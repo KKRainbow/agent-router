@@ -227,9 +227,9 @@ impl ApprovalBroker {
             }
 
             let same_session = pending.request.session_key == session_key;
-            let same_requester_explicit =
-                explicit_target && pending.request.requester_user_id.is_some();
-            if !same_session && !same_requester_explicit {
+            let allowed_slack_slash = explicit_target
+                && slack_slash_session_matches(&pending.request.session_key, session_key);
+            if !same_session && !allowed_slack_slash {
                 return Some(ApprovalCommandReply {
                     text: format!("Approval {target_id} belongs to a different session."),
                 });
@@ -252,7 +252,12 @@ impl ApprovalBroker {
             remove_session_order(&mut state, &session_key, &target_id);
             (pending, target_id, selection)
         };
-        let _ = pending.responder.send(selection);
+        let resolved = pending.responder.send(selection).is_ok();
+        if !resolved {
+            return Some(ApprovalCommandReply {
+                text: format!("Approval {target_id} is no longer active."),
+            });
+        }
 
         Some(ApprovalCommandReply {
             text: match command.decision {
@@ -301,6 +306,24 @@ fn remove_session_order(state: &mut ApprovalState, session_key: &str, id: &str) 
         if order.is_empty() {
             state.session_order.remove(session_key);
         }
+    }
+}
+
+fn slack_slash_session_matches(pending_session: &str, command_session: &str) -> bool {
+    let Some(command_channel) = parse_slack_slash_channel(command_session) else {
+        return false;
+    };
+    match pending_session.split(':').collect::<Vec<_>>().as_slice() {
+        ["slack", "channel", pending_channel, _thread_ts] => *pending_channel == command_channel,
+        ["slack", "dm", pending_channel] => *pending_channel == command_channel,
+        _ => false,
+    }
+}
+
+fn parse_slack_slash_channel(session_key: &str) -> Option<&str> {
+    match session_key.split(':').collect::<Vec<_>>().as_slice() {
+        ["slack", channel, "slash", _user] => Some(*channel),
+        _ => None,
     }
 }
 
@@ -432,5 +455,72 @@ mod tests {
             pending.await.unwrap(),
             ApprovalSelection::Selected("allow_once".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_id_from_unrelated_session_is_rejected() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            request_broker
+                .request(request("slack:channel:C1:123.456"))
+                .await
+        });
+        let prompt = prompts.recv().await.unwrap();
+
+        let reply = broker
+            .resolve_command(
+                "slack:channel:C2:999.000",
+                &format!("/approve {}", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("different session"));
+        let reply = broker
+            .resolve_command(
+                "slack:C1:slash:U1",
+                &format!("/approve {}", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_request_receiver_is_reported_as_inactive() {
+        let broker = ApprovalBroker::new(Duration::from_secs(5));
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        {
+            let mut state = broker.state.lock().await;
+            state
+                .session_order
+                .entry("s1".to_string())
+                .or_default()
+                .push_back("1".to_string());
+            state.pending.insert(
+                "1".to_string(),
+                PendingApproval {
+                    request: request("s1"),
+                    responder: tx,
+                },
+            );
+        }
+
+        let reply = broker
+            .resolve_command("s1", "/approve 1", Some("U1"))
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("no longer active"));
     }
 }
