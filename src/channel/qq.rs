@@ -7,11 +7,11 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    approval::SharedApprovalBroker,
+    approval::{SharedApprovalBroker, is_approval_command},
     channel::EventDeduper,
     config::QqConfig,
     router::{RouterInput, RouterService},
@@ -32,6 +32,7 @@ pub struct QqBotChannel {
     gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
     reply_contexts: Arc<Mutex<HashMap<String, QqReplyContext>>>,
+    session_workers: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<QqInboundMessage>>>>,
 }
 
 impl QqBotChannel {
@@ -44,6 +45,7 @@ impl QqBotChannel {
             gateway_session: Arc::new(Mutex::new(QqGatewaySession::default())),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(1024))),
             reply_contexts: Arc::new(Mutex::new(HashMap::new())),
+            session_workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -179,13 +181,7 @@ impl QqBotChannel {
                     }
                     return Ok(());
                 }
-                let channel = self.clone();
-                let data = data.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = channel.handle_dispatch(&event_type, &data, router).await {
-                        tracing::warn!(error = %err, event_type = %event_type, "failed to handle QQ dispatch");
-                    }
-                });
+                self.handle_dispatch(&event_type, data, router).await?;
             }
             1 => send_heartbeat(sink, *sequence).await?,
             7 => anyhow::bail!("QQ gateway requested reconnect"),
@@ -220,6 +216,70 @@ impl QqBotChannel {
             return Ok(());
         }
 
+        if is_approval_command(&message.text) {
+            let channel = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = channel.route_message(message, router).await {
+                    tracing::warn!(error = %err, "failed to handle QQ approval command");
+                }
+            });
+            return Ok(());
+        }
+
+        self.enqueue_session_message(message, router).await
+    }
+
+    async fn enqueue_session_message(
+        &self,
+        message: QqInboundMessage,
+        router: Arc<dyn RouterService>,
+    ) -> anyhow::Result<()> {
+        let session_key = message.session_key.clone();
+        let sender = self.session_worker(&session_key, router).await;
+        if sender.send(message).is_err() {
+            self.session_workers.lock().await.remove(&session_key);
+            anyhow::bail!("QQ session worker stopped for session `{session_key}`");
+        }
+        Ok(())
+    }
+
+    async fn session_worker(
+        &self,
+        session_key: &str,
+        router: Arc<dyn RouterService>,
+    ) -> mpsc::UnboundedSender<QqInboundMessage> {
+        let mut workers = self.session_workers.lock().await;
+        if let Some(sender) = workers.get(session_key) {
+            return sender.clone();
+        }
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        workers.insert(session_key.to_string(), sender.clone());
+        self.clone()
+            .spawn_session_worker(session_key.to_string(), router, receiver);
+        sender
+    }
+
+    fn spawn_session_worker(
+        self,
+        session_key: String,
+        router: Arc<dyn RouterService>,
+        mut receiver: mpsc::UnboundedReceiver<QqInboundMessage>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                if let Err(err) = self.route_message(message, router.clone()).await {
+                    tracing::warn!(error = %err, session_key = %session_key, "failed to handle QQ session message");
+                }
+            }
+        });
+    }
+
+    async fn route_message(
+        &self,
+        message: QqInboundMessage,
+        router: Arc<dyn RouterService>,
+    ) -> anyhow::Result<()> {
         self.remember_reply_context(&message).await;
         let reply = router
             .handle(RouterInput {
@@ -234,8 +294,7 @@ impl QqBotChannel {
             &message.msg_id,
             &reply.text,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     fn spawn_approval_notifier(self: Arc<Self>) {

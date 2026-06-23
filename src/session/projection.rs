@@ -250,7 +250,8 @@ mod tests {
 
     #[test]
     fn projection_truncates_multibyte_content_on_char_boundary() {
-        let messages = vec![TranscriptMessage::assistant("汉".repeat(500), "kimi", None)];
+        let content = format!("{}🙂z", "a".repeat(1196));
+        let messages = vec![TranscriptMessage::assistant(content, "kimi", None)];
 
         let projection = build_context_projection(ProjectionInput {
             transcript: &messages,
