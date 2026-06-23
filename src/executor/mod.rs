@@ -39,6 +39,7 @@ pub struct ExecutorUpdate {
     pub title: String,
     pub text: String,
     pub status: String,
+    pub transcript_summary: Option<String>,
     pub channel_event: Option<ExecutorChannelEvent>,
 }
 
@@ -54,8 +55,14 @@ impl ExecutorUpdate {
             title: title.into(),
             text: text.into(),
             status: status.into(),
+            transcript_summary: None,
             channel_event: None,
         }
+    }
+
+    pub fn with_transcript_summary(mut self, summary: impl Into<String>) -> Self {
+        self.transcript_summary = Some(summary.into());
+        self
     }
 
     pub fn with_channel_event(mut self, channel_event: ExecutorChannelEvent) -> Self {
@@ -66,21 +73,7 @@ impl ExecutorUpdate {
 
 impl ExecutorUpdate {
     pub fn summary(&self, limit: usize) -> Option<String> {
-        let label = if self.title.is_empty() {
-            self.kind.as_str()
-        } else {
-            self.title.as_str()
-        };
-        let detail = if self.text.is_empty() {
-            self.status.as_str()
-        } else {
-            self.text.as_str()
-        };
-        let mut text = if detail.is_empty() {
-            label.to_string()
-        } else {
-            format!("{label}: {detail}")
-        };
+        let mut text = self.transcript_summary.clone()?;
         if text.trim().is_empty() {
             return None;
         }
@@ -203,7 +196,10 @@ pub mod test_support {
             });
             Ok(ExecutorResponse {
                 final_text: "fake response".to_string(),
-                updates: vec![ExecutorUpdate::new("plan", "Plan", "working", "")],
+                updates: vec![
+                    ExecutorUpdate::new("plan", "Plan", "working", "")
+                        .with_transcript_summary("Plan: working"),
+                ],
             })
         }
     }
@@ -231,9 +227,10 @@ mod tests {
 
     #[test]
     fn update_summary_truncates_on_char_boundary() {
-        let update = ExecutorUpdate::new("tool_call", "Bash", format!("{}🙂z", "a".repeat(16)), "");
+        let update = ExecutorUpdate::new("tool_call", "Bash", "raw", "")
+            .with_transcript_summary(format!("{}🙂z", "a".repeat(16)));
 
-        let summary = update.summary(20).unwrap();
+        let summary = update.summary(17).unwrap();
 
         assert!(summary.ends_with("..."));
     }

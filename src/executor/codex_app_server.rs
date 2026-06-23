@@ -970,9 +970,10 @@ fn collect_codex_notification(
             let mut update =
                 ExecutorUpdate::new("agent_thought_chunk", "Reasoning", text, String::new());
             if let Some(summary) = summary.filter(|summary| !summary.trim().is_empty()) {
-                update = update.with_channel_event(ExecutorChannelEvent::reasoning_summary(
-                    truncate_text(summary, 1_000),
-                ));
+                let summary = truncate_text(summary, 1_000);
+                update = update
+                    .with_channel_event(ExecutorChannelEvent::reasoning_summary(summary.clone()));
+                update = update.with_transcript_summary(format!("Reasoning: {summary}"));
             }
             updates.push(update);
         }
@@ -989,6 +990,7 @@ fn collect_codex_notification(
                         .unwrap_or("")
                         .to_string(),
                 )
+                .with_transcript_summary(format!("Bash: {channel_summary}"))
                 .with_channel_event(ExecutorChannelEvent::tool_call("Bash", channel_summary)),
             );
         }
@@ -1015,6 +1017,7 @@ fn collect_codex_notification(
                         .unwrap_or("")
                         .to_string(),
                 )
+                .with_transcript_summary(format!("{item_type}: {summary}"))
                 .with_channel_event(ExecutorChannelEvent::tool_call(item_type, summary)),
             );
         }
@@ -1259,6 +1262,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         assert!(updates[0].channel_event.is_none());
+        assert!(updates[0].summary(700).is_none());
 
         collect_codex_notification(
             json!({
@@ -1273,6 +1277,10 @@ mod tests {
         let event = updates[1].channel_event.as_ref().unwrap();
         assert_eq!(event.kind, ExecutorChannelEventKind::ReasoningSummary);
         assert_eq!(event.text, "safe summary");
+        assert_eq!(
+            updates[1].summary(700).as_deref(),
+            Some("Reasoning: safe summary")
+        );
     }
 
     #[test]
@@ -1303,6 +1311,10 @@ mod tests {
         assert!(event.text.contains("exit: 0"));
         assert!(!event.text.contains("printenv"));
         assert!(!event.text.contains("super-secret"));
+        let summary = updates[0].summary(700).unwrap();
+        assert!(summary.contains("exit: 0"));
+        assert!(!summary.contains("printenv"));
+        assert!(!summary.contains("super-secret"));
     }
 
     fn write_fake_codex_script(path: &Path, behavior: &str) {
