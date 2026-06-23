@@ -1,44 +1,80 @@
 # Agent Router
 
-Agent Router is a Rust-first channel edge for agent sessions. It is meant to
-connect chat channels such as Slack and QQ to one or more agent runtimes without
-making those runtimes own every channel integration.
+> A router between IM and your agent team.
 
-The project starts from a small scope:
+Agent Router connects instant messaging channels such as Slack and QQ to a team
+of agent executors. Users can talk to agents from the chat tools they already
+use, while Agent Router owns channel integration, session routing, executor
+switching, and reply delivery.
 
-- accept inbound messages from channel adapters
-- normalize them into a shared session event model
-- initialize each session with a default executor
-- route each session to exactly one active executor backend at a time
-- support explicit executor switching inside the same session context
-- share context across executor switches through safe transcript projection
-- send normalized outbound messages back through the originating channel
+## Development Status
 
-## Initial Direction
+Agent Router is still in active development. Configuration, commands, backend
+protocols, and channel behavior may change before the project is considered
+stable. It is currently best suited for experiments, internal workflows, and
+early integrations.
 
-Agent Router should be its own project instead of another Hermes subsystem. The
-router is infrastructure around channels, sessions, executor routing, and
-handoff policy. Hermes, OpenClaw, Codex, Kimi, or future agents should be
-pluggable executor backends behind a narrow protocol interface.
+## What It Does
 
-The first backend protocol is ACP. Codex app-server is supported as a separate
-backend protocol adapter.
+- Receives messages from supported IM channels.
+- Normalizes channel messages into a shared session model.
+- Starts each session with a configured default executor.
+- Routes a session to one active executor at a time.
+- Lets users switch executors inside the same chat session.
+- Projects conversation context when a session switches executors.
+- Sends normalized replies back to the originating channel.
 
-Slack and QQ are the first channels that matter. Slack should use the official
-Slack API model. QQ should use Tencent's official QQ Bot API, with ZeroClaw's QQ
-adapter as a protocol reference rather than a runtime dependency.
+## Supported Today
 
-## MVP
+Channels:
 
-The current MVP runs Slack Socket Mode and QQ Official Bot Gateway as the first
-channels, `kimi acp` as the first ACP executor backend, and `codex app-server`
-as the first app-server executor backend:
+- Slack Socket Mode
+- Tencent QQ Official Bot Gateway
+
+Executor backends:
+
+- ACP, for example `kimi acp`
+- Codex app-server
+
+User commands:
+
+```text
+/agent status
+/agent <executor-name>
+```
+
+For example:
+
+```text
+/agent kimi
+/agent codex
+```
+
+## Quick Start
+
+Requirements:
+
+- Rust toolchain
+- Credentials for at least one supported channel
+- At least one configured executor command available on `PATH`
+
+Run with the example configuration:
 
 ```bash
 cargo run -- --config config/agent-router.example.yaml
 ```
 
-Secrets are read from environment variables. The runner also tries these dotenv
+For local changes, copy the example configuration and edit the executor names,
+commands, and channel options:
+
+```bash
+cp config/agent-router.example.yaml config/agent-router.yaml
+cargo run -- --config config/agent-router.yaml
+```
+
+## Secrets
+
+Prefer environment variables for secrets. The runner also tries these dotenv
 locations, in order, so a local Hermes install can be reused without copying
 tokens into this repository:
 
@@ -47,32 +83,68 @@ tokens into this repository:
 3. `$HERMES_HOME/.env`
 4. `~/.hermes/.env`
 
+Slack:
+
 ```bash
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
+```
+
+QQ:
+
+```bash
 QQ_APP_ID=...
 QQ_CLIENT_SECRET=...
+QQ_SANDBOX=false
 ```
 
 Slack and QQ are enabled automatically when all required credentials for that
-channel are present, unless the config explicitly sets `enabled: false`. QQ can
-be restricted with `QQ_ALLOWED_USERS` and `QQ_ALLOWED_GROUPS`, both as
-comma-separated openid lists. The MVP supports `/agent status` and
-`/agent <name>` from channel messages. A session starts with `default_executor`,
-has one `active_executor`, and shares context between executor switches by
-projecting canonical transcript into the target executor.
+channel are present, unless the config explicitly sets `enabled: false`.
 
-Example switches:
+QQ access can be restricted with comma-separated openid lists:
 
-```text
-/agent kimi
-/agent codex
+```bash
+QQ_ALLOWED_USERS=...
+QQ_ALLOWED_GROUPS=...
 ```
+
+## Configuration Overview
+
+The example config defines a default executor, available executor backends, and
+channel options:
+
+```yaml
+router:
+  default_executor: kimi
+
+executors:
+  kimi:
+    protocol: acp
+    command: kimi
+    args: ["acp"]
+  codex:
+    protocol: app_server
+    command: codex
+
+slack:
+  require_mention: true
+  allowed_channels: []
+  free_response_channels: []
+
+qq:
+  sandbox: false
+  allowed_users: []
+  allowed_groups: []
+```
+
+Each chat session has one active executor. New sessions start with
+`router.default_executor`. Users can switch the active executor with
+`/agent <executor-name>`.
 
 ## Non-Goals
 
-- Replacing Hermes or OpenClaw as an agent runtime.
-- Importing ZeroClaw's channel crate wholesale.
+- Replacing Hermes, OpenClaw, Codex, Kimi, or other agent runtimes.
+- Importing a channel adapter wholesale as a runtime dependency.
 - Building a full customer-support inbox product.
 - Coupling channel adapters to LLM provider, memory, tool, or orchestration
   implementations.
