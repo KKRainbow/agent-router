@@ -32,6 +32,7 @@ type SharedCodexSession = Arc<Mutex<CodexAppServerSession>>;
 type SessionMap = HashMap<SessionKey, SharedCodexSession>;
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
+const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct CodexRuntimeLimits {
@@ -393,7 +394,7 @@ impl CodexAppServerSession {
         updates: &mut Vec<ExecutorUpdate>,
         turn_completed: &mut bool,
     ) -> anyhow::Result<()> {
-        loop {
+        for _ in 0..MAX_READY_NOTIFICATIONS_BEFORE_REQUEST {
             match notifications.try_recv() {
                 Ok(notification) => {
                     self.handle_notification(notification, final_text, updates, turn_completed)?;
