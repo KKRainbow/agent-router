@@ -22,8 +22,9 @@ use crate::{
     },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorPrepareRequest,
-        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
+        ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate,
+        PreparedExecutor,
     },
 };
 
@@ -169,12 +170,18 @@ impl ExecutorBackend for CodexAppServerManager {
         })
     }
 
-    async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse> {
+    async fn prompt(
+        &self,
+        request: ExecutorPromptRequest,
+        events: &mut dyn ExecutorEventSink,
+    ) -> anyhow::Result<ExecutorResponse> {
         let session = self
             .existing_session(&request.session_key, &request.executor)
             .await?;
         let mut session = session.lock().await;
-        session.run_turn(&request.prompt, request.user_id).await
+        session
+            .run_turn(&request.prompt, request.user_id, events)
+            .await
     }
 }
 
@@ -286,6 +293,7 @@ impl CodexAppServerSession {
         &mut self,
         prompt: &str,
         user_id: Option<String>,
+        events: &mut dyn ExecutorEventSink,
     ) -> anyhow::Result<ExecutorResponse> {
         let thread_id = self
             .thread_id
@@ -306,7 +314,6 @@ impl CodexAppServerSession {
             .await?;
 
         let mut final_text = String::new();
-        let mut updates = Vec::new();
         let mut turn_start_acknowledged = false;
         let mut turn_completed = false;
         let turn_start_timeout = sleep(self.limits.rpc_timeout);
@@ -328,9 +335,9 @@ impl CodexAppServerSession {
                             self.drain_ready_notifications(
                                 &mut notifications,
                                 &mut final_text,
-                                &mut updates,
+                                events,
                                 &mut turn_completed,
-                            )?;
+                            ).await?;
                             self.handle_server_request(request, user_id.clone()).await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -345,9 +352,9 @@ impl CodexAppServerSession {
                             self.handle_notification(
                                 notification,
                                 &mut final_text,
-                                &mut updates,
+                                events,
                                 &mut turn_completed,
-                            )?;
+                            ).await?;
                             if turn_completed && turn_start_acknowledged {
                                 break;
                             }
@@ -381,23 +388,21 @@ impl CodexAppServerSession {
             }
         }
 
-        Ok(ExecutorResponse {
-            final_text,
-            updates,
-        })
+        Ok(ExecutorResponse { final_text })
     }
 
-    fn drain_ready_notifications(
+    async fn drain_ready_notifications(
         &mut self,
         notifications: &mut broadcast::Receiver<Value>,
         final_text: &mut String,
-        updates: &mut Vec<ExecutorUpdate>,
+        events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
     ) -> anyhow::Result<()> {
         for _ in 0..MAX_READY_NOTIFICATIONS_BEFORE_REQUEST {
             match notifications.try_recv() {
                 Ok(notification) => {
-                    self.handle_notification(notification, final_text, updates, turn_completed)?;
+                    self.handle_notification(notification, final_text, events, turn_completed)
+                        .await?;
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -409,15 +414,19 @@ impl CodexAppServerSession {
         Ok(())
     }
 
-    fn handle_notification(
+    async fn handle_notification(
         &mut self,
         notification: Value,
         final_text: &mut String,
-        updates: &mut Vec<ExecutorUpdate>,
+        events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
     ) -> anyhow::Result<()> {
         self.track_pending_file_change(&notification);
-        match collect_codex_notification(notification, final_text, updates)? {
+        let collected = collect_codex_notification(notification, final_text)?;
+        for update in collected.updates {
+            events.send(update).await?;
+        }
+        match collected.outcome {
             CodexNotificationOutcome::Pending => {}
             CodexNotificationOutcome::TurnCompleted => *turn_completed = true,
         }
@@ -923,29 +932,44 @@ enum CodexNotificationOutcome {
     TurnCompleted,
 }
 
+#[derive(Debug)]
+struct CollectedCodexNotification {
+    outcome: CodexNotificationOutcome,
+    updates: Vec<ExecutorUpdate>,
+}
+
 fn collect_codex_notification(
     notification: Value,
     final_text: &mut String,
-    updates: &mut Vec<ExecutorUpdate>,
-) -> anyhow::Result<CodexNotificationOutcome> {
+) -> anyhow::Result<CollectedCodexNotification> {
     let method = notification
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("");
     if method == "turn/completed" {
         validate_turn_completed(&notification)?;
-        return Ok(CodexNotificationOutcome::TurnCompleted);
+        return Ok(CollectedCodexNotification {
+            outcome: CodexNotificationOutcome::TurnCompleted,
+            updates: Vec::new(),
+        });
     }
     if method != "item/completed" {
-        return Ok(CodexNotificationOutcome::Pending);
+        return Ok(CollectedCodexNotification {
+            outcome: CodexNotificationOutcome::Pending,
+            updates: Vec::new(),
+        });
     }
     let Some(item) = notification
         .get("params")
         .and_then(|params| params.get("item"))
     else {
-        return Ok(CodexNotificationOutcome::Pending);
+        return Ok(CollectedCodexNotification {
+            outcome: CodexNotificationOutcome::Pending,
+            updates: Vec::new(),
+        });
     };
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut updates = Vec::new();
     match item_type {
         "agentMessage" => {
             let text = item
@@ -1023,7 +1047,10 @@ fn collect_codex_notification(
         }
         _ => {}
     }
-    Ok(CodexNotificationOutcome::Pending)
+    Ok(CollectedCodexNotification {
+        outcome: CodexNotificationOutcome::Pending,
+        updates,
+    })
 }
 
 fn validate_turn_completed(notification: &Value) -> anyhow::Result<()> {
@@ -1216,6 +1243,7 @@ mod tests {
     use crate::approval::ApprovalBroker;
     use crate::executor::{
         ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
+        test_support::CollectingExecutorEventSink,
     };
 
     use super::*;
@@ -1248,37 +1276,34 @@ mod tests {
     #[test]
     fn codex_reasoning_channel_event_requires_summary() {
         let mut final_text = String::new();
-        let mut updates = Vec::new();
 
-        collect_codex_notification(
+        let collected = collect_codex_notification(
             json!({
                 "method": "item/completed",
                 "params": {"item": {"type": "reasoning", "content": "raw thinking"}}
             }),
             &mut final_text,
-            &mut updates,
         )
         .unwrap();
 
-        assert_eq!(updates.len(), 1);
-        assert!(updates[0].channel_event.is_none());
-        assert!(updates[0].summary(700).is_none());
+        assert_eq!(collected.updates.len(), 1);
+        assert!(collected.updates[0].channel_event.is_none());
+        assert!(collected.updates[0].summary(700).is_none());
 
-        collect_codex_notification(
+        let collected = collect_codex_notification(
             json!({
                 "method": "item/completed",
                 "params": {"item": {"type": "reasoning", "summary": [{"text": "safe summary"}]}}
             }),
             &mut final_text,
-            &mut updates,
         )
         .unwrap();
 
-        let event = updates[1].channel_event.as_ref().unwrap();
+        let event = collected.updates[0].channel_event.as_ref().unwrap();
         assert_eq!(event.kind, ExecutorChannelEventKind::ReasoningSummary);
         assert_eq!(event.text, "safe summary");
         assert_eq!(
-            updates[1].summary(700).as_deref(),
+            collected.updates[0].summary(700).as_deref(),
             Some("Reasoning: safe summary")
         );
     }
@@ -1286,9 +1311,8 @@ mod tests {
     #[test]
     fn codex_command_channel_event_omits_aggregated_output() {
         let mut final_text = String::new();
-        let mut updates = Vec::new();
 
-        collect_codex_notification(
+        let collected = collect_codex_notification(
             json!({
                 "method": "item/completed",
                 "params": {
@@ -1302,16 +1326,15 @@ mod tests {
                 }
             }),
             &mut final_text,
-            &mut updates,
         )
         .unwrap();
 
-        let event = updates[0].channel_event.as_ref().unwrap();
+        let event = collected.updates[0].channel_event.as_ref().unwrap();
         assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
         assert!(event.text.contains("exit: 0"));
         assert!(!event.text.contains("printenv"));
         assert!(!event.text.contains("super-secret"));
-        let summary = updates[0].summary(700).unwrap();
+        let summary = collected.updates[0].summary(700).unwrap();
         assert!(summary.contains("exit: 0"));
         assert!(!summary.contains("printenv"));
         assert!(!summary.contains("super-secret"));
@@ -1381,13 +1404,17 @@ for line in sys.stdin:
             })
             .await
             .unwrap();
+        let mut events = CollectingExecutorEventSink::default();
         let response = manager
-            .prompt(ExecutorPromptRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                prompt: "hello".to_string(),
-                user_id: Some("U1".to_string()),
-            })
+            .prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    prompt: "hello".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            )
             .await
             .unwrap();
 
@@ -1444,13 +1471,17 @@ for line in sys.stdin:
 
         let prompt_manager = manager.clone();
         let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
             prompt_manager
-                .prompt(ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
-                    prompt: "run pwd".to_string(),
-                    user_id: Some("U1".to_string()),
-                })
+                .prompt(
+                    ExecutorPromptRequest {
+                        session_key: "session-1".to_string(),
+                        executor: "codex".to_string(),
+                        prompt: "run pwd".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                )
                 .await
         });
         let approval_prompt = prompts.recv().await.unwrap();
@@ -1499,13 +1530,17 @@ for line in sys.stdin:
             .await
             .unwrap();
 
+        let mut events = CollectingExecutorEventSink::default();
         let err = manager
-            .prompt(ExecutorPromptRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                prompt: "fail".to_string(),
-                user_id: Some("U1".to_string()),
-            })
+            .prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    prompt: "fail".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            )
             .await
             .unwrap_err();
 
@@ -1581,13 +1616,17 @@ for line in sys.stdin:
 
         let prompt_manager = manager.clone();
         let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
             prompt_manager
-                .prompt(ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
-                    prompt: "patch".to_string(),
-                    user_id: Some("U1".to_string()),
-                })
+                .prompt(
+                    ExecutorPromptRequest {
+                        session_key: "session-1".to_string(),
+                        executor: "codex".to_string(),
+                        prompt: "patch".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                )
                 .await
         });
         let approval_prompt = prompts.recv().await.unwrap();
@@ -1650,13 +1689,17 @@ for line in sys.stdin:
             .await
             .unwrap();
 
+        let mut events = CollectingExecutorEventSink::default();
         let response = manager
-            .prompt(ExecutorPromptRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                prompt: "elicit".to_string(),
-                user_id: Some("U1".to_string()),
-            })
+            .prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    prompt: "elicit".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            )
             .await
             .unwrap();
 
@@ -1690,13 +1733,17 @@ for line in sys.stdin:
             .await
             .unwrap();
 
+        let mut events = CollectingExecutorEventSink::default();
         let err = manager
-            .prompt(ExecutorPromptRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                prompt: "hang".to_string(),
-                user_id: Some("U1".to_string()),
-            })
+            .prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    prompt: "hang".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            )
             .await
             .unwrap_err();
 

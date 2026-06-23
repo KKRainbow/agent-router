@@ -6,8 +6,8 @@ use crate::{
     approval::SharedApprovalBroker,
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorPrepareRequest, ExecutorPromptRequest,
-        ExecutorResponse, PreparedExecutor, acp::AcpExecutorManager,
+        ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
+        ExecutorPromptRequest, ExecutorResponse, PreparedExecutor, acp::AcpExecutorManager,
         codex_app_server::CodexAppServerManager,
     },
 };
@@ -60,8 +60,14 @@ impl ExecutorBackend for ExecutorRegistry {
         self.backend_for(&request.executor)?.prepare(request).await
     }
 
-    async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse> {
-        self.backend_for(&request.executor)?.prompt(request).await
+    async fn prompt(
+        &self,
+        request: ExecutorPromptRequest,
+        events: &mut dyn ExecutorEventSink,
+    ) -> anyhow::Result<ExecutorResponse> {
+        self.backend_for(&request.executor)?
+            .prompt(request, events)
+            .await
     }
 }
 

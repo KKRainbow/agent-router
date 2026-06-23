@@ -10,8 +10,8 @@ pub mod session;
 mod text;
 
 pub use router::{
-    AgentRouter, RouterChannelEvent, RouterChannelEventKind, RouterInput, RouterReply,
-    RouterService,
+    AgentRouter, RouterChannelEvent, RouterChannelEventKind, RouterInput, RouterOutputEvent,
+    RouterOutputSink, RouterService,
 };
 
 #[cfg(test)]

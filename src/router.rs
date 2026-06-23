@@ -6,8 +6,8 @@ use tokio::sync::Mutex;
 use crate::{
     approval::{ApprovalBroker, SharedApprovalBroker},
     executor::{
-        ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
-        ExecutorUpdate,
+        ExecutorBackend, ExecutorChannelEventKind, ExecutorEventSink, ExecutorPrepareRequest,
+        ExecutorPromptRequest, ExecutorUpdate,
     },
     session::{
         ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
@@ -28,28 +28,9 @@ pub struct RouterInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouterReply {
-    pub text: String,
-    pub channel_events: Vec<RouterChannelEvent>,
-}
-
-impl RouterReply {
-    fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            channel_events: Vec::new(),
-        }
-    }
-
-    fn with_channel_events(
-        text: impl Into<String>,
-        channel_events: Vec<RouterChannelEvent>,
-    ) -> Self {
-        Self {
-            text: text.into(),
-            channel_events,
-        }
-    }
+pub enum RouterOutputEvent {
+    Channel(RouterChannelEvent),
+    FinalReply(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +61,18 @@ pub enum RouterChannelEventKind {
 }
 
 #[async_trait]
+pub trait RouterOutputSink: Send {
+    fn send_channel_event(&mut self, event: RouterChannelEvent);
+    async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()>;
+}
+
+#[async_trait]
 pub trait RouterService: Send + Sync + 'static {
-    async fn handle(&self, input: RouterInput) -> anyhow::Result<RouterReply>;
+    async fn handle(
+        &self,
+        input: RouterInput,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()>;
 }
 
 pub struct AgentRouter<S, E>
@@ -133,52 +124,69 @@ where
             .clone()
     }
 
-    async fn handle_locked(&self, input: RouterInput) -> anyhow::Result<RouterReply> {
+    async fn handle_locked(
+        &self,
+        input: RouterInput,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
         let text = input.text.trim();
         if text.starts_with("/agent") {
-            return self.handle_agent_command(&input.session_key, text).await;
+            return self
+                .handle_agent_command(&input.session_key, text, output)
+                .await;
         }
-        self.route_to_active_executor(input).await
+        self.route_to_active_executor(input, output).await
     }
 
     async fn handle_agent_command(
         &self,
         session_key: &str,
         text: &str,
-    ) -> anyhow::Result<RouterReply> {
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
         let args = text.trim_start_matches("/agent").trim();
         let mut state = self
             .store
             .load_or_create(session_key, &self.default_executor)
             .await;
         if args.is_empty() || args == "status" {
-            return Ok(RouterReply::text(self.render_status(&state)));
+            return output.send_final_reply(self.render_status(&state)).await;
         }
         if args.split_whitespace().count() != 1 {
-            return Ok(RouterReply::text("Usage: /agent [status|done|<executor>]"));
+            return output
+                .send_final_reply("Usage: /agent [status|done|<executor>]".to_string())
+                .await;
         }
 
         let target = args;
         if target == "done" {
             state.active_executor = state.default_executor.clone();
             self.store.save(state.clone()).await;
-            return Ok(RouterReply::text(format!(
-                "Agent handoff ended. Active executor: {}",
-                state.active_executor
-            )));
+            return output
+                .send_final_reply(format!(
+                    "Agent handoff ended. Active executor: {}",
+                    state.active_executor
+                ))
+                .await;
         }
 
         if self.executor.get(target).is_none() {
-            return Ok(RouterReply::text(format!(
-                "Executor `{target}` is not configured."
-            )));
+            return output
+                .send_final_reply(format!("Executor `{target}` is not configured."))
+                .await;
         }
         state.active_executor = target.to_string();
         self.store.save(state).await;
-        Ok(RouterReply::text(format!("Active executor: {target}")))
+        output
+            .send_final_reply(format!("Active executor: {target}"))
+            .await
     }
 
-    async fn route_to_active_executor(&self, input: RouterInput) -> anyhow::Result<RouterReply> {
+    async fn route_to_active_executor(
+        &self,
+        input: RouterInput,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
         let mut state = self
             .store
             .load_or_create(&input.session_key, &self.default_executor)
@@ -220,20 +228,26 @@ where
             max_messages: 40,
         });
 
-        let response = self
-            .executor
-            .prompt(ExecutorPromptRequest {
-                session_key: input.session_key.clone(),
-                executor: executor_name.clone(),
-                prompt: projection.prompt,
-                user_id: input.user_id.clone(),
-            })
-            .await;
+        let (response, updates) = {
+            let mut executor_events = RouterExecutorEventSink::new(&executor_name, output);
+            let response = self
+                .executor
+                .prompt(
+                    ExecutorPromptRequest {
+                        session_key: input.session_key.clone(),
+                        executor: executor_name.clone(),
+                        prompt: projection.prompt,
+                        user_id: input.user_id.clone(),
+                    },
+                    &mut executor_events,
+                )
+                .await;
+            (response, executor_events.into_updates())
+        };
 
         match response {
             Ok(response) => {
-                let activity_summaries = response
-                    .updates
+                let activity_summaries = updates
                     .iter()
                     .filter_map(|update| update.summary(700))
                     .collect::<Vec<_>>();
@@ -267,10 +281,7 @@ where
                     ),
                 );
                 self.store.save(state).await;
-                Ok(RouterReply::with_channel_events(
-                    response.final_text,
-                    channel_events_from_executor_updates(&executor_name, &response.updates),
-                ))
+                output.send_final_reply(response.final_text).await
             }
             Err(err) => {
                 state.executor_bindings.insert(
@@ -314,28 +325,53 @@ where
     S: SessionStore,
     E: ExecutorBackend,
 {
-    async fn handle(&self, input: RouterInput) -> anyhow::Result<RouterReply> {
+    async fn handle(
+        &self,
+        input: RouterInput,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
         if let Some(reply) = self
             .approvals
             .resolve_command(&input.session_key, &input.text, input.user_id.as_deref())
             .await
         {
-            return Ok(RouterReply::text(reply.text));
+            return output.send_final_reply(reply.text).await;
         }
         let lock = self.session_lock(&input.session_key).await;
         let _guard = lock.lock().await;
-        self.handle_locked(input).await
+        self.handle_locked(input, output).await
     }
 }
 
-fn channel_events_from_executor_updates(
-    executor: &str,
-    updates: &[ExecutorUpdate],
-) -> Vec<RouterChannelEvent> {
-    updates
-        .iter()
-        .filter_map(|update| channel_event_from_executor_update(executor, update))
-        .collect()
+struct RouterExecutorEventSink<'a> {
+    executor: &'a str,
+    output: &'a mut dyn RouterOutputSink,
+    updates: Vec<ExecutorUpdate>,
+}
+
+impl<'a> RouterExecutorEventSink<'a> {
+    fn new(executor: &'a str, output: &'a mut dyn RouterOutputSink) -> Self {
+        Self {
+            executor,
+            output,
+            updates: Vec::new(),
+        }
+    }
+
+    fn into_updates(self) -> Vec<ExecutorUpdate> {
+        self.updates
+    }
+}
+
+#[async_trait]
+impl ExecutorEventSink for RouterExecutorEventSink<'_> {
+    async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
+        if let Some(event) = channel_event_from_executor_update(self.executor, &update) {
+            self.output.send_channel_event(event);
+        }
+        self.updates.push(update);
+        Ok(())
+    }
 }
 
 fn channel_event_from_executor_update(
@@ -404,23 +440,53 @@ mod tests {
     };
     use std::time::Duration;
 
+    #[derive(Debug, Default)]
+    struct CollectingRouterOutputSink {
+        events: Vec<RouterOutputEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouterOutputSink for CollectingRouterOutputSink {
+        fn send_channel_event(&mut self, event: RouterChannelEvent) {
+            self.events.push(RouterOutputEvent::Channel(event));
+        }
+
+        async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+            self.events.push(RouterOutputEvent::FinalReply(text));
+            Ok(())
+        }
+    }
+
+    impl CollectingRouterOutputSink {
+        fn final_reply(&self) -> &str {
+            match self.events.last().expect("router emitted no events") {
+                RouterOutputEvent::FinalReply(text) => text,
+                RouterOutputEvent::Channel(_) => panic!("last router event was not final reply"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn agent_status_shows_default_and_active_executor() {
         let store = Arc::new(InMemorySessionStore::default());
         let executor = Arc::new(FakeExecutorBackend::default());
         let router = AgentRouter::new("kimi", store, executor);
 
-        let reply = router
-            .handle(RouterInput {
-                session_key: "slack:C1:T1".to_string(),
-                text: "/agent status".to_string(),
-                user_id: None,
-            })
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "/agent status".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
             .await
             .unwrap();
 
-        assert!(reply.text.contains("Default executor: kimi"));
-        assert!(reply.text.contains("Active executor: kimi"));
+        assert!(output.final_reply().contains("Default executor: kimi"));
+        assert!(output.final_reply().contains("Active executor: kimi"));
     }
 
     #[tokio::test]
@@ -457,16 +523,20 @@ mod tests {
         });
 
         let prompt = prompts.recv().await.unwrap();
-        let reply = router
-            .handle(RouterInput {
-                session_key: "slack:C1:T1".to_string(),
-                text: format!("/approve {}", prompt.id),
-                user_id: Some("U1".to_string()),
-            })
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: format!("/approve {}", prompt.id),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut output,
+            )
             .await
             .unwrap();
 
-        assert!(reply.text.contains("Approved"));
+        assert!(output.final_reply().contains("Approved"));
         assert_eq!(
             pending.await.unwrap(),
             ApprovalSelection::Selected("allow_once".to_string())
@@ -483,16 +553,20 @@ mod tests {
         store.save(state).await;
         let router = AgentRouter::new("kimi", store.clone(), executor.clone());
 
-        let reply = router
-            .handle(RouterInput {
-                session_key: "slack:C1:T1".to_string(),
-                text: "next".to_string(),
-                user_id: None,
-            })
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "next".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
             .await
             .unwrap();
 
-        assert_eq!(reply.text, "fake response");
+        assert_eq!(output.final_reply(), "fake response");
         let prompts = executor.prompts.lock().await;
         assert!(prompts[0].prompt.contains("user: prior"));
         assert!(prompts[0].prompt.contains("Current user message:\nnext"));
@@ -512,24 +586,25 @@ mod tests {
 
     #[test]
     fn channel_events_include_reasoning_and_tool_updates_only() {
-        let events = channel_events_from_executor_updates(
-            "codex",
-            &[
-                ExecutorUpdate::new("plan", "Plan", "working", ""),
-                ExecutorUpdate::new(
-                    "agent_thought_chunk",
-                    "Reasoning",
-                    "raw thinking should not leak",
-                    "",
-                ),
-                ExecutorUpdate::new("tool_call", "Bash", "$ cargo test\nok", "completed")
-                    .with_channel_event(ExecutorChannelEvent::tool_call("Bash", "$ cargo test")),
-                ExecutorUpdate::new("agent_thought_chunk", "Reasoning", "summary", "")
-                    .with_channel_event(ExecutorChannelEvent::reasoning_summary(
-                        "I should inspect the config.",
-                    )),
-            ],
-        );
+        let updates = [
+            ExecutorUpdate::new("plan", "Plan", "working", ""),
+            ExecutorUpdate::new(
+                "agent_thought_chunk",
+                "Reasoning",
+                "raw thinking should not leak",
+                "",
+            ),
+            ExecutorUpdate::new("tool_call", "Bash", "$ cargo test\nok", "completed")
+                .with_channel_event(ExecutorChannelEvent::tool_call("Bash", "$ cargo test")),
+            ExecutorUpdate::new("agent_thought_chunk", "Reasoning", "summary", "")
+                .with_channel_event(ExecutorChannelEvent::reasoning_summary(
+                    "I should inspect the config.",
+                )),
+        ];
+        let events = updates
+            .iter()
+            .filter_map(|update| channel_event_from_executor_update("codex", update))
+            .collect::<Vec<_>>();
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, RouterChannelEventKind::ToolCall);
@@ -541,6 +616,213 @@ mod tests {
         assert_eq!(
             events[1].render_text(),
             "[codex] Reasoning summary\nI should inspect the config."
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_channel_events_are_emitted_before_final_reply() {
+        #[derive(Debug)]
+        struct StreamingExecutorBackend {
+            release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExecutorBackend for StreamingExecutorBackend {
+            fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+                (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                    name: "kimi".to_string(),
+                    protocol: "fake".to_string(),
+                })
+            }
+
+            fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+                self.get("kimi").into_iter().collect()
+            }
+
+            async fn prepare(
+                &self,
+                _request: ExecutorPrepareRequest,
+            ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+                Ok(crate::executor::PreparedExecutor {
+                    external_session_id: Some("stream-session".to_string()),
+                    started_new_session: true,
+                })
+            }
+
+            async fn prompt(
+                &self,
+                _request: ExecutorPromptRequest,
+                events: &mut dyn ExecutorEventSink,
+            ) -> anyhow::Result<crate::executor::ExecutorResponse> {
+                events
+                    .send(
+                        ExecutorUpdate::new("tool_call", "Bash", "$ cargo test", "completed")
+                            .with_transcript_summary("Bash: status: completed")
+                            .with_channel_event(ExecutorChannelEvent::tool_call(
+                                "Bash",
+                                "status: completed",
+                            )),
+                    )
+                    .await?;
+                let release = self
+                    .release
+                    .lock()
+                    .await
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("release gate already consumed"))?;
+                release.await?;
+                Ok(crate::executor::ExecutorResponse {
+                    final_text: "done".to_string(),
+                })
+            }
+        }
+
+        struct ChannelRouterOutputSink {
+            tx: tokio::sync::mpsc::UnboundedSender<RouterOutputEvent>,
+        }
+
+        #[async_trait::async_trait]
+        impl RouterOutputSink for ChannelRouterOutputSink {
+            fn send_channel_event(&mut self, event: RouterChannelEvent) {
+                let _ = self.tx.send(RouterOutputEvent::Channel(event));
+            }
+
+            async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+                self.tx
+                    .send(RouterOutputEvent::FinalReply(text))
+                    .map_err(|_| anyhow::anyhow!("router output receiver dropped"))
+            }
+        }
+
+        let store = Arc::new(InMemorySessionStore::default());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(StreamingExecutorBackend {
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        });
+        let router = AgentRouter::new("kimi", store, executor);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let handle = tokio::spawn(async move {
+            let mut output = ChannelRouterOutputSink { tx };
+            router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "run tests".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, RouterOutputEvent::Channel(_)));
+        assert!(rx.try_recv().is_err());
+
+        release_tx.send(()).unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(second, RouterOutputEvent::FinalReply(text) if text == "done"));
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn best_effort_channel_event_delivery_does_not_fail_successful_turn() {
+        #[derive(Debug)]
+        struct ToolEventExecutorBackend;
+
+        #[async_trait::async_trait]
+        impl ExecutorBackend for ToolEventExecutorBackend {
+            fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+                (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                    name: "kimi".to_string(),
+                    protocol: "fake".to_string(),
+                })
+            }
+
+            fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+                self.get("kimi").into_iter().collect()
+            }
+
+            async fn prepare(
+                &self,
+                _request: ExecutorPrepareRequest,
+            ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+                Ok(crate::executor::PreparedExecutor {
+                    external_session_id: Some("tool-session".to_string()),
+                    started_new_session: true,
+                })
+            }
+
+            async fn prompt(
+                &self,
+                _request: ExecutorPromptRequest,
+                events: &mut dyn ExecutorEventSink,
+            ) -> anyhow::Result<crate::executor::ExecutorResponse> {
+                events
+                    .send(
+                        ExecutorUpdate::new("tool_call", "Bash", "$ cargo test", "completed")
+                            .with_transcript_summary("Bash: status: completed")
+                            .with_channel_event(ExecutorChannelEvent::tool_call(
+                                "Bash",
+                                "status: completed",
+                            )),
+                    )
+                    .await?;
+                Ok(crate::executor::ExecutorResponse {
+                    final_text: "done".to_string(),
+                })
+            }
+        }
+
+        #[derive(Default)]
+        struct BestEffortChannelEventSink {
+            channel_event_count: usize,
+            final_replies: Vec<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl RouterOutputSink for BestEffortChannelEventSink {
+            fn send_channel_event(&mut self, _event: RouterChannelEvent) {
+                self.channel_event_count += 1;
+            }
+
+            async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+                self.final_replies.push(text);
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(ToolEventExecutorBackend);
+        let router = AgentRouter::new("kimi", store.clone(), executor);
+        let mut output = BestEffortChannelEventSink::default();
+
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "run tests".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.channel_event_count, 1);
+        assert_eq!(output.final_replies, ["done".to_string()]);
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(
+            saved.executor_bindings["kimi"].health,
+            ExecutorHealth::Healthy
         );
     }
 
@@ -564,12 +846,16 @@ mod tests {
         store.save(state).await;
         let router = AgentRouter::new("kimi", store, executor.clone());
 
+        let mut output = CollectingRouterOutputSink::default();
         router
-            .handle(RouterInput {
-                session_key: "slack:C1:T1".to_string(),
-                text: "continue".to_string(),
-                user_id: None,
-            })
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "continue".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
             .await
             .unwrap();
 
@@ -603,12 +889,16 @@ mod tests {
         store.save(state).await;
         let router = AgentRouter::new("kimi", store, executor.clone());
 
+        let mut output = CollectingRouterOutputSink::default();
         router
-            .handle(RouterInput {
-                session_key: "slack:C1:T1".to_string(),
-                text: "recover".to_string(),
-                user_id: None,
-            })
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "recover".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
             .await
             .unwrap();
 
@@ -651,6 +941,7 @@ mod tests {
             async fn prompt(
                 &self,
                 _request: ExecutorPromptRequest,
+                _events: &mut dyn ExecutorEventSink,
             ) -> anyhow::Result<crate::executor::ExecutorResponse> {
                 anyhow::bail!("prompt failed")
             }
@@ -673,12 +964,16 @@ mod tests {
         store.save(state).await;
         let router = AgentRouter::new("kimi", store.clone(), executor);
 
+        let mut output = CollectingRouterOutputSink::default();
         let err = router
-            .handle(RouterInput {
-                session_key: "slack:C1:T1".to_string(),
-                text: "recover".to_string(),
-                user_id: None,
-            })
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "recover".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
             .await
             .unwrap_err();
 

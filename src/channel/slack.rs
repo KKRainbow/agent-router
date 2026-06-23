@@ -11,7 +11,7 @@ use crate::{
     approval::{SharedApprovalBroker, is_approval_command},
     channel::EventDeduper,
     config::SlackConfig,
-    router::{RouterInput, RouterService},
+    router::{RouterInput, RouterOutputSink, RouterService},
 };
 
 #[derive(Debug, Clone)]
@@ -154,18 +154,20 @@ impl SlackSocketModeChannel {
         {
             return Ok(());
         }
-        let reply = router
-            .handle(RouterInput {
-                session_key: event.session_key(),
-                text,
-                user_id: Some(event.user),
-            })
+        let mut output = SlackRouterOutputSink {
+            channel: self.clone(),
+            target: reply_target,
+        };
+        router
+            .handle(
+                RouterInput {
+                    session_key: event.session_key(),
+                    text,
+                    user_id: Some(event.user),
+                },
+                &mut output,
+            )
             .await?;
-        for channel_event in &reply.channel_events {
-            self.post_message(&reply_target, &channel_event.render_text())
-                .await?;
-        }
-        self.post_message(&reply_target, &reply.text).await?;
         Ok(())
     }
 
@@ -180,22 +182,24 @@ impl SlackSocketModeChannel {
         let text = format!("{} {}", command.command, command.text)
             .trim()
             .to_string();
-        let reply = router
-            .handle(RouterInput {
-                session_key: format!("slack:{}:slash:{}", command.channel_id, command.user_id),
-                text,
-                user_id: Some(command.user_id),
-            })
-            .await?;
         let reply_target = SlackReplyTarget {
-            channel: command.channel_id,
+            channel: command.channel_id.clone(),
             thread_ts: None,
         };
-        for channel_event in &reply.channel_events {
-            self.post_message(&reply_target, &channel_event.render_text())
-                .await?;
-        }
-        self.post_message(&reply_target, &reply.text).await?;
+        let mut output = SlackRouterOutputSink {
+            channel: self.clone(),
+            target: reply_target,
+        };
+        router
+            .handle(
+                RouterInput {
+                    session_key: format!("slack:{}:slash:{}", command.channel_id, command.user_id),
+                    text,
+                    user_id: Some(command.user_id),
+                },
+                &mut output,
+            )
+            .await?;
         Ok(())
     }
 
@@ -297,6 +301,28 @@ impl SlackSocketModeChannel {
 
     fn should_accept_channel(&self, channel: &str) -> bool {
         self.cfg.allowed_channels.is_empty() || self.cfg.allowed_channels.contains(channel)
+    }
+}
+
+struct SlackRouterOutputSink {
+    channel: SlackSocketModeChannel,
+    target: SlackReplyTarget,
+}
+
+#[async_trait::async_trait]
+impl RouterOutputSink for SlackRouterOutputSink {
+    fn send_channel_event(&mut self, event: crate::router::RouterChannelEvent) {
+        let channel = self.channel.clone();
+        let target = self.target.clone();
+        tokio::spawn(async move {
+            if let Err(err) = channel.post_message(&target, &event.render_text()).await {
+                tracing::warn!(error = %err, "failed to post Slack channel event");
+            }
+        });
+    }
+
+    async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+        self.channel.post_message(&self.target, &text).await
     }
 }
 

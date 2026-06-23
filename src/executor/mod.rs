@@ -118,7 +118,11 @@ pub enum ExecutorChannelEventKind {
 #[derive(Debug, Clone)]
 pub struct ExecutorResponse {
     pub final_text: String,
-    pub updates: Vec<ExecutorUpdate>,
+}
+
+#[async_trait]
+pub trait ExecutorEventSink: Send {
+    async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -126,7 +130,11 @@ pub trait ExecutorBackend: Send + Sync + 'static {
     fn get(&self, name: &str) -> Option<ExecutorDescriptor>;
     fn list(&self) -> Vec<ExecutorDescriptor>;
     async fn prepare(&self, request: ExecutorPrepareRequest) -> anyhow::Result<PreparedExecutor>;
-    async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse>;
+    async fn prompt(
+        &self,
+        request: ExecutorPromptRequest,
+        events: &mut dyn ExecutorEventSink,
+    ) -> anyhow::Result<ExecutorResponse>;
 }
 
 #[cfg(test)]
@@ -137,8 +145,8 @@ pub mod test_support {
     use tokio::sync::Mutex;
 
     use super::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorPrepareRequest, ExecutorPromptRequest,
-        ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
+        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
     };
 
     #[derive(Debug, Default)]
@@ -153,6 +161,19 @@ pub mod test_support {
         pub session_key: String,
         pub executor: String,
         pub prompt: String,
+    }
+
+    #[derive(Debug, Default)]
+    pub struct CollectingExecutorEventSink {
+        pub updates: Vec<ExecutorUpdate>,
+    }
+
+    #[async_trait]
+    impl ExecutorEventSink for CollectingExecutorEventSink {
+        async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
+            self.updates.push(update);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -188,18 +209,24 @@ pub mod test_support {
             })
         }
 
-        async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse> {
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            events: &mut dyn ExecutorEventSink,
+        ) -> anyhow::Result<ExecutorResponse> {
             self.prompts.lock().await.push(ExecutorRequest {
                 session_key: request.session_key,
                 executor: request.executor,
                 prompt: request.prompt,
             });
-            Ok(ExecutorResponse {
-                final_text: "fake response".to_string(),
-                updates: vec![
+            events
+                .send(
                     ExecutorUpdate::new("plan", "Plan", "working", "")
                         .with_transcript_summary("Plan: working"),
-                ],
+                )
+                .await?;
+            Ok(ExecutorResponse {
+                final_text: "fake response".to_string(),
             })
         }
     }

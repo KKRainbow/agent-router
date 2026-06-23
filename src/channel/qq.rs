@@ -14,7 +14,7 @@ use crate::{
     approval::{SharedApprovalBroker, is_approval_command},
     channel::EventDeduper,
     config::QqConfig,
-    router::{RouterInput, RouterService},
+    router::{RouterInput, RouterOutputSink, RouterService},
     session::work_queue::{EnqueueResult, SessionWorkQueue},
 };
 
@@ -279,29 +279,22 @@ impl QqBotChannel {
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
         self.remember_reply_context(&message).await;
-        let reply = router
-            .handle(RouterInput {
-                session_key: message.session_key.clone(),
-                text: message.text,
-                user_id: Some(message.user_id),
-            })
-            .await?;
-        for channel_event in &reply.channel_events {
-            self.send_reply_message(
-                &message.session_key,
-                &message.target,
-                &message.msg_id,
-                &channel_event.render_text(),
+        let mut output = QqRouterOutputSink {
+            channel: self.clone(),
+            session_key: message.session_key.clone(),
+            target: message.target,
+            msg_id: message.msg_id,
+        };
+        router
+            .handle(
+                RouterInput {
+                    session_key: message.session_key,
+                    text: message.text,
+                    user_id: Some(message.user_id),
+                },
+                &mut output,
             )
-            .await?;
-        }
-        self.send_reply_message(
-            &message.session_key,
-            &message.target,
-            &message.msg_id,
-            &reply.text,
-        )
-        .await
+            .await
     }
 
     fn spawn_approval_notifier(self: Arc<Self>) {
@@ -521,6 +514,37 @@ impl QqBotChannel {
             "QQ_CLIENT_SECRET is required"
         );
         Ok(())
+    }
+}
+
+struct QqRouterOutputSink {
+    channel: QqBotChannel,
+    session_key: String,
+    target: QqReplyTarget,
+    msg_id: String,
+}
+
+#[async_trait::async_trait]
+impl RouterOutputSink for QqRouterOutputSink {
+    fn send_channel_event(&mut self, event: crate::router::RouterChannelEvent) {
+        let channel = self.channel.clone();
+        let session_key = self.session_key.clone();
+        let target = self.target.clone();
+        let msg_id = self.msg_id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = channel
+                .send_reply_message(&session_key, &target, &msg_id, &event.render_text())
+                .await
+            {
+                tracing::warn!(error = %err, "failed to post QQ channel event");
+            }
+        });
+    }
+
+    async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+        self.channel
+            .send_reply_message(&self.session_key, &self.target, &self.msg_id, &text)
+            .await
     }
 }
 

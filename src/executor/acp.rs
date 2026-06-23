@@ -21,8 +21,8 @@ use crate::{
     },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorPrepareRequest, ExecutorPromptRequest,
-        ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
+        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
     },
 };
 
@@ -144,15 +144,20 @@ impl ExecutorBackend for AcpExecutorManager {
         })
     }
 
-    async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse> {
+    async fn prompt(
+        &self,
+        request: ExecutorPromptRequest,
+        events: &mut dyn ExecutorEventSink,
+    ) -> anyhow::Result<ExecutorResponse> {
         let session = self
             .existing_session(&request.session_key, &request.executor)
             .await?;
         let mut session = session.lock().await;
-        let result = session.prompt(&request.prompt, request.user_id).await?;
+        let result = session
+            .prompt(&request.prompt, request.user_id, events)
+            .await?;
         Ok(ExecutorResponse {
             final_text: result.final_text,
-            updates: result.updates,
         })
     }
 }
@@ -274,14 +279,19 @@ impl AcpSession {
         &mut self,
         prompt: &str,
         user_id: Option<String>,
+        events: &mut dyn ExecutorEventSink,
     ) -> anyhow::Result<AcpPromptResult> {
         self.client.set_active_user(user_id).await;
-        let result = self.prompt_with_active_user(prompt).await;
+        let result = self.prompt_with_active_user(prompt, events).await;
         self.client.clear_active_user().await;
         result
     }
 
-    async fn prompt_with_active_user(&mut self, prompt: &str) -> anyhow::Result<AcpPromptResult> {
+    async fn prompt_with_active_user(
+        &mut self,
+        prompt: &str,
+        events: &mut dyn ExecutorEventSink,
+    ) -> anyhow::Result<AcpPromptResult> {
         let session_id = self
             .session_id
             .clone()
@@ -296,14 +306,13 @@ impl AcpSession {
         );
         tokio::pin!(response_fut);
 
-        let mut updates = Vec::new();
         let mut text_parts = Vec::new();
         let result = loop {
             tokio::select! {
                 result = &mut response_fut => break result?,
                 received = updates_rx.recv() => {
                     match received {
-                        Ok(update) => collect_update(update, &mut updates, &mut text_parts),
+                        Ok(update) => collect_update(update, events, &mut text_parts).await?,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => continue,
                     }
@@ -311,35 +320,31 @@ impl AcpSession {
             }
         };
         while let Ok(update) = updates_rx.try_recv() {
-            collect_update(update, &mut updates, &mut text_parts);
+            collect_update(update, events, &mut text_parts).await?;
         }
         let final_text = if text_parts.is_empty() {
             extract_text_result(&result)
         } else {
             text_parts.join("")
         };
-        Ok(AcpPromptResult {
-            final_text,
-            updates,
-        })
+        Ok(AcpPromptResult { final_text })
     }
 }
 
-fn collect_update(
+async fn collect_update(
     update: ExecutorUpdate,
-    updates: &mut Vec<ExecutorUpdate>,
+    events: &mut dyn ExecutorEventSink,
     text_parts: &mut Vec<String>,
-) {
+) -> anyhow::Result<()> {
     if update.kind == "agent_message_chunk" {
         text_parts.push(update.text.clone());
     }
-    updates.push(update);
+    events.send(update).await
 }
 
 #[derive(Debug)]
 struct AcpPromptResult {
     final_text: String,
-    updates: Vec<ExecutorUpdate>,
 }
 
 #[derive(Debug)]
@@ -798,7 +803,10 @@ mod tests {
     use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
 
     use crate::approval::ApprovalBroker;
-    use crate::executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest};
+    use crate::executor::{
+        ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest,
+        test_support::CollectingExecutorEventSink,
+    };
 
     use super::*;
 
@@ -865,13 +873,17 @@ for line in sys.stdin:
             })
             .await
             .unwrap();
+        let mut events = CollectingExecutorEventSink::default();
         let response = manager
-            .prompt(ExecutorPromptRequest {
-                session_key: "session-1".to_string(),
-                executor: "kimi".to_string(),
-                prompt: "hello".to_string(),
-                user_id: Some("U1".to_string()),
-            })
+            .prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "kimi".to_string(),
+                    prompt: "hello".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            )
             .await
             .unwrap();
 
@@ -881,7 +893,7 @@ for line in sys.stdin:
         );
         assert_eq!(response.final_text, "reply:hello");
         assert!(prepared.started_new_session);
-        assert_eq!(response.updates[0].kind, "plan");
+        assert_eq!(events.updates[0].kind, "plan");
     }
 
     #[tokio::test]
@@ -969,13 +981,17 @@ for line in sys.stdin:
 
         let prompt_manager = manager.clone();
         let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
             prompt_manager
-                .prompt(ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "kimi".to_string(),
-                    prompt: "run tests".to_string(),
-                    user_id: Some("U1".to_string()),
-                })
+                .prompt(
+                    ExecutorPromptRequest {
+                        session_key: "session-1".to_string(),
+                        executor: "kimi".to_string(),
+                        prompt: "run tests".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                )
                 .await
         });
         let approval_prompt = prompts.recv().await.unwrap();
@@ -1046,13 +1062,17 @@ for line in sys.stdin:
             .await
             .unwrap();
 
+        let mut events = CollectingExecutorEventSink::default();
         let err = manager
-            .prompt(ExecutorPromptRequest {
-                session_key: "session-1".to_string(),
-                executor: "kimi".to_string(),
-                prompt: "hello".to_string(),
-                user_id: Some("U1".to_string()),
-            })
+            .prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "kimi".to_string(),
+                    prompt: "hello".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            )
             .await
             .unwrap_err();
 

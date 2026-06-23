@@ -105,8 +105,8 @@ QQ_SANDBOX=false
 Slack and QQ are enabled automatically when all required credentials for that
 channel are present, unless the config explicitly sets `enabled: false`.
 When an executor reports safe tool-call or reasoning-summary updates, Agent
-Router echoes those updates back to the originating channel before the final
-assistant reply.
+Router streams those updates back to the originating channel while the turn is
+still running, before the final assistant reply.
 
 QQ access can be restricted with comma-separated openid lists:
 
