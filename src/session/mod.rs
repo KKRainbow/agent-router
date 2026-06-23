@@ -10,6 +10,23 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    #[default]
+    Normal,
+    Yolo,
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Yolo => "yolo",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -82,6 +99,8 @@ pub struct SessionState {
     pub session_key: String,
     pub default_executor: String,
     pub active_executor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode_override: Option<ApprovalMode>,
     pub transcript: Vec<TranscriptMessage>,
     pub executor_bindings: BTreeMap<String, ExecutorBinding>,
 }
@@ -93,6 +112,7 @@ impl SessionState {
             session_key: session_key.into(),
             active_executor: default_executor.clone(),
             default_executor,
+            approval_mode_override: None,
             transcript: Vec::new(),
             executor_bindings: BTreeMap::new(),
         }

@@ -1,11 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use agent_router::{
     approval::ApprovalBroker,
     channel::{qq::QqBotChannel, slack::SlackSocketModeChannel},
     config::{AppConfig, default_config_path, load_dotenv},
     executor::registry::ExecutorRegistry,
-    router::{AgentRouter, RouterService},
+    router::{AgentRouter, RouterService, SessionApprovalPolicy},
     session::store::InMemorySessionStore,
 };
 use clap::Parser;
@@ -41,13 +41,21 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load(config_path.as_deref())?;
 
     let store = Arc::new(InMemorySessionStore::default());
-    let approvals = Arc::new(ApprovalBroker::default());
+    let approvals = Arc::new(ApprovalBroker::with_policy(
+        Duration::from_secs(120),
+        Arc::new(SessionApprovalPolicy::new(
+            config.router.default_executor.clone(),
+            config.approval.default_mode,
+            store.clone(),
+        )),
+    ));
     let executor = Arc::new(ExecutorRegistry::new(
         config.executors.clone(),
         approvals.clone(),
     ));
-    let router: Arc<dyn RouterService> = Arc::new(AgentRouter::with_approvals(
+    let router: Arc<dyn RouterService> = Arc::new(AgentRouter::with_approval_mode(
         config.router.default_executor.clone(),
+        config.approval.default_mode,
         store,
         executor,
         approvals.clone(),

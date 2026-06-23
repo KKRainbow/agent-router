@@ -635,11 +635,13 @@ fn codex_approval_request(
                 id: "accept".to_string(),
                 kind: "allow_once".to_string(),
                 name: "Approve".to_string(),
+                auto_approvable: true,
             },
             ApprovalOption {
                 id: "decline".to_string(),
                 kind: "reject_once".to_string(),
                 name: "Deny".to_string(),
+                auto_approvable: false,
             },
         ],
     }

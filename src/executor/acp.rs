@@ -720,6 +720,7 @@ fn permission_options(params: &Value) -> Vec<ApprovalOption> {
                         id: id.to_string(),
                         kind: kind.to_string(),
                         name: name.to_string(),
+                        auto_approvable: true,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -731,11 +732,13 @@ fn permission_options(params: &Value) -> Vec<ApprovalOption> {
                     id: "allow_once".to_string(),
                     kind: "allow_once".to_string(),
                     name: "Allow once".to_string(),
+                    auto_approvable: false,
                 },
                 ApprovalOption {
                     id: "deny".to_string(),
                     kind: "reject_once".to_string(),
                     name: "Deny".to_string(),
+                    auto_approvable: false,
                 },
             ]
         })
@@ -876,6 +879,33 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn synthetic_acp_permission_options_are_not_auto_approvable() {
+        let message = serde_json::json!({
+            "params": {
+                "toolCall": {
+                    "title": "Run shell command",
+                    "content": [{"type": "text", "text": "$ cargo test"}]
+                }
+            }
+        });
+
+        let request = approval_request_from_permission_message(
+            &message,
+            "session-1",
+            "kimi",
+            Some("U1".to_string()),
+        );
+
+        assert!(
+            request
+                .options
+                .iter()
+                .any(|option| option.id == "allow_once")
+        );
+        assert_eq!(request.allow_once_option_id(), None);
+    }
 
     #[tokio::test]
     async fn acp_manager_prompts_fake_stdio_server() {

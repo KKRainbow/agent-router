@@ -6,12 +6,20 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::session::ApprovalMode;
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub router: RouterConfig,
+    pub approval: ApprovalConfig,
     pub slack: SlackConfig,
     pub qq: QqConfig,
     pub executors: BTreeMap<String, ExecutorConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalConfig {
+    pub default_mode: ApprovalMode,
 }
 
 #[derive(Debug, Clone)]
@@ -59,9 +67,15 @@ pub struct ExecutorConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     router: Option<FileRouterConfig>,
+    approval: Option<FileApprovalConfig>,
     slack: Option<FileSlackConfig>,
     qq: Option<FileQqConfig>,
     executors: Option<BTreeMap<String, FileExecutorConfig>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileApprovalConfig {
+    default_mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -141,6 +155,17 @@ impl AppConfig {
                     .and_then(|router| router.default_executor.clone())
             })
             .unwrap_or_else(|| "kimi".to_string());
+
+        let approval_file = file_cfg.approval.unwrap_or_default();
+        let default_approval_mode = env_cfg
+            .approval_default_mode
+            .or(approval_file.default_mode)
+            .map(|value| parse_approval_mode(&value))
+            .transpose()?
+            .unwrap_or_default();
+        let approval = ApprovalConfig {
+            default_mode: default_approval_mode,
+        };
 
         let slack_file = file_cfg.slack.unwrap_or_default();
         let slack_bot_token = env_cfg
@@ -230,6 +255,7 @@ impl AppConfig {
 
         Ok(Self {
             router: RouterConfig { default_executor },
+            approval,
             slack,
             qq,
             executors,
@@ -240,6 +266,7 @@ impl AppConfig {
 #[derive(Debug, Default)]
 struct EnvConfig {
     default_executor: Option<String>,
+    approval_default_mode: Option<String>,
     slack_enabled: Option<bool>,
     slack_bot_token: Option<String>,
     slack_app_token: Option<String>,
@@ -259,6 +286,8 @@ impl EnvConfig {
     fn from_process() -> Self {
         Self {
             default_executor: nonempty_env("AGENT_ROUTER_DEFAULT_EXECUTOR"),
+            approval_default_mode: nonempty_env("AGENT_ROUTER_APPROVAL_DEFAULT_MODE")
+                .or_else(|| nonempty_env("AGENT_ROUTER_APPROVAL_MODE")),
             slack_enabled: env_bool("SLACK_ENABLED"),
             slack_bot_token: nonempty_env("SLACK_BOT_TOKEN"),
             slack_app_token: nonempty_env("SLACK_APP_TOKEN"),
@@ -348,6 +377,14 @@ fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Resul
     })
 }
 
+fn parse_approval_mode(value: &str) -> anyhow::Result<ApprovalMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Ok(ApprovalMode::Normal),
+        "yolo" => Ok(ApprovalMode::Yolo),
+        other => anyhow::bail!("approval.default_mode `{other}` is not supported"),
+    }
+}
+
 fn nonempty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
@@ -393,6 +430,7 @@ mod tests {
         assert_eq!(kimi.protocol, ExecutorProtocol::Acp);
         assert_eq!(kimi.command, "kimi");
         assert_eq!(kimi.args, ["acp"]);
+        assert_eq!(cfg.approval.default_mode, ApprovalMode::Normal);
         assert!(!cfg.slack.enabled);
         assert!(!cfg.qq.enabled);
     }
@@ -453,6 +491,37 @@ qq:
             cfg.qq.allowed_groups,
             ["g1", "g2", "g3"].into_iter().map(str::to_string).collect()
         );
+    }
+
+    #[test]
+    fn parses_approval_default_mode() {
+        let raw = r#"
+approval:
+  default_mode: yolo
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert_eq!(cfg.approval.default_mode, ApprovalMode::Yolo);
+    }
+
+    #[test]
+    fn env_approval_mode_overrides_file_config() {
+        let raw = r#"
+approval:
+  default_mode: normal
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(
+            file_cfg,
+            EnvConfig {
+                approval_default_mode: Some("yolo".to_string()),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cfg.approval.default_mode, ApprovalMode::Yolo);
     }
 
     #[test]

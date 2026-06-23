@@ -1,6 +1,11 @@
 router:
   default_executor: kimi
 
+approval:
+  # normal: ask for approval prompts.
+  # yolo: auto-approve one-shot allow options unless a session overrides it.
+  default_mode: normal
+
 executors:
   kimi:
     protocol: acp

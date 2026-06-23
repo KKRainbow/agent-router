@@ -82,6 +82,7 @@ impl SlackSocketModeChannel {
 
     fn spawn_approval_notifier(self: Arc<Self>) {
         let mut prompts = self.approvals.subscribe();
+        let prompt_channel = self.clone();
         tokio::spawn(async move {
             loop {
                 let prompt = match prompts.recv().await {
@@ -92,8 +93,28 @@ impl SlackSocketModeChannel {
                 let Some(target) = SlackReplyTarget::from_session_key(&prompt.session_key) else {
                     continue;
                 };
-                if let Err(err) = self.post_message(&target, &prompt.render_text()).await {
+                if let Err(err) = prompt_channel
+                    .post_message(&target, &prompt.render_text())
+                    .await
+                {
                     tracing::warn!(error = %err, "failed to post Slack approval prompt");
+                }
+            }
+        });
+
+        let mut auto_selections = self.approvals.subscribe_auto_selections();
+        tokio::spawn(async move {
+            loop {
+                let notice = match auto_selections.recv().await {
+                    Ok(notice) => notice,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(target) = SlackReplyTarget::from_session_key(&notice.session_key) else {
+                    continue;
+                };
+                if let Err(err) = self.post_message(&target, &notice.render_text()).await {
+                    tracing::warn!(error = %err, "failed to post Slack auto-approval notice");
                 }
             }
         });

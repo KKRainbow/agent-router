@@ -312,6 +312,7 @@ impl QqBotChannel {
 
     fn spawn_approval_notifier(self: Arc<Self>) {
         let mut prompts = self.approvals.subscribe();
+        let prompt_channel = self.clone();
         tokio::spawn(async move {
             loop {
                 let prompt = match prompts.recv().await {
@@ -322,11 +323,31 @@ impl QqBotChannel {
                 if !prompt.session_key.starts_with("qq:") {
                     continue;
                 }
-                if let Err(err) = self
+                if let Err(err) = prompt_channel
                     .send_session_message(&prompt.session_key, &prompt.render_text())
                     .await
                 {
                     tracing::warn!(error = %err, "failed to post QQ approval prompt");
+                }
+            }
+        });
+
+        let mut auto_selections = self.approvals.subscribe_auto_selections();
+        tokio::spawn(async move {
+            loop {
+                let notice = match auto_selections.recv().await {
+                    Ok(notice) => notice,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if !notice.session_key.starts_with("qq:") {
+                    continue;
+                }
+                if let Err(err) = self
+                    .send_session_message(&notice.session_key, &notice.render_text())
+                    .await
+                {
+                    tracing::warn!(error = %err, "failed to post QQ auto-approval notice");
                 }
             }
         });

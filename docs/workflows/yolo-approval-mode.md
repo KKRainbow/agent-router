@@ -41,6 +41,9 @@ approval:
   default_mode: normal  # normal | yolo
 ```
 
+The same value can be overridden by `AGENT_ROUTER_APPROVAL_DEFAULT_MODE` or
+`AGENT_ROUTER_APPROVAL_MODE`.
+
 and a per-session override stored in `SessionState`:
 
 ```text
@@ -64,8 +67,8 @@ Per-session commands should mutate only the current `session_key`:
 - `/yolo off` sets the current session override to `normal`.
 - `/yolo inherit` clears the override and returns to the global default.
 
-`/new` should clear the session override so a reset session returns to the
-operator-configured default.
+When `/new` is implemented, it must clear the session override so a reset
+session returns to the operator-configured default.
 
 Slack slash commands should not be used to change a thread-specific YOLO mode in
 version 1 because Slack slash command payloads are channel-scoped, not
@@ -173,5 +176,4 @@ Integration-style router tests should cover:
 - `/yolo on` followed by an executor permission request in the same session is
   auto-approved.
 - A different session still receives a manual approval prompt.
-- `/new` clears the session override.
-
+- The future `/new` session reset clears the session override.

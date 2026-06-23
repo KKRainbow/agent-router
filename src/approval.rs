@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -7,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use tokio::{
     sync::{Mutex, broadcast, oneshot},
     time,
@@ -35,6 +37,13 @@ impl ApprovalRequest {
             .map(|option| option.id.clone())
     }
 
+    pub fn allow_once_option_id(&self) -> Option<String> {
+        self.options
+            .iter()
+            .find(|option| option.auto_approvable && option.kind == "allow_once")
+            .map(|option| option.id.clone())
+    }
+
     fn deny_option_id(&self) -> Option<String> {
         self.options
             .iter()
@@ -53,6 +62,7 @@ pub struct ApprovalOption {
     pub id: String,
     pub kind: String,
     pub name: String,
+    pub auto_approvable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +98,23 @@ impl ApprovalPrompt {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ApprovalAutoSelection {
+    pub session_key: String,
+    pub executor: String,
+    pub title: String,
+    pub option_id: String,
+}
+
+impl ApprovalAutoSelection {
+    pub fn render_text(&self) -> String {
+        format!(
+            "Auto-approved in YOLO mode: {}\nExecutor: {}\nSelected: {}",
+            self.title, self.executor, self.option_id
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalCommandReply {
     pub text: String,
@@ -105,18 +132,42 @@ struct PendingApproval {
     responder: oneshot::Sender<ApprovalSelection>,
 }
 
+#[async_trait]
+pub trait ApprovalPolicy: Send + Sync + 'static {
+    async fn auto_selection(&self, request: &ApprovalRequest) -> Option<ApprovalSelection>;
+}
+
+#[derive(Debug, Default)]
+struct ManualApprovalPolicy;
+
+#[async_trait]
+impl ApprovalPolicy for ManualApprovalPolicy {
+    async fn auto_selection(&self, _request: &ApprovalRequest) -> Option<ApprovalSelection> {
+        None
+    }
+}
+
 #[derive(Debug, Default)]
 struct ApprovalState {
     pending: HashMap<String, PendingApproval>,
     session_order: HashMap<String, VecDeque<String>>,
 }
 
-#[derive(Debug)]
 pub struct ApprovalBroker {
     next_id: AtomicU64,
     timeout: Duration,
     state: Mutex<ApprovalState>,
     prompts: broadcast::Sender<ApprovalPrompt>,
+    auto_selections: broadcast::Sender<ApprovalAutoSelection>,
+    policy: Arc<dyn ApprovalPolicy>,
+}
+
+impl fmt::Debug for ApprovalBroker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApprovalBroker")
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ApprovalBroker {
@@ -127,12 +178,19 @@ impl Default for ApprovalBroker {
 
 impl ApprovalBroker {
     pub fn new(timeout: Duration) -> Self {
+        Self::with_policy(timeout, Arc::new(ManualApprovalPolicy))
+    }
+
+    pub fn with_policy(timeout: Duration, policy: Arc<dyn ApprovalPolicy>) -> Self {
         let (prompts, _) = broadcast::channel(256);
+        let (auto_selections, _) = broadcast::channel(256);
         Self {
             next_id: AtomicU64::new(1),
             timeout,
             state: Mutex::new(ApprovalState::default()),
             prompts,
+            auto_selections,
+            policy,
         }
     }
 
@@ -140,7 +198,23 @@ impl ApprovalBroker {
         self.prompts.subscribe()
     }
 
+    pub fn subscribe_auto_selections(&self) -> broadcast::Receiver<ApprovalAutoSelection> {
+        self.auto_selections.subscribe()
+    }
+
     pub async fn request(&self, request: ApprovalRequest) -> ApprovalSelection {
+        if let Some(selection) = self.policy.auto_selection(&request).await {
+            if let ApprovalSelection::Selected(option_id) = &selection {
+                let _ = self.auto_selections.send(ApprovalAutoSelection {
+                    session_key: request.session_key.clone(),
+                    executor: request.executor.clone(),
+                    title: request.title.clone(),
+                    option_id: option_id.clone(),
+                });
+            }
+            return selection;
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let (tx, rx) = oneshot::channel();
         let prompt = ApprovalPrompt {
@@ -334,6 +408,18 @@ pub type SharedApprovalBroker = Arc<ApprovalBroker>;
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct AllowOncePolicy;
+
+    #[async_trait]
+    impl ApprovalPolicy for AllowOncePolicy {
+        async fn auto_selection(&self, request: &ApprovalRequest) -> Option<ApprovalSelection> {
+            request
+                .allow_once_option_id()
+                .map(ApprovalSelection::Selected)
+        }
+    }
+
     fn request(session_key: &str) -> ApprovalRequest {
         ApprovalRequest {
             session_key: session_key.to_string(),
@@ -346,11 +432,13 @@ mod tests {
                     id: "allow_once".to_string(),
                     kind: "allow_once".to_string(),
                     name: "Allow once".to_string(),
+                    auto_approvable: true,
                 },
                 ApprovalOption {
                     id: "deny".to_string(),
                     kind: "reject_once".to_string(),
                     name: "Deny".to_string(),
+                    auto_approvable: false,
                 },
             ],
         }
@@ -361,6 +449,66 @@ mod tests {
             requester_user_id: None,
             ..request(session_key)
         }
+    }
+
+    #[tokio::test]
+    async fn auto_policy_selects_allow_once_without_pending_prompt() {
+        let broker = ApprovalBroker::with_policy(Duration::from_secs(5), Arc::new(AllowOncePolicy));
+        let mut prompts = broker.subscribe();
+        let mut notices = broker.subscribe_auto_selections();
+
+        let selection = broker.request(request("s1")).await;
+
+        assert_eq!(
+            selection,
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+        assert!(prompts.try_recv().is_err());
+        let notice = notices.try_recv().unwrap();
+        assert_eq!(notice.session_key, "s1");
+        assert_eq!(notice.option_id, "allow_once");
+        assert!(notice.render_text().contains("Auto-approved in YOLO mode"));
+    }
+
+    #[tokio::test]
+    async fn auto_policy_without_allow_once_falls_back_to_manual_prompt() {
+        let broker = Arc::new(ApprovalBroker::with_policy(
+            Duration::from_secs(5),
+            Arc::new(AllowOncePolicy),
+        ));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            let mut request = request("s1");
+            request.options = vec![
+                ApprovalOption {
+                    id: "allow_once".to_string(),
+                    kind: "allow_always".to_string(),
+                    name: "Always allow".to_string(),
+                    auto_approvable: true,
+                },
+                ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                    auto_approvable: false,
+                },
+            ];
+            request_broker.request(request).await
+        });
+
+        let prompt = prompts.recv().await.unwrap();
+        assert_eq!(prompt.session_key, "s1");
+        let reply = broker
+            .resolve_command("s1", &format!("/deny {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
     }
 
     #[tokio::test]

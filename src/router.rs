@@ -4,13 +4,15 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
-    approval::{ApprovalBroker, SharedApprovalBroker},
+    approval::{
+        ApprovalBroker, ApprovalPolicy, ApprovalRequest, ApprovalSelection, SharedApprovalBroker,
+    },
     executor::{
         ExecutorBackend, ExecutorChannelEventKind, ExecutorEventSink, ExecutorPrepareRequest,
         ExecutorPromptRequest, ExecutorUpdate,
     },
     session::{
-        ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
+        ApprovalMode, ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
         projection::{
             ProjectionInput, build_context_projection, merge_seen_context,
             projected_assistant_content, visible_message_fingerprints,
@@ -75,12 +77,64 @@ pub trait RouterService: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 }
 
+pub struct SessionApprovalPolicy<S>
+where
+    S: SessionStore,
+{
+    default_executor: String,
+    default_mode: ApprovalMode,
+    store: Arc<S>,
+}
+
+impl<S> SessionApprovalPolicy<S>
+where
+    S: SessionStore,
+{
+    pub fn new(
+        default_executor: impl Into<String>,
+        default_mode: ApprovalMode,
+        store: Arc<S>,
+    ) -> Self {
+        Self {
+            default_executor: default_executor.into(),
+            default_mode,
+            store,
+        }
+    }
+}
+
+#[async_trait]
+impl<S> ApprovalPolicy for SessionApprovalPolicy<S>
+where
+    S: SessionStore,
+{
+    async fn auto_selection(&self, request: &ApprovalRequest) -> Option<ApprovalSelection> {
+        let state = self
+            .store
+            .load_or_create(&request.session_key, &self.default_executor)
+            .await;
+        let effective_mode = state.approval_mode_override.unwrap_or(self.default_mode);
+        if effective_mode != ApprovalMode::Yolo {
+            return None;
+        }
+        let option_id = request.allow_once_option_id()?;
+        tracing::info!(
+            session_key = %request.session_key,
+            executor = %request.executor,
+            option_id = %option_id,
+            "auto-approving request in YOLO mode"
+        );
+        Some(ApprovalSelection::Selected(option_id))
+    }
+}
+
 pub struct AgentRouter<S, E>
 where
     S: SessionStore,
     E: ExecutorBackend,
 {
     default_executor: String,
+    default_approval_mode: ApprovalMode,
     store: Arc<S>,
     executor: Arc<E>,
     approvals: SharedApprovalBroker,
@@ -107,8 +161,25 @@ where
         executor: Arc<E>,
         approvals: SharedApprovalBroker,
     ) -> Self {
+        Self::with_approval_mode(
+            default_executor,
+            ApprovalMode::Normal,
+            store,
+            executor,
+            approvals,
+        )
+    }
+
+    pub fn with_approval_mode(
+        default_executor: impl Into<String>,
+        default_approval_mode: ApprovalMode,
+        store: Arc<S>,
+        executor: Arc<E>,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
         Self {
             default_executor: default_executor.into(),
+            default_approval_mode,
             store,
             executor,
             approvals,
@@ -130,9 +201,15 @@ where
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
         let text = input.text.trim();
-        if text.starts_with("/agent") {
+        let command = text.split_whitespace().next().unwrap_or("");
+        if command == "/agent" {
             return self
                 .handle_agent_command(&input.session_key, text, output)
+                .await;
+        }
+        if command == "/yolo" {
+            return self
+                .handle_yolo_command(&input.session_key, text, output)
                 .await;
         }
         self.route_to_active_executor(input, output).await
@@ -180,6 +257,67 @@ where
         output
             .send_final_reply(format!("Active executor: {target}"))
             .await
+    }
+
+    async fn handle_yolo_command(
+        &self,
+        session_key: &str,
+        text: &str,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        let args = text.trim_start_matches("/yolo").trim();
+        let mut state = self
+            .store
+            .load_or_create(session_key, &self.default_executor)
+            .await;
+        if args.is_empty() || args == "status" {
+            return output
+                .send_final_reply(self.render_yolo_status(&state))
+                .await;
+        }
+        if args.split_whitespace().count() != 1 {
+            return output
+                .send_final_reply("Usage: /yolo [status|on|off|inherit]".to_string())
+                .await;
+        }
+
+        match args {
+            "on" => {
+                state.approval_mode_override = Some(ApprovalMode::Yolo);
+                self.store.save(state.clone()).await;
+                output
+                    .send_final_reply(self.render_yolo_status_with_prefix(
+                        "YOLO mode enabled for this session.",
+                        &state,
+                    ))
+                    .await
+            }
+            "off" => {
+                state.approval_mode_override = Some(ApprovalMode::Normal);
+                self.store.save(state.clone()).await;
+                output
+                    .send_final_reply(self.render_yolo_status_with_prefix(
+                        "YOLO mode disabled for this session.",
+                        &state,
+                    ))
+                    .await
+            }
+            "inherit" => {
+                state.approval_mode_override = None;
+                self.store.save(state.clone()).await;
+                output
+                    .send_final_reply(self.render_yolo_status_with_prefix(
+                        "YOLO mode now inherits the global default.",
+                        &state,
+                    ))
+                    .await
+            }
+            _ => {
+                output
+                    .send_final_reply("Usage: /yolo [status|on|off|inherit]".to_string())
+                    .await
+            }
+        }
     }
 
     async fn route_to_active_executor(
@@ -335,6 +473,29 @@ where
         }
         lines.join("\n")
     }
+
+    fn render_yolo_status_with_prefix(&self, prefix: &str, state: &SessionState) -> String {
+        format!("{prefix}\n{}", self.render_yolo_status(state))
+    }
+
+    fn render_yolo_status(&self, state: &SessionState) -> String {
+        let override_label = state
+            .approval_mode_override
+            .map(ApprovalMode::as_str)
+            .unwrap_or("inherit");
+        let effective_mode = state
+            .approval_mode_override
+            .unwrap_or(self.default_approval_mode);
+        [
+            format!(
+                "Global default approval mode: {}",
+                self.default_approval_mode.as_str()
+            ),
+            format!("Session override: {override_label}"),
+            format!("Effective approval mode: {}", effective_mode.as_str()),
+        ]
+        .join("\n")
+    }
 }
 
 #[async_trait]
@@ -450,7 +611,9 @@ fn update_binding_after_prompt_failure(
 mod tests {
     use super::*;
     use crate::{
-        approval::{ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection},
+        approval::{
+            ApprovalBroker, ApprovalOption, ApprovalPolicy, ApprovalRequest, ApprovalSelection,
+        },
         executor::{ExecutorChannelEvent, test_support::FakeExecutorBackend},
         session::{
             TranscriptMessage, projection::message_fingerprint, store::InMemorySessionStore,
@@ -508,6 +671,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn yolo_commands_update_current_session_override() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::with_approval_mode(
+            "kimi",
+            ApprovalMode::Normal,
+            store.clone(),
+            executor,
+            Arc::new(ApprovalBroker::default()),
+        );
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/yolo on".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert!(output.final_reply().contains("Session override: yolo"));
+        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        assert_eq!(saved.approval_mode_override, Some(ApprovalMode::Yolo));
+
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/yolo inherit".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert!(output.final_reply().contains("Session override: inherit"));
+        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        assert_eq!(saved.approval_mode_override, None);
+
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/yolo off".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert!(output.final_reply().contains("Session override: normal"));
+        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        assert_eq!(saved.approval_mode_override, Some(ApprovalMode::Normal));
+    }
+
+    #[tokio::test]
+    async fn concatenated_yolo_command_name_is_not_a_router_command() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone());
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/yoloon".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "fake response");
+        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        assert_eq!(saved.approval_mode_override, None);
+        assert!(
+            executor.prompts.lock().await[0]
+                .prompt
+                .contains("Current user message:\n/yoloon")
+        );
+    }
+
+    #[tokio::test]
+    async fn yolo_command_enables_broker_auto_approval_for_session() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let approvals = Arc::new(ApprovalBroker::with_policy(
+            Duration::from_secs(5),
+            Arc::new(SessionApprovalPolicy::new(
+                "kimi",
+                ApprovalMode::Normal,
+                store.clone(),
+            )),
+        ));
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::with_approval_mode(
+            "kimi",
+            ApprovalMode::Normal,
+            store,
+            executor,
+            approvals.clone(),
+        );
+        let mut prompts = approvals.subscribe();
+        let mut notices = approvals.subscribe_auto_selections();
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/yolo on".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        let selection = approvals
+            .request(ApprovalRequest {
+                session_key: "slack:dm:D1:111.000".to_string(),
+                executor: "kimi".to_string(),
+                requester_user_id: Some("U1".to_string()),
+                title: "Run command".to_string(),
+                body: "$ cargo test".to_string(),
+                options: vec![ApprovalOption {
+                    id: "allow_once".to_string(),
+                    kind: "allow_once".to_string(),
+                    name: "Allow once".to_string(),
+                    auto_approvable: true,
+                }],
+            })
+            .await;
+
+        assert_eq!(
+            selection,
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+        assert!(prompts.try_recv().is_err());
+        let notice = notices.try_recv().unwrap();
+        assert_eq!(notice.session_key, "slack:dm:D1:111.000");
+    }
+
+    #[tokio::test]
+    async fn session_approval_policy_isolates_slack_dm_sessions() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let policy = SessionApprovalPolicy::new("kimi", ApprovalMode::Normal, store.clone());
+        let mut yolo_session = SessionState::new("slack:dm:D1:111.000", "kimi");
+        yolo_session.approval_mode_override = Some(ApprovalMode::Yolo);
+        store.save(yolo_session).await;
+
+        let yolo_request = ApprovalRequest {
+            session_key: "slack:dm:D1:111.000".to_string(),
+            executor: "kimi".to_string(),
+            requester_user_id: Some("U1".to_string()),
+            title: "Run command".to_string(),
+            body: "$ cargo test".to_string(),
+            options: vec![
+                ApprovalOption {
+                    id: "allow_once".to_string(),
+                    kind: "allow_once".to_string(),
+                    name: "Allow once".to_string(),
+                    auto_approvable: true,
+                },
+                ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                    auto_approvable: false,
+                },
+            ],
+        };
+        let normal_request = ApprovalRequest {
+            session_key: "slack:dm:D1:222.000".to_string(),
+            ..yolo_request.clone()
+        };
+
+        assert_eq!(
+            policy.auto_selection(&yolo_request).await,
+            Some(ApprovalSelection::Selected("allow_once".to_string()))
+        );
+        assert_eq!(policy.auto_selection(&normal_request).await, None);
+    }
+
+    #[tokio::test]
+    async fn session_approval_policy_normal_override_disables_global_yolo() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let policy = SessionApprovalPolicy::new("kimi", ApprovalMode::Yolo, store.clone());
+        let mut state = SessionState::new("slack:channel:C1:111.000", "kimi");
+        state.approval_mode_override = Some(ApprovalMode::Normal);
+        store.save(state).await;
+
+        let request = ApprovalRequest {
+            session_key: "slack:channel:C1:111.000".to_string(),
+            executor: "kimi".to_string(),
+            requester_user_id: Some("U1".to_string()),
+            title: "Run command".to_string(),
+            body: "$ cargo test".to_string(),
+            options: vec![ApprovalOption {
+                id: "allow_once".to_string(),
+                kind: "allow_once".to_string(),
+                name: "Allow once".to_string(),
+                auto_approvable: true,
+            }],
+        };
+
+        assert_eq!(policy.auto_selection(&request).await, None);
+
+        let inherited_request = ApprovalRequest {
+            session_key: "slack:channel:C1:222.000".to_string(),
+            ..request
+        };
+        assert_eq!(
+            policy.auto_selection(&inherited_request).await,
+            Some(ApprovalSelection::Selected("allow_once".to_string()))
+        );
+    }
+
+    #[tokio::test]
     async fn approval_command_resolves_pending_request() {
         let store = Arc::new(InMemorySessionStore::default());
         let executor = Arc::new(FakeExecutorBackend::default());
@@ -529,11 +915,13 @@ mod tests {
                             id: "allow_once".to_string(),
                             kind: "allow_once".to_string(),
                             name: "Allow once".to_string(),
+                            auto_approvable: true,
                         },
                         ApprovalOption {
                             id: "deny".to_string(),
                             kind: "reject_once".to_string(),
                             name: "Deny".to_string(),
+                            auto_approvable: false,
                         },
                     ],
                 })
