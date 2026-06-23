@@ -37,8 +37,14 @@ the first ACP executor backend:
 cargo run -- --config config/agent-router.example.yaml
 ```
 
-Secrets are read from environment variables. The runner also tries `.env` and
-`../.env` for local development:
+Secrets are read from environment variables. The runner also tries these dotenv
+locations, in order, so a local Hermes install can be reused without copying
+tokens into this repository:
+
+1. `.env`
+2. `../.env`
+3. `$HERMES_HOME/.env`
+4. `~/.hermes/.env`
 
 ```bash
 SLACK_BOT_TOKEN=xoxb-...

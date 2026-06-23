@@ -201,13 +201,32 @@ pub fn load_dotenv(path: Option<&Path>) {
         let _ = dotenvy::from_path(path);
         return;
     }
-    for candidate in [Path::new(".env"), Path::new("../.env")] {
+    for candidate in dotenv_candidates() {
         if candidate.exists() {
             let _ = dotenvy::from_path(candidate);
             return;
         }
     }
     let _ = dotenvy::dotenv();
+}
+
+fn dotenv_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from(".env"), PathBuf::from("../.env")];
+    if let Some(hermes_home) = env::var_os("HERMES_HOME").map(PathBuf::from) {
+        candidates.push(hermes_home.join(".env"));
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".hermes").join(".env"));
+    }
+    dedupe_paths(candidates)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
@@ -306,6 +325,27 @@ executors:
         assert_eq!(
             cfg.slack.free_response_channels,
             ["C3", "C4", "C5"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn dotenv_candidates_include_hermes_env_locations() {
+        let candidates = dedupe_paths(vec![
+            PathBuf::from(".env"),
+            PathBuf::from("../.env"),
+            PathBuf::from("/tmp/hermes/.env"),
+            PathBuf::from("/home/test/.hermes/.env"),
+            PathBuf::from("/tmp/hermes/.env"),
+        ]);
+
+        assert_eq!(
+            candidates,
+            [
+                PathBuf::from(".env"),
+                PathBuf::from("../.env"),
+                PathBuf::from("/tmp/hermes/.env"),
+                PathBuf::from("/home/test/.hermes/.env"),
+            ]
         );
     }
 }
