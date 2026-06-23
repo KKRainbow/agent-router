@@ -30,6 +30,7 @@ pub struct SlackConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorProtocol {
     Acp,
+    AppServer,
 }
 
 #[derive(Debug, Clone)]
@@ -242,17 +243,24 @@ pub fn default_config_path() -> Option<PathBuf> {
 fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Result<ExecutorConfig> {
     let protocol = match raw.protocol.as_deref().unwrap_or("acp") {
         "acp" => ExecutorProtocol::Acp,
+        "app_server" | "codex_app_server" => ExecutorProtocol::AppServer,
         other => anyhow::bail!("executors.{name}.protocol `{other}` is not supported in MVP"),
     };
     let command = raw
         .command
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| (protocol == ExecutorProtocol::AppServer).then(|| "codex".to_string()))
         .ok_or_else(|| anyhow::anyhow!("executors.{name}.command is required"))?;
+    let args = match raw.args {
+        Some(args) => args,
+        None if protocol == ExecutorProtocol::AppServer => vec!["app-server".to_string()],
+        None => Vec::new(),
+    };
     Ok(ExecutorConfig {
         name,
         protocol,
         command,
-        args: raw.args.unwrap_or_default(),
+        args,
         cwd: raw.cwd,
         env: raw.env.unwrap_or_default(),
     })
@@ -326,6 +334,25 @@ executors:
             cfg.slack.free_response_channels,
             ["C3", "C4", "C5"].into_iter().map(str::to_string).collect()
         );
+    }
+
+    #[test]
+    fn parses_codex_app_server_executor_config() {
+        let raw = r#"
+router:
+  default_executor: codex
+executors:
+  codex:
+    protocol: app_server
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let codex = cfg.executors.get("codex").unwrap();
+
+        assert_eq!(cfg.router.default_executor, "codex");
+        assert_eq!(codex.protocol, ExecutorProtocol::AppServer);
+        assert_eq!(codex.command, "codex");
+        assert_eq!(codex.args, ["app-server"]);
     }
 
     #[test]

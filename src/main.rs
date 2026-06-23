@@ -4,7 +4,7 @@ use agent_router::{
     approval::ApprovalBroker,
     channel::slack::SlackSocketModeChannel,
     config::{AppConfig, default_config_path, load_dotenv},
-    executor::acp::AcpExecutorManager,
+    executor::registry::ExecutorRegistry,
     router::{AgentRouter, RouterService},
     session::store::InMemorySessionStore,
 };
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(InMemorySessionStore::default());
     let approvals = Arc::new(ApprovalBroker::default());
-    let executor = Arc::new(AcpExecutorManager::with_approvals(
+    let executor = Arc::new(ExecutorRegistry::new(
         config.executors.clone(),
         approvals.clone(),
     ));

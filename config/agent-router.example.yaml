@@ -6,6 +6,9 @@ executors:
     protocol: acp
     command: kimi
     args: ["acp"]
+  codex:
+    protocol: app_server
+    command: codex
 
 slack:
   # Prefer environment variables for secrets:

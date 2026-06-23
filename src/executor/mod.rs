@@ -1,4 +1,6 @@
 pub mod acp;
+pub mod codex_app_server;
+pub mod registry;
 
 use async_trait::async_trait;
 

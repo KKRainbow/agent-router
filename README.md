@@ -21,8 +21,8 @@ router is infrastructure around channels, sessions, executor routing, and
 handoff policy. Hermes, OpenClaw, Codex, Kimi, or future agents should be
 pluggable executor backends behind a narrow protocol interface.
 
-The first backend protocol is ACP. Codex app-server support can be added later
-as a separate backend protocol adapter.
+The first backend protocol is ACP. Codex app-server is supported as a separate
+backend protocol adapter.
 
 Slack and QQ are the first channels that matter. Slack should use the official
 Slack API model. QQ should use Tencent's official QQ Bot API, with ZeroClaw's QQ
@@ -30,8 +30,9 @@ adapter as a protocol reference rather than a runtime dependency.
 
 ## MVP
 
-The current MVP runs Slack Socket Mode as the first channel and `kimi acp` as
-the first ACP executor backend:
+The current MVP runs Slack Socket Mode as the first channel, `kimi acp` as the
+first ACP executor backend, and `codex app-server` as the first app-server
+executor backend:
 
 ```bash
 cargo run -- --config config/agent-router.example.yaml
@@ -55,6 +56,13 @@ The MVP supports `/agent status` and `/agent <name>` from Slack messages. A
 session starts with `default_executor`, has one `active_executor`, and shares
 context between executor switches by projecting canonical transcript into the
 target executor.
+
+Example switches:
+
+```text
+/agent kimi
+/agent codex
+```
 
 ## Non-Goals
 
