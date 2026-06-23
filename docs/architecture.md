@@ -19,10 +19,10 @@ Agent Router owns:
 - inbound event normalization
 - outbound message delivery
 - session identity and channel thread mapping
-- agent selection and handoff policy
-- shared session context that can be passed between agents
+- executor selection and handoff policy
+- shared session context that can be projected to executor backends
 
-Agent runtimes own:
+Executor backends own:
 
 - model selection
 - tool execution
@@ -30,8 +30,8 @@ Agent runtimes own:
 - agent-specific prompts and policies
 - domain behavior
 
-The boundary should be a small runtime interface, not a shared dependency on a
-specific agent implementation.
+The boundary should be a small backend protocol interface, not a shared
+dependency on a specific agent implementation.
 
 ## First-Class Concepts
 
@@ -52,11 +52,16 @@ key.
 
 The session is the unit of shared handoff context.
 
-### Agent Runtime
+### Executor Backend
 
-An agent runtime is anything that can accept a normalized session turn and
-produce router-compatible output. Hermes is one runtime. Future runtimes should
-be able to implement the same boundary.
+An executor backend is anything that can accept a normalized session turn and
+produce router-compatible output. Hermes, Codex, and Kimi are examples of
+executor identities from the user's point of view.
+
+The first supported backend protocol is ACP. A configured executor such as
+`kimi` or `codex` should initially connect through ACP. Codex app-server can be
+added later as a separate protocol adapter without changing the session routing
+model.
 
 ### Handoff
 
@@ -92,23 +97,32 @@ Channel adapters depend on router-core abstractions.
 
 Router core depends on no channel-specific crates.
 
-Runtime integrations depend on router-core abstractions.
+Backend protocol integrations depend on router-core abstractions.
 
 Router core should not depend on Hermes, ZeroClaw, Slack, QQ, or any LLM
 provider SDK.
+
+The initial backend protocol set is intentionally narrow:
+
+- `acp` in phase 1
+- `codex_app_server` in a later phase
 
 ## Phasing
 
 ### Phase 1
 
 - Define normalized inbound and outbound message types.
-- Define `ChannelAdapter` and `AgentRuntime` traits.
+- Define `ChannelAdapter` and executor backend traits.
+- Implement session executor routing with a stable user-visible session,
+  mutable current executor, unified transcript, and per-executor private state.
+- Implement ACP as the only backend protocol.
 - Implement Slack text message ingress and egress.
 - Implement QQ text message ingress and egress.
-- Support explicit handoff inside one session.
+- Support explicit `/agent` switching inside one session.
 
 ### Phase 2
 
+- Add Codex app-server as a backend protocol adapter.
 - Add media upload and download.
 - Add stronger session persistence.
 - Add retries, rate-limit handling, and delivery receipts.
