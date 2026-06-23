@@ -1,0 +1,8 @@
+[package]
+name = "agent-router"
+version = "0.1.0"
+edition = "2024"
+description = "Channel edge and session router for multi-agent handoff"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
