@@ -6,9 +6,10 @@ from Hermes into Agent Router.
 
 ## Goal
 
-The user sees one continuous session. Under that session, the current executor
-can switch between configured agents such as Hermes, Codex, Kimi, or future
-backends.
+The user sees one continuous session. When the session starts, the router
+chooses a `default_executor`. The session then has exactly one
+`active_executor`, initialized from that default. The active executor can switch
+between configured agents such as Hermes, Codex, Kimi, or future backends.
 
 Agent Router owns the session routing state and the user-visible transcript.
 Each executor backend keeps its own private state.
@@ -16,14 +17,21 @@ Each executor backend keeps its own private state.
 ## Core Rules
 
 - The user-visible session key is stable.
-- The current executor is mutable.
+- Each session has a `default_executor`.
+- Each session has exactly one `active_executor`.
+- `active_executor` is initialized to `default_executor`.
+- Executor switching changes `active_executor`; it does not create a new
+  user-visible session.
 - The canonical transcript is unified and safe to show to the user.
+- Shared context is derived from the canonical transcript and router-owned
+  session metadata.
 - Each executor can keep private state, such as an ACP session id, cwd,
   permission mode, model hint, or protocol-specific cache.
 - Backend raw logs, stderr, secrets, and full internal reasoning are not
   forwarded directly to user channels.
 - Switching executor does not require lossless migration of private backend
   state.
+- A failed or cancelled external turn must not mark projected context as seen.
 
 ## Backend Protocols
 
@@ -75,7 +83,7 @@ The first command surface is explicit executor switching:
 the current user-visible session.
 
 `/agent done` ends the current external takeover and returns to the configured
-home executor.
+default executor.
 
 Natural-language completion, such as "这个事情做完了", can be added after the
 explicit command path is stable.
@@ -85,8 +93,8 @@ explicit command path is stable.
 Each router session stores:
 
 - `session_key`
-- `home_executor`
-- `current_executor`
+- `default_executor`
+- `active_executor`
 - canonical user-visible transcript
 - per-executor backend bindings
 - safe projected event log
@@ -101,21 +109,61 @@ Each executor binding stores protocol-specific private state:
 - MCP server selection
 - model hint
 - last known status
+- seen context cursor, such as message fingerprints
 
-The router may use projected transcript or a summary when switching executors.
-It should not inject raw backend event streams into another executor's context.
+Only one binding is active at a time. Other bindings can remain idle so a later
+switch can resume their private backend session.
+
+## Shared Context
+
+Context sharing is a router-level projection, not a shared mutable object passed
+between backends.
+
+The router's source of truth is:
+
+- canonical user-visible transcript
+- router-owned session metadata
+- safe summaries of backend tool/progress events
+
+When switching to a backend for the first time, the router should seed it with a
+safe handoff prompt containing recent transcript, relevant session context, and
+the current user message.
+
+When resuming a backend that already has private state, the router should send
+only transcript entries that backend has not seen yet. Hermes' prototype tracks
+this with message fingerprints in the executor binding metadata. The new project
+can use the same idea or an equivalent monotonic cursor, but the invariant is
+the same: do not replay already-acknowledged context unless a reset or recovery
+requires it.
+
+After a backend turn succeeds, the router projects the backend result back into
+canonical transcript:
+
+- append the user turn as user-visible input
+- append a safe assistant entry attributed to the executor
+- include visible final reply
+- include safe tool/progress summaries
+- record the backend session id and updated seen-context cursor
+
+If a backend turn is cancelled or fails before producing a usable result, the
+router should preserve the previous seen-context cursor so a future retry can
+receive the missed context.
+
+The router should not inject raw backend event streams, stderr, secrets, or full
+internal reasoning into another executor's context.
 
 ## Message Flow
 
 1. A channel adapter receives an inbound platform event.
 2. The adapter normalizes it into a router event and resolves a `session_key`.
 3. The router checks whether the message is a router command.
-4. If the message switches executor, the router updates `current_executor`,
+4. If the message switches executor, the router updates `active_executor`,
    creates or resumes that executor's backend binding, records the switch in the
    transcript, and emits a short user-visible status event.
 5. If the message is a normal user turn, the router sends it to the current
-   executor backend.
-6. ACP backends receive the turn through ACP session calls.
+   active executor backend.
+6. ACP backends receive the turn through ACP session calls. The prompt includes
+   the shared-context projection needed by that backend.
 7. ACP `session/update` events are converted into router output events.
 8. Permission requests are converted into the router's approval workflow.
 9. Outbound router events are sent through the originating channel adapter.
@@ -126,7 +174,7 @@ External executor crashes, failed startup, protocol errors, and user
 cancellation should leave the user-visible session intact.
 
 The router should mark the backend binding as failed, emit a short safe status
-message, and return control to the configured home executor.
+message, and return control to the configured default executor.
 
 Long-running work must not be killed by a fixed timeout while the backend is
 still active. Liveness should come from protocol events, process state,

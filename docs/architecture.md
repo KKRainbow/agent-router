@@ -19,7 +19,8 @@ Agent Router owns:
 - inbound event normalization
 - outbound message delivery
 - session identity and channel thread mapping
-- executor selection and handoff policy
+- session default executor and active executor state
+- executor switching and handoff policy
 - shared session context that can be projected to executor backends
 
 Executor backends own:
@@ -50,7 +51,14 @@ A session is the durable conversation identity used by the router. It may map to
 a Slack thread, a QQ user openid, a QQ group openid, or a webhook conversation
 key.
 
-The session is the unit of shared handoff context.
+Each session starts with a configured `default_executor`. The `active_executor`
+is initialized to the default executor and can change later through explicit
+commands or routing policy. There is exactly one active executor per session at
+any time.
+
+The session is the unit of shared handoff context. Shared context is owned by
+the router and projected into backend-specific prompts or resume calls; executor
+private state is not shared directly.
 
 ### Executor Backend
 
@@ -66,8 +74,23 @@ model.
 ### Handoff
 
 Handoff lets one session call multiple agents while preserving shared context.
-The router should own the cross-agent routing state, while each runtime remains
-responsible for its own execution semantics.
+The router should own the cross-agent routing state. Only one executor is active
+at a time, but multiple executor bindings may exist in an idle resumable state.
+Each backend remains responsible for its own execution semantics.
+
+### Shared Context
+
+The shared context source of truth is the router's canonical transcript plus
+router-owned session metadata. When switching executors, the router builds a safe
+context projection for the target backend.
+
+For ACP backends, the first turn can include recent transcript and session
+context in the prompt. A resumed backend should receive only transcript entries
+it has not already seen, tracked by stable message fingerprints or an equivalent
+cursor. Backend output is projected back into the canonical transcript as safe
+user-visible assistant content plus tool/progress summaries.
+
+Raw backend logs, stderr, secrets, and internal reasoning are not shared context.
 
 ## Channel Strategy
 
@@ -114,7 +137,9 @@ The initial backend protocol set is intentionally narrow:
 - Define normalized inbound and outbound message types.
 - Define `ChannelAdapter` and executor backend traits.
 - Implement session executor routing with a stable user-visible session,
-  mutable current executor, unified transcript, and per-executor private state.
+  configured default executor, single active executor, unified transcript, and
+  per-executor private state.
+- Implement shared-context projection across executor switches.
 - Implement ACP as the only backend protocol.
 - Implement Slack text message ingress and egress.
 - Implement QQ text message ingress and egress.

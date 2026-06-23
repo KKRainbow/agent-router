@@ -8,8 +8,10 @@ The project starts from a small scope:
 
 - accept inbound messages from channel adapters
 - normalize them into a shared session event model
-- route each session to one current executor backend
+- initialize each session with a default executor
+- route each session to exactly one active executor backend at a time
 - support explicit executor switching inside the same session context
+- share context across executor switches through safe transcript projection
 - send normalized outbound messages back through the originating channel
 
 ## Initial Direction
@@ -40,3 +42,4 @@ adapter as a protocol reference rather than a runtime dependency.
 - [Session Executor Routing Workflow](docs/workflows/session-executor-routing.md)
 - [ADR 0001: Split Channel Router From Agent Runtime](docs/adr/0001-router-runtime-boundary.md)
 - [ADR 0002: Use ACP as the First Backend Protocol](docs/adr/0002-acp-first-backend-protocol.md)
+- [ADR 0003: Default Executor, Active Executor, and Shared Context](docs/adr/0003-default-active-executor-context.md)
