@@ -393,7 +393,7 @@ impl CodexAppServerSession {
         updates: &mut Vec<ExecutorUpdate>,
         turn_completed: &mut bool,
     ) -> anyhow::Result<()> {
-        for _ in 0..8 {
+        loop {
             match notifications.try_recv() {
                 Ok(notification) => {
                     self.handle_notification(notification, final_text, updates, turn_completed)?;
@@ -456,14 +456,7 @@ impl CodexAppServerSession {
             }
             "mcpServer/elicitation/request" => {
                 self.client
-                    .respond(
-                        id,
-                        json!({
-                            "action": "decline",
-                            "content": Value::Null,
-                            "_meta": Value::Null,
-                        }),
-                    )
+                    .respond(id, json!({ "action": "decline" }))
                     .await?;
             }
             _ => {
@@ -1403,6 +1396,12 @@ for line in sys.stdin:
             r#"    elif method == "turn/start":
         turn_request_id = request_id
         send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-1"}}})
+        for i in range(12):
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {"item": {"type": "reasoning", "summary": ["noise " + str(i)]}},
+            })
         send({
             "jsonrpc": "2.0",
             "method": "item/started",
@@ -1498,7 +1497,7 @@ for line in sys.stdin:
         })
     elif request_id == 902:
         result = msg.get("result", {})
-        if result.get("action") == "decline" and "decision" not in result:
+        if result == {"action": "decline"}:
             send({
                 "jsonrpc": "2.0",
                 "method": "item/completed",
