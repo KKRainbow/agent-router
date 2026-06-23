@@ -228,6 +228,7 @@ impl ApprovalBroker {
 
             let same_session = pending.request.session_key == session_key;
             let allowed_slack_slash = explicit_target
+                && pending.request.requester_user_id.is_some()
                 && slack_slash_session_matches(&pending.request.session_key, session_key);
             if !same_session && !allowed_slack_slash {
                 return Some(ApprovalCommandReply {
@@ -352,6 +353,13 @@ mod tests {
                     name: "Deny".to_string(),
                 },
             ],
+        }
+    }
+
+    fn request_without_requester(session_key: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            requester_user_id: None,
+            ..request(session_key)
         }
     }
 
@@ -484,6 +492,44 @@ mod tests {
                 "slack:C1:slash:U1",
                 &format!("/approve {}", prompt.id),
                 Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_session_cannot_cross_resolve_without_requester_identity() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            request_broker
+                .request(request_without_requester("slack:channel:C1:123.456"))
+                .await
+        });
+        let prompt = prompts.recv().await.unwrap();
+
+        let reply = broker
+            .resolve_command(
+                "slack:C1:slash:U1",
+                &format!("/approve {}", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("different session"));
+        let reply = broker
+            .resolve_command(
+                "slack:channel:C1:123.456",
+                &format!("/approve {}", prompt.id),
+                None,
             )
             .await
             .unwrap();
