@@ -316,7 +316,7 @@ fn slack_slash_session_matches(pending_session: &str, command_session: &str) -> 
     };
     match pending_session.split(':').collect::<Vec<_>>().as_slice() {
         ["slack", "channel", pending_channel, _thread_ts] => *pending_channel == command_channel,
-        ["slack", "dm", pending_channel] => *pending_channel == command_channel,
+        ["slack", "dm", pending_channel, _thread_ts] => *pending_channel == command_channel,
         _ => false,
     }
 }
@@ -452,6 +452,33 @@ mod tests {
         let reply = broker
             .resolve_command(
                 "slack:C1:slash:U1",
+                &format!("/approve {}", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_id_can_be_resolved_from_requester_dm_slash_session() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending =
+            tokio::spawn(
+                async move { request_broker.request(request("slack:dm:D1:123.456")).await },
+            );
+        let prompt = prompts.recv().await.unwrap();
+
+        let reply = broker
+            .resolve_command(
+                "slack:D1:slash:U1",
                 &format!("/approve {}", prompt.id),
                 Some("U1"),
             )

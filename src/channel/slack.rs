@@ -347,14 +347,11 @@ struct SlackMessageEvent {
 
 impl SlackMessageEvent {
     fn session_key(&self) -> String {
+        let thread_root = self.thread_ts.as_deref().unwrap_or(&self.ts);
         if self.channel.starts_with('D') {
-            format!("slack:dm:{}", self.channel)
+            format!("slack:dm:{}:{}", self.channel, thread_root)
         } else {
-            format!(
-                "slack:channel:{}:{}",
-                self.channel,
-                self.thread_ts.as_deref().unwrap_or(&self.ts)
-            )
+            format!("slack:channel:{}:{}", self.channel, thread_root)
         }
     }
 
@@ -384,9 +381,9 @@ impl SlackReplyTarget {
     fn from_session_key(session_key: &str) -> Option<Self> {
         let parts = session_key.split(':').collect::<Vec<_>>();
         match parts.as_slice() {
-            ["slack", "dm", channel] => Some(Self {
+            ["slack", "dm", channel, thread_ts] => Some(Self {
                 channel: (*channel).to_string(),
-                thread_ts: None,
+                thread_ts: Some((*thread_ts).to_string()),
             }),
             ["slack", "channel", channel, thread_ts] => Some(Self {
                 channel: (*channel).to_string(),
@@ -496,8 +493,45 @@ mod tests {
         assert_eq!(threaded.channel, "C1");
         assert_eq!(threaded.thread_ts.as_deref(), Some("123.456"));
 
-        let dm = SlackReplyTarget::from_session_key("slack:dm:D1").unwrap();
+        let dm = SlackReplyTarget::from_session_key("slack:dm:D1:123.456").unwrap();
         assert_eq!(dm.channel, "D1");
-        assert_eq!(dm.thread_ts, None);
+        assert_eq!(dm.thread_ts.as_deref(), Some("123.456"));
+    }
+
+    #[test]
+    fn dm_top_level_messages_get_distinct_session_keys() {
+        let first = SlackMessageEvent {
+            event_key: "Ev1".to_string(),
+            channel: "D1".to_string(),
+            user: "U1".to_string(),
+            text: "first".to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+        };
+        let second = SlackMessageEvent {
+            event_key: "Ev2".to_string(),
+            channel: "D1".to_string(),
+            user: "U1".to_string(),
+            text: "second".to_string(),
+            ts: "222.000".to_string(),
+            thread_ts: None,
+        };
+
+        assert_eq!(first.session_key(), "slack:dm:D1:111.000");
+        assert_eq!(second.session_key(), "slack:dm:D1:222.000");
+    }
+
+    #[test]
+    fn dm_thread_replies_share_root_session_key() {
+        let reply = SlackMessageEvent {
+            event_key: "Ev2".to_string(),
+            channel: "D1".to_string(),
+            user: "U1".to_string(),
+            text: "reply".to_string(),
+            ts: "222.000".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+
+        assert_eq!(reply.session_key(), "slack:dm:D1:111.000");
     }
 }
