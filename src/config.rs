@@ -154,7 +154,7 @@ impl AppConfig {
         let slack_enabled = env_cfg
             .slack_enabled
             .or(slack_file.enabled)
-            .unwrap_or(!slack_bot_token.is_empty() || !slack_app_token.is_empty());
+            .unwrap_or(!slack_bot_token.is_empty() && !slack_app_token.is_empty());
         let slack = SlackConfig {
             enabled: slack_enabled,
             bot_token: slack_bot_token,
@@ -182,7 +182,7 @@ impl AppConfig {
         let qq_enabled = env_cfg
             .qq_enabled
             .or(qq_file.enabled)
-            .unwrap_or(!qq_app_id.is_empty() || !qq_client_secret.is_empty());
+            .unwrap_or(!qq_app_id.is_empty() && !qq_client_secret.is_empty());
         let qq = QqConfig {
             enabled: qq_enabled,
             app_id: qq_app_id,
@@ -470,6 +470,22 @@ qq:
         assert!(cfg.qq.enabled);
         assert_eq!(cfg.qq.app_id, "app");
         assert_eq!(cfg.qq.client_secret, "secret");
+    }
+
+    #[test]
+    fn partial_channel_credentials_do_not_auto_enable_channels() {
+        let cfg = AppConfig::from_file_config(
+            FileConfig::default(),
+            EnvConfig {
+                slack_bot_token: Some("xoxb-token".to_string()),
+                qq_app_id: Some("app".to_string()),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!cfg.slack.enabled);
+        assert!(!cfg.qq.enabled);
     }
 
     #[test]

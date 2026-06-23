@@ -54,10 +54,10 @@ QQ_APP_ID=...
 QQ_CLIENT_SECRET=...
 ```
 
-Slack and QQ are enabled automatically when their credentials are present,
-unless the config explicitly sets `enabled: false`. QQ can be restricted with
-`QQ_ALLOWED_USERS` and `QQ_ALLOWED_GROUPS`, both as comma-separated openid
-lists. The MVP supports `/agent status` and
+Slack and QQ are enabled automatically when all required credentials for that
+channel are present, unless the config explicitly sets `enabled: false`. QQ can
+be restricted with `QQ_ALLOWED_USERS` and `QQ_ALLOWED_GROUPS`, both as
+comma-separated openid lists. The MVP supports `/agent status` and
 `/agent <name>` from channel messages. A session starts with `default_executor`,
 has one `active_executor`, and shares context between executor switches by
 projecting canonical transcript into the target executor.

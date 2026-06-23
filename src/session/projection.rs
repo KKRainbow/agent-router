@@ -53,11 +53,7 @@ pub fn build_context_projection(input: ProjectionInput<'_>) -> ContextProjection
             MessageRole::Tool => "tool",
             MessageRole::System => "system",
         };
-        let mut content = message.content.clone();
-        if content.len() > 1200 {
-            content.truncate(1197);
-            content.push_str("...");
-        }
+        let content = truncate_utf8_with_ellipsis(message.content.clone(), 1200);
         transcript_lines.push(format!("{role}: {content}"));
     }
 
@@ -157,6 +153,21 @@ pub fn projected_assistant_content(
     parts.join("\n\n")
 }
 
+fn truncate_utf8_with_ellipsis(mut content: String, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content;
+    }
+
+    let suffix = "...";
+    let mut cutoff = max_bytes.saturating_sub(suffix.len());
+    while !content.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    content.truncate(cutoff);
+    content.push_str(suffix);
+    content
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +246,22 @@ mod tests {
                 .map(message_fingerprint)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn projection_truncates_multibyte_content_on_char_boundary() {
+        let messages = vec![TranscriptMessage::assistant("汉".repeat(500), "kimi", None)];
+
+        let projection = build_context_projection(ProjectionInput {
+            transcript: &messages,
+            seen_context: &[],
+            current_message: "继续",
+            started_new_session: true,
+            max_messages: 40,
+        });
+
+        assert!(projection.prompt.contains("assistant: "));
+        assert!(projection.prompt.contains("..."));
+        assert!(projection.prompt.contains("Current user message:\n继续"));
     }
 }

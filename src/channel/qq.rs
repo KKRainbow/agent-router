@@ -29,6 +29,7 @@ pub struct QqBotChannel {
     approvals: SharedApprovalBroker,
     http: Client,
     access_token: Arc<Mutex<Option<CachedAccessToken>>>,
+    gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
     reply_contexts: Arc<Mutex<HashMap<String, QqReplyContext>>>,
 }
@@ -40,6 +41,7 @@ impl QqBotChannel {
             approvals,
             http: Client::new(),
             access_token: Arc::new(Mutex::new(None)),
+            gateway_session: Arc::new(Mutex::new(QqGatewaySession::default())),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(1024))),
             reply_contexts: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -78,22 +80,36 @@ impl QqBotChannel {
             .and_then(Value::as_u64)
             .unwrap_or(41_250);
 
-        let identify = json!({
-            "op": 2,
-            "d": {
-                "token": format!("QQBot {token}"),
-                "intents": self.cfg.intents,
-                "properties": {
-                    "os": "linux",
-                    "browser": "agent-router",
-                    "device": "agent-router",
+        let stored_session = self.stored_gateway_session().await;
+        let mut sequence = stored_session.sequence;
+        if let (Some(session_id), Some(seq)) = (&stored_session.session_id, stored_session.sequence)
+        {
+            let resume = json!({
+                "op": 6,
+                "d": {
+                    "token": format!("QQBot {token}"),
+                    "session_id": session_id,
+                    "seq": seq,
                 },
-            },
-        });
-        sink.send(Message::Text(identify.to_string().into()))
-            .await?;
+            });
+            sink.send(Message::Text(resume.to_string().into())).await?;
+        } else {
+            let identify = json!({
+                "op": 2,
+                "d": {
+                    "token": format!("QQBot {token}"),
+                    "intents": self.cfg.intents,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "agent-router",
+                        "device": "agent-router",
+                    },
+                },
+            });
+            sink.send(Message::Text(identify.to_string().into()))
+                .await?;
+        }
 
-        let mut sequence = None;
         let mut heartbeat = tokio::time::interval(Duration::from_millis(heartbeat_interval));
         heartbeat.tick().await;
 
@@ -144,22 +160,39 @@ impl QqBotChannel {
         };
         if let Some(next_sequence) = payload.get("s").and_then(Value::as_i64) {
             *sequence = Some(next_sequence);
+            self.record_gateway_sequence(next_sequence).await;
         }
 
         match payload.get("op").and_then(Value::as_u64).unwrap_or(0) {
             0 => {
-                let event_type = payload.get("t").and_then(Value::as_str).unwrap_or("");
-                if matches!(event_type, "READY" | "RESUMED") {
-                    return Ok(());
-                }
+                let event_type = payload
+                    .get("t")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let Some(data) = payload.get("d") else {
                     return Ok(());
                 };
-                self.handle_dispatch(event_type, data, router).await?;
+                if matches!(event_type.as_str(), "READY" | "RESUMED") {
+                    if let Some(session_id) = data.get("session_id").and_then(Value::as_str) {
+                        self.record_gateway_session_id(session_id.to_string()).await;
+                    }
+                    return Ok(());
+                }
+                let channel = self.clone();
+                let data = data.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = channel.handle_dispatch(&event_type, &data, router).await {
+                        tracing::warn!(error = %err, event_type = %event_type, "failed to handle QQ dispatch");
+                    }
+                });
             }
             1 => send_heartbeat(sink, *sequence).await?,
             7 => anyhow::bail!("QQ gateway requested reconnect"),
-            9 => anyhow::bail!("QQ gateway reported invalid session"),
+            9 => {
+                self.clear_gateway_session().await;
+                anyhow::bail!("QQ gateway reported invalid session");
+            }
             11 => {}
             _ => {}
         }
@@ -195,8 +228,13 @@ impl QqBotChannel {
                 user_id: Some(message.user_id),
             })
             .await?;
-        self.send_session_message(&message.session_key, &reply.text)
-            .await?;
+        self.send_reply_message(
+            &message.session_key,
+            &message.target,
+            &message.msg_id,
+            &reply.text,
+        )
+        .await?;
         Ok(())
     }
 
@@ -244,12 +282,31 @@ impl QqBotChannel {
             let context = contexts.get_mut(session_key).ok_or_else(|| {
                 anyhow::anyhow!("QQ reply context is missing for session `{session_key}`")
             })?;
-            let msg_seq = context.next_seq;
-            context.next_seq = context.next_seq.checked_add(1).unwrap_or(1);
-            (context.target.clone(), context.msg_id.clone(), msg_seq)
+            (
+                context.target.clone(),
+                context.msg_id.clone(),
+                context.take_next_seq(),
+            )
         };
         self.post_text_message(&target, &msg_id, msg_seq, text)
             .await
+    }
+
+    async fn send_reply_message(
+        &self,
+        session_key: &str,
+        target: &QqReplyTarget,
+        msg_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let msg_seq = {
+            let mut contexts = self.reply_contexts.lock().await;
+            let context = contexts.get_mut(session_key).ok_or_else(|| {
+                anyhow::anyhow!("QQ reply context is missing for session `{session_key}`")
+            })?;
+            context.take_next_seq()
+        };
+        self.post_text_message(target, msg_id, msg_seq, text).await
     }
 
     async fn post_text_message(
@@ -356,6 +413,24 @@ impl QqBotChannel {
             .ok_or_else(|| anyhow::anyhow!("QQ gateway response omitted url"))
     }
 
+    async fn stored_gateway_session(&self) -> QqGatewaySession {
+        self.gateway_session.lock().await.clone()
+    }
+
+    async fn record_gateway_sequence(&self, sequence: i64) {
+        if sequence >= 0 {
+            self.gateway_session.lock().await.sequence = Some(sequence);
+        }
+    }
+
+    async fn record_gateway_session_id(&self, session_id: String) {
+        self.gateway_session.lock().await.session_id = Some(session_id);
+    }
+
+    async fn clear_gateway_session(&self) {
+        *self.gateway_session.lock().await = QqGatewaySession::default();
+    }
+
     fn api_base(&self) -> &'static str {
         if self.cfg.sandbox {
             QQ_SANDBOX_API_BASE
@@ -389,11 +464,25 @@ struct CachedAccessToken {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone, Default)]
+struct QqGatewaySession {
+    session_id: Option<String>,
+    sequence: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 struct QqReplyContext {
     target: QqReplyTarget,
     msg_id: String,
     next_seq: u32,
+}
+
+impl QqReplyContext {
+    fn take_next_seq(&mut self) -> u32 {
+        let msg_seq = self.next_seq;
+        self.next_seq = self.next_seq.checked_add(1).unwrap_or(1);
+        msg_seq
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
