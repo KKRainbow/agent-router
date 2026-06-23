@@ -2,26 +2,27 @@
 
 > A router between IM and your agent team.
 
-Agent Router connects instant messaging channels such as Slack and QQ to a team
-of agent executors. Users can talk to agents from the chat tools they already
-use, while Agent Router owns channel integration, session routing, executor
-switching, and reply delivery.
+Agent Router connects instant messaging channels such as Slack and QQ to your
+agent team: Codex, Claude Code, Kimi, and other agent runtimes that can be
+exposed through executor adapters. Users can talk to those agents from the chat
+tools they already use, while Agent Router owns channel integration, session
+routing, executor switching, and reply delivery.
 
 ## Development Status
 
 Agent Router is still in active development. Configuration, commands, backend
-protocols, and channel behavior may change before the project is considered
-stable. It is currently best suited for experiments, internal workflows, and
-early integrations.
+protocols, channel behavior, and supported agent adapters may change before the
+project is considered stable. It is currently best suited for experiments,
+internal workflows, and early integrations.
 
 ## What It Does
 
 - Receives messages from supported IM channels.
 - Normalizes channel messages into a shared session model.
-- Starts each session with a configured default executor.
-- Routes a session to one active executor at a time.
-- Lets users switch executors inside the same chat session.
-- Projects conversation context when a session switches executors.
+- Starts each session with a configured default agent.
+- Routes a session to one active agent at a time.
+- Lets users switch agents inside the same chat session.
+- Projects conversation context when a session switches agents.
 - Sends normalized replies back to the originating channel.
 
 ## Supported Today
@@ -31,16 +32,19 @@ Channels:
 - Slack Socket Mode
 - Tencent QQ Official Bot Gateway
 
-Executor backends:
+Agent integrations:
 
-- ACP, for example `kimi acp`
-- Codex app-server
+- Kimi through ACP, for example `kimi acp`
+- Codex through app-server
+
+Other agents, such as Claude Code, are intended to be added through executor
+adapters as their protocol integrations land.
 
 User commands:
 
 ```text
 /agent status
-/agent <executor-name>
+/agent <agent-name>
 ```
 
 For example:
@@ -56,7 +60,7 @@ Requirements:
 
 - Rust toolchain
 - Credentials for at least one supported channel
-- At least one configured executor command available on `PATH`
+- At least one configured agent command available on `PATH`
 
 Run with the example configuration:
 
@@ -64,7 +68,7 @@ Run with the example configuration:
 cargo run -- --config config/agent-router.example.yaml
 ```
 
-For local changes, copy the example configuration and edit the executor names,
+For local changes, copy the example configuration and edit the agent names,
 commands, and channel options:
 
 ```bash
@@ -110,7 +114,7 @@ QQ_ALLOWED_GROUPS=...
 
 ## Configuration Overview
 
-The example config defines a default executor, available executor backends, and
+The example config defines a default agent, available agent backends, and
 channel options:
 
 ```yaml
@@ -137,13 +141,13 @@ qq:
   allowed_groups: []
 ```
 
-Each chat session has one active executor. New sessions start with
-`router.default_executor`. Users can switch the active executor with
-`/agent <executor-name>`.
+Each chat session has one active agent. New sessions start with
+`router.default_executor`. Users can switch the active agent with
+`/agent <agent-name>`.
 
 ## Non-Goals
 
-- Replacing Hermes, OpenClaw, Codex, Kimi, or other agent runtimes.
+- Replacing Hermes, OpenClaw, Codex, Claude Code, Kimi, or other agent runtimes.
 - Importing a channel adapter wholesale as a runtime dependency.
 - Building a full customer-support inbox product.
 - Coupling channel adapters to LLM provider, memory, tool, or orchestration
