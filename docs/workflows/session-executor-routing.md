@@ -188,3 +188,6 @@ Automatic routing is a later layer on top of the same state machine.
 The first implementation should use deterministic rules and configuration. A
 skill or model may provide routing hints later, but it should not own the
 routing state machine.
+
+The draft implementation plan is documented separately in
+`docs/workflows/default-executor-auto-routing.md`.
