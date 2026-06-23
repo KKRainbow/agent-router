@@ -161,6 +161,10 @@ impl SlackSocketModeChannel {
                 user_id: Some(event.user),
             })
             .await?;
+        for channel_event in &reply.channel_events {
+            self.post_message(&reply_target, &channel_event.render_text())
+                .await?;
+        }
         self.post_message(&reply_target, &reply.text).await?;
         Ok(())
     }
@@ -183,14 +187,15 @@ impl SlackSocketModeChannel {
                 user_id: Some(command.user_id),
             })
             .await?;
-        self.post_message(
-            &SlackReplyTarget {
-                channel: command.channel_id,
-                thread_ts: None,
-            },
-            &reply.text,
-        )
-        .await?;
+        let reply_target = SlackReplyTarget {
+            channel: command.channel_id,
+            thread_ts: None,
+        };
+        for channel_event in &reply.channel_events {
+            self.post_message(&reply_target, &channel_event.render_text())
+                .await?;
+        }
+        self.post_message(&reply_target, &reply.text).await?;
         Ok(())
     }
 

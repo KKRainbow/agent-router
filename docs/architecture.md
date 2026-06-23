@@ -91,6 +91,9 @@ cursor. Backend output is projected back into the canonical transcript as safe
 user-visible assistant content plus tool/progress summaries.
 
 Raw backend logs, stderr, secrets, and internal reasoning are not shared context.
+Executor-provided reasoning summaries and tool-call summaries may be projected as
+router-owned channel events when they are safe to show to the user. Channel
+adapters deliver those events but do not interpret backend protocol events.
 
 ## Channel Strategy
 

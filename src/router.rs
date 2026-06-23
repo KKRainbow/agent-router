@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     approval::{ApprovalBroker, SharedApprovalBroker},
-    executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest},
+    executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorUpdate},
     session::{
         ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
         projection::{
@@ -14,6 +14,7 @@ use crate::{
         },
         store::SessionStore,
     },
+    text::truncate_chars,
 };
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,53 @@ pub struct RouterInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouterReply {
     pub text: String,
+    pub channel_events: Vec<RouterChannelEvent>,
+}
+
+impl RouterReply {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            channel_events: Vec::new(),
+        }
+    }
+
+    fn with_channel_events(
+        text: impl Into<String>,
+        channel_events: Vec<RouterChannelEvent>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            channel_events,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterChannelEvent {
+    pub kind: RouterChannelEventKind,
+    pub executor: String,
+    pub title: String,
+    pub text: String,
+}
+
+impl RouterChannelEvent {
+    pub fn render_text(&self) -> String {
+        let heading = match self.kind {
+            RouterChannelEventKind::ReasoningSummary => "Reasoning summary".to_string(),
+            RouterChannelEventKind::ToolCall if self.title.trim().is_empty() => {
+                "Tool call".to_string()
+            }
+            RouterChannelEventKind::ToolCall => format!("Tool call: {}", self.title.trim()),
+        };
+        format!("[{}] {heading}\n{}", self.executor, self.text)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterChannelEventKind {
+    ReasoningSummary,
+    ToolCall,
 }
 
 #[async_trait]
@@ -101,38 +149,30 @@ where
             .load_or_create(session_key, &self.default_executor)
             .await;
         if args.is_empty() || args == "status" {
-            return Ok(RouterReply {
-                text: self.render_status(&state),
-            });
+            return Ok(RouterReply::text(self.render_status(&state)));
         }
         if args.split_whitespace().count() != 1 {
-            return Ok(RouterReply {
-                text: "Usage: /agent [status|done|<executor>]".to_string(),
-            });
+            return Ok(RouterReply::text("Usage: /agent [status|done|<executor>]"));
         }
 
         let target = args;
         if target == "done" {
             state.active_executor = state.default_executor.clone();
             self.store.save(state.clone()).await;
-            return Ok(RouterReply {
-                text: format!(
-                    "Agent handoff ended. Active executor: {}",
-                    state.active_executor
-                ),
-            });
+            return Ok(RouterReply::text(format!(
+                "Agent handoff ended. Active executor: {}",
+                state.active_executor
+            )));
         }
 
         if self.executor.get(target).is_none() {
-            return Ok(RouterReply {
-                text: format!("Executor `{target}` is not configured."),
-            });
+            return Ok(RouterReply::text(format!(
+                "Executor `{target}` is not configured."
+            )));
         }
         state.active_executor = target.to_string();
         self.store.save(state).await;
-        Ok(RouterReply {
-            text: format!("Active executor: {target}"),
-        })
+        Ok(RouterReply::text(format!("Active executor: {target}")))
     }
 
     async fn route_to_active_executor(&self, input: RouterInput) -> anyhow::Result<RouterReply> {
@@ -224,9 +264,10 @@ where
                     ),
                 );
                 self.store.save(state).await;
-                Ok(RouterReply {
-                    text: response.final_text,
-                })
+                Ok(RouterReply::with_channel_events(
+                    response.final_text,
+                    channel_events_from_executor_updates(&executor_name, &response.updates),
+                ))
             }
             Err(err) => {
                 state.executor_bindings.insert(
@@ -276,12 +317,47 @@ where
             .resolve_command(&input.session_key, &input.text, input.user_id.as_deref())
             .await
         {
-            return Ok(RouterReply { text: reply.text });
+            return Ok(RouterReply::text(reply.text));
         }
         let lock = self.session_lock(&input.session_key).await;
         let _guard = lock.lock().await;
         self.handle_locked(input).await
     }
+}
+
+fn channel_events_from_executor_updates(
+    executor: &str,
+    updates: &[ExecutorUpdate],
+) -> Vec<RouterChannelEvent> {
+    updates
+        .iter()
+        .filter_map(|update| channel_event_from_executor_update(executor, update))
+        .collect()
+}
+
+fn channel_event_from_executor_update(
+    executor: &str,
+    update: &ExecutorUpdate,
+) -> Option<RouterChannelEvent> {
+    let kind = match update.kind.as_str() {
+        "agent_thought_chunk" => RouterChannelEventKind::ReasoningSummary,
+        "tool_call" => RouterChannelEventKind::ToolCall,
+        _ => return None,
+    };
+    let text = if update.text.trim().is_empty() {
+        update.status.trim()
+    } else {
+        update.text.trim()
+    };
+    if text.is_empty() {
+        return None;
+    }
+    Some(RouterChannelEvent {
+        kind,
+        executor: executor.to_string(),
+        title: update.title.clone(),
+        text: truncate_chars(text, 1_500),
+    })
 }
 
 fn update_binding_after_success(
@@ -431,6 +507,45 @@ mod tests {
                 .is_some()
         );
         assert_eq!(saved.executor_bindings["kimi"].protocol, "fake");
+    }
+
+    #[test]
+    fn channel_events_include_reasoning_and_tool_updates_only() {
+        let events = channel_events_from_executor_updates(
+            "codex",
+            &[
+                ExecutorUpdate {
+                    kind: "plan".to_string(),
+                    title: "Plan".to_string(),
+                    text: "working".to_string(),
+                    status: String::new(),
+                },
+                ExecutorUpdate {
+                    kind: "agent_thought_chunk".to_string(),
+                    title: "Reasoning".to_string(),
+                    text: "I should inspect the config.".to_string(),
+                    status: String::new(),
+                },
+                ExecutorUpdate {
+                    kind: "tool_call".to_string(),
+                    title: "Bash".to_string(),
+                    text: "$ cargo test\nok".to_string(),
+                    status: "completed".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, RouterChannelEventKind::ReasoningSummary);
+        assert_eq!(
+            events[0].render_text(),
+            "[codex] Reasoning summary\nI should inspect the config."
+        );
+        assert_eq!(events[1].kind, RouterChannelEventKind::ToolCall);
+        assert_eq!(
+            events[1].render_text(),
+            "[codex] Tool call: Bash\n$ cargo test\nok"
+        );
     }
 
     #[tokio::test]

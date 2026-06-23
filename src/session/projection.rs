@@ -4,6 +4,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::{MessageRole, TranscriptMessage};
+use crate::text::truncate_bytes_on_char_boundary;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextProjection {
@@ -53,7 +54,7 @@ pub fn build_context_projection(input: ProjectionInput<'_>) -> ContextProjection
             MessageRole::Tool => "tool",
             MessageRole::System => "system",
         };
-        let content = truncate_utf8_with_ellipsis(message.content.clone(), 1200);
+        let content = truncate_bytes_on_char_boundary(message.content.clone(), 1200);
         transcript_lines.push(format!("{role}: {content}"));
     }
 
@@ -151,21 +152,6 @@ pub fn projected_assistant_content(
         }
     ));
     parts.join("\n\n")
-}
-
-fn truncate_utf8_with_ellipsis(mut content: String, max_bytes: usize) -> String {
-    if content.len() <= max_bytes {
-        return content;
-    }
-
-    let suffix = "...";
-    let mut cutoff = max_bytes.saturating_sub(suffix.len());
-    while !content.is_char_boundary(cutoff) {
-        cutoff -= 1;
-    }
-    content.truncate(cutoff);
-    content.push_str(suffix);
-    content
 }
 
 #[cfg(test)]

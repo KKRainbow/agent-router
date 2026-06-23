@@ -1,5 +1,6 @@
 pub mod projection;
 pub mod store;
+pub(crate) mod work_queue;
 
 use std::{
     collections::BTreeMap,

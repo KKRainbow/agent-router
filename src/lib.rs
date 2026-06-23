@@ -7,8 +7,12 @@ pub mod config;
 pub mod executor;
 pub mod router;
 pub mod session;
+mod text;
 
-pub use router::{AgentRouter, RouterInput, RouterReply, RouterService};
+pub use router::{
+    AgentRouter, RouterChannelEvent, RouterChannelEventKind, RouterInput, RouterReply,
+    RouterService,
+};
 
 #[cfg(test)]
 mod tests {

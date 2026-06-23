@@ -4,6 +4,8 @@ pub mod registry;
 
 use async_trait::async_trait;
 
+use crate::text::truncate_chars;
+
 #[derive(Debug, Clone)]
 pub struct ExecutorDescriptor {
     pub name: String,
@@ -59,9 +61,8 @@ impl ExecutorUpdate {
         if text.trim().is_empty() {
             return None;
         }
-        if limit > 3 && text.len() > limit {
-            text.truncate(limit - 3);
-            text.push_str("...");
+        if limit > 3 && text.chars().count() > limit {
+            text = truncate_chars(&text, limit);
         }
         Some(text)
     }
@@ -172,5 +173,24 @@ pub mod test_support {
             },
         );
         map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_summary_truncates_on_char_boundary() {
+        let update = ExecutorUpdate {
+            kind: "tool_call".to_string(),
+            title: "Bash".to_string(),
+            text: format!("{}🙂z", "a".repeat(16)),
+            status: String::new(),
+        };
+
+        let summary = update.summary(20).unwrap();
+
+        assert!(summary.ends_with("..."));
     }
 }
