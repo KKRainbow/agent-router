@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 type SessionKey = (String, String);
 type SharedAcpSession = Arc<Mutex<AcpSession>>;
@@ -298,11 +298,16 @@ struct AcpPromptResult {
 #[derive(Debug)]
 struct JsonRpcClient {
     stdin: SharedStdin,
-    pending: PendingMap,
+    state: SharedJsonRpcState,
     next_id: AtomicU64,
     updates: broadcast::Sender<ExecutorUpdate>,
     child: Arc<Mutex<Child>>,
-    closed: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct JsonRpcState {
+    closed: bool,
+    pending: HashMap<u64, oneshot::Sender<Value>>,
 }
 
 impl JsonRpcClient {
@@ -335,17 +340,15 @@ impl JsonRpcClient {
         let stderr = child.stderr.take();
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let state = Arc::new(Mutex::new(JsonRpcState::default()));
         let (updates, _) = broadcast::channel(256);
         let child = Arc::new(Mutex::new(child));
-        let closed = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(read_stdout(
             BufReader::new(stdout),
-            pending.clone(),
+            state.clone(),
             stdin.clone(),
             updates.clone(),
-            closed.clone(),
         ));
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
@@ -358,11 +361,10 @@ impl JsonRpcClient {
 
         Ok(Self {
             stdin,
-            pending,
+            state,
             next_id: AtomicU64::new(1),
             updates,
             child,
-            closed,
         })
     }
 
@@ -371,7 +373,12 @@ impl JsonRpcClient {
     }
 
     fn is_alive(&self) -> bool {
-        if self.closed.load(Ordering::Relaxed) {
+        if self
+            .state
+            .try_lock()
+            .map(|state| state.closed)
+            .unwrap_or(true)
+        {
             return false;
         }
         self.child
@@ -386,13 +393,13 @@ impl JsonRpcClient {
     }
 
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        anyhow::ensure!(
-            !self.closed.load(Ordering::Relaxed),
-            "ACP client stdout is closed"
-        );
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        {
+            let mut state = self.state.lock().await;
+            anyhow::ensure!(!state.closed, "ACP client stdout is closed");
+            state.pending.insert(id, tx);
+        }
         if let Err(err) = write_json(
             &self.stdin,
             json!({
@@ -404,7 +411,7 @@ impl JsonRpcClient {
         )
         .await
         {
-            self.pending.lock().await.remove(&id);
+            self.state.lock().await.pending.remove(&id);
             return Err(err);
         }
         let response = rx
@@ -419,10 +426,9 @@ impl JsonRpcClient {
 
 async fn read_stdout<R>(
     reader: BufReader<R>,
-    pending: PendingMap,
+    state: SharedJsonRpcState,
     stdin: SharedStdin,
     updates: broadcast::Sender<ExecutorUpdate>,
-    closed: Arc<AtomicBool>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -432,16 +438,16 @@ async fn read_stdout<R>(
             tracing::debug!(target: "agent_router::acp", raw_stdout = %line, "ignoring non-json ACP stdout");
             continue;
         };
-        dispatch_message(message, &pending, &stdin, &updates).await;
+        dispatch_message(message, &state, &stdin, &updates).await;
     }
-    closed.store(true, Ordering::Relaxed);
-    fail_all_pending(&pending, "ACP process closed stdout").await;
+    fail_all_pending(&state, "ACP process closed stdout").await;
 }
 
-async fn fail_all_pending(pending: &PendingMap, message: &str) {
+async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
     let drained = {
-        let mut guard = pending.lock().await;
-        guard.drain().collect::<Vec<_>>()
+        let mut guard = state.lock().await;
+        guard.closed = true;
+        guard.pending.drain().collect::<Vec<_>>()
     };
     for (id, tx) in drained {
         let _ = tx.send(json!({
@@ -457,13 +463,13 @@ async fn fail_all_pending(pending: &PendingMap, message: &str) {
 
 async fn dispatch_message(
     message: Value,
-    pending: &PendingMap,
+    state: &SharedJsonRpcState,
     stdin: &SharedStdin,
     updates: &broadcast::Sender<ExecutorUpdate>,
 ) {
     if message.get("method").is_none() {
         let sender = match message.get("id").and_then(Value::as_u64) {
-            Some(id) => pending.lock().await.remove(&id),
+            Some(id) => state.lock().await.pending.remove(&id),
             None => None,
         };
         if let Some(tx) = sender {
