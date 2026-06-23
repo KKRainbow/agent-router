@@ -195,6 +195,12 @@ where
         let descriptor = self.executor.get(&executor_name).ok_or_else(|| {
             anyhow::anyhow!("active executor `{executor_name}` is not configured")
         })?;
+        tracing::info!(
+            session_key = %input.session_key,
+            executor = %executor_name,
+            text_len = input.text.len(),
+            "routing turn to active executor"
+        );
 
         let binding = state.binding_for(&executor_name);
         let prepared = self
@@ -281,6 +287,12 @@ where
                     ),
                 );
                 self.store.save(state).await;
+                tracing::info!(
+                    session_key = %input.session_key,
+                    executor = %executor_name,
+                    final_text_len = response.final_text.len(),
+                    "committed successful router turn"
+                );
                 output.send_final_reply(response.final_text).await
             }
             Err(err) => {
@@ -293,6 +305,12 @@ where
                     ),
                 );
                 self.store.save(state).await;
+                tracing::warn!(
+                    error = %err,
+                    session_key = %input.session_key,
+                    executor = %executor_name,
+                    "router turn failed"
+                );
                 Err(err)
             }
         }

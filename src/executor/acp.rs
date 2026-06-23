@@ -23,6 +23,7 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
         ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        internal_json_rpc_error, internal_json_rpc_error_message, summarize_json_rpc_error,
     },
 };
 
@@ -131,6 +132,12 @@ impl ExecutorBackend for AcpExecutorManager {
             .executors
             .get(&request.executor)
             .ok_or_else(|| anyhow::anyhow!("executor `{}` is not configured", request.executor))?;
+        tracing::info!(
+            executor = %request.executor,
+            session_key = %request.session_key,
+            previous_session_id = ?request.previous_session_id,
+            "preparing ACP executor session"
+        );
         let session = self
             .get_or_create_session(&request.session_key, &request.executor, cfg)
             .await?;
@@ -138,6 +145,13 @@ impl ExecutorBackend for AcpExecutorManager {
         let (external_session_id, started_new_session) = session
             .ensure_session(request.previous_session_id.as_deref())
             .await?;
+        tracing::info!(
+            executor = %request.executor,
+            session_key = %request.session_key,
+            external_session_id = %external_session_id,
+            started_new_session,
+            "prepared ACP executor session"
+        );
         Ok(PreparedExecutor {
             external_session_id: Some(external_session_id),
             started_new_session,
@@ -153,9 +167,33 @@ impl ExecutorBackend for AcpExecutorManager {
             .existing_session(&request.session_key, &request.executor)
             .await?;
         let mut session = session.lock().await;
+        let session_key = request.session_key.clone();
+        let executor = request.executor.clone();
+        let prompt_len = request.prompt.len();
+        tracing::info!(
+            executor = %executor,
+            session_key = %session_key,
+            prompt_len,
+            "starting ACP executor turn"
+        );
         let result = session
             .prompt(&request.prompt, request.user_id, events)
-            .await?;
+            .await;
+        match &result {
+            Ok(result) => tracing::info!(
+                executor = %executor,
+                session_key = %session_key,
+                final_text_len = result.final_text.len(),
+                "completed ACP executor turn"
+            ),
+            Err(err) => tracing::warn!(
+                error = %err,
+                executor = %executor,
+                session_key = %session_key,
+                "failed ACP executor turn"
+            ),
+        }
+        let result = result?;
         Ok(ExecutorResponse {
             final_text: result.final_text,
         })
@@ -179,16 +217,28 @@ impl AcpSession {
         executor: String,
         approvals: SharedApprovalBroker,
     ) -> anyhow::Result<Self> {
+        tracing::info!(
+            executor = %executor,
+            session_key = %session_key,
+            command = %cfg.command,
+            cwd = %cwd.display(),
+            "starting ACP executor process"
+        );
         let client = JsonRpcClient::spawn(
             &cfg.command,
             &cfg.args,
             &cwd,
             &cfg.env,
-            session_key,
-            executor,
+            session_key.clone(),
+            executor.clone(),
             approvals,
         )
         .await?;
+        tracing::info!(
+            executor = %executor,
+            session_key = %session_key,
+            "started ACP executor process"
+        );
         Ok(Self {
             cfg,
             cwd,
@@ -384,6 +434,15 @@ impl JsonRpcClient {
         executor: String,
         approvals: SharedApprovalBroker,
     ) -> anyhow::Result<Self> {
+        tracing::info!(
+            target: "agent_router::acp",
+            executor = %executor,
+            session_key = %session_key,
+            command = %command,
+            arg_count = args.len(),
+            cwd = %cwd.display(),
+            "spawning ACP process"
+        );
         let mut cmd = Command::new(command);
         cmd.args(args).current_dir(cwd);
         for (key, value) in env {
@@ -396,6 +455,15 @@ impl JsonRpcClient {
         let mut child = cmd
             .spawn()
             .map_err(|err| anyhow::anyhow!("could not start ACP command `{command}`: {err}"))?;
+        let pid = child.id();
+        tracing::info!(
+            target: "agent_router::acp",
+            executor = %executor,
+            session_key = %session_key,
+            command = %command,
+            pid = ?pid,
+            "spawned ACP process"
+        );
         let stdin = child
             .stdin
             .take()
@@ -499,7 +567,10 @@ impl JsonRpcClient {
             .await
             .map_err(|_| anyhow::anyhow!("ACP response channel closed"))?;
         if let Some(error) = response.get("error") {
-            anyhow::bail!("ACP `{method}` failed: {error}");
+            if let Some(message) = internal_json_rpc_error_message(error) {
+                anyhow::bail!("{message}");
+            }
+            anyhow::bail!("ACP `{method}` failed: {}", summarize_json_rpc_error(error));
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -517,6 +588,12 @@ where
         };
         dispatch_message(message, &context).await;
     }
+    tracing::warn!(
+        target: "agent_router::acp",
+        executor = %context.executor,
+        session_key = %context.session_key,
+        "ACP process stdout closed"
+    );
     fail_all_pending(&context.state, "ACP process closed stdout").await;
 }
 
@@ -530,10 +607,7 @@ async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
         let _ = tx.send(json!({
             "jsonrpc": "2.0",
             "id": id,
-            "error": {
-                "code": -32000,
-                "message": message,
-            }
+            "error": internal_json_rpc_error(message),
         }));
     }
 }

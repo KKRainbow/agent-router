@@ -3,6 +3,7 @@ pub mod codex_app_server;
 pub mod registry;
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
 use crate::text::truncate_chars;
 
@@ -137,6 +138,44 @@ pub trait ExecutorBackend: Send + Sync + 'static {
     ) -> anyhow::Result<ExecutorResponse>;
 }
 
+pub(crate) fn summarize_json_rpc_error(error: &Value) -> String {
+    let code = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let message_state = if error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .is_some()
+    {
+        "omitted"
+    } else {
+        "absent"
+    };
+    format!("code={code}, message={message_state}")
+}
+
+pub(crate) fn internal_json_rpc_error(message: &str) -> Value {
+    json!({
+        "code": -32000,
+        "message": message,
+        "data": {"source": "agent-router"},
+    })
+}
+
+pub(crate) fn internal_json_rpc_error_message(error: &Value) -> Option<&str> {
+    let source = error
+        .get("data")
+        .and_then(|data| data.get("source"))
+        .and_then(Value::as_str);
+    if source != Some("agent-router") {
+        return None;
+    }
+    error.get("message").and_then(Value::as_str)
+}
+
 #[cfg(test)]
 pub mod test_support {
     use std::{collections::BTreeMap, sync::Arc};
@@ -260,5 +299,44 @@ mod tests {
         let summary = update.summary(17).unwrap();
 
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn json_rpc_error_summary_omits_sensitive_fields() {
+        let summary = summarize_json_rpc_error(&serde_json::json!({
+            "code": -32000,
+            "message": "secret prompt text",
+            "data": {"token": "secret-token"},
+        }));
+
+        assert_eq!(summary, "code=-32000, message=omitted");
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("token"));
+    }
+
+    #[test]
+    fn json_rpc_error_summary_ignores_malformed_code() {
+        let summary = summarize_json_rpc_error(&serde_json::json!({
+            "code": {"token": "secret-code"},
+            "message": "",
+        }));
+
+        assert_eq!(summary, "code=unknown, message=absent");
+        assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn internal_json_rpc_error_message_requires_router_marker() {
+        let internal = internal_json_rpc_error("ACP process closed stdout");
+        assert_eq!(
+            internal_json_rpc_error_message(&internal),
+            Some("ACP process closed stdout")
+        );
+
+        let external = serde_json::json!({
+            "code": -32000,
+            "message": "secret prompt text",
+        });
+        assert_eq!(internal_json_rpc_error_message(&external), None);
     }
 }

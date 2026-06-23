@@ -24,7 +24,8 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
         ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate,
-        PreparedExecutor,
+        PreparedExecutor, internal_json_rpc_error, internal_json_rpc_error_message,
+        summarize_json_rpc_error,
     },
 };
 
@@ -159,11 +160,23 @@ impl ExecutorBackend for CodexAppServerManager {
             .executors
             .get(&request.executor)
             .ok_or_else(|| anyhow::anyhow!("executor `{}` is not configured", request.executor))?;
+        tracing::info!(
+            executor = %request.executor,
+            session_key = %request.session_key,
+            "preparing Codex app-server executor session"
+        );
         let session = self
             .get_or_create_session(&request.session_key, &request.executor, cfg)
             .await?;
         let mut session = session.lock().await;
         let (thread_id, started_new_session) = session.ensure_thread().await?;
+        tracing::info!(
+            executor = %request.executor,
+            session_key = %request.session_key,
+            thread_id = %thread_id,
+            started_new_session,
+            "prepared Codex app-server executor session"
+        );
         Ok(PreparedExecutor {
             external_session_id: Some(thread_id),
             started_new_session,
@@ -179,9 +192,33 @@ impl ExecutorBackend for CodexAppServerManager {
             .existing_session(&request.session_key, &request.executor)
             .await?;
         let mut session = session.lock().await;
-        session
+        let session_key = request.session_key.clone();
+        let executor = request.executor.clone();
+        let prompt_len = request.prompt.len();
+        tracing::info!(
+            executor = %executor,
+            session_key = %session_key,
+            prompt_len,
+            "starting Codex app-server turn"
+        );
+        let result = session
             .run_turn(&request.prompt, request.user_id, events)
-            .await
+            .await;
+        match &result {
+            Ok(response) => tracing::info!(
+                executor = %executor,
+                session_key = %session_key,
+                final_text_len = response.final_text.len(),
+                "completed Codex app-server turn"
+            ),
+            Err(err) => tracing::warn!(
+                error = %err,
+                executor = %executor,
+                session_key = %session_key,
+                "failed Codex app-server turn"
+            ),
+        }
+        result
     }
 }
 
@@ -208,7 +245,27 @@ impl CodexAppServerSession {
         approvals: SharedApprovalBroker,
         limits: CodexRuntimeLimits,
     ) -> anyhow::Result<Self> {
-        let client = CodexJsonRpcClient::spawn(&cfg.command, &cfg.args, &cwd, &cfg.env).await?;
+        tracing::info!(
+            executor = %executor,
+            session_key = %session_key,
+            command = %cfg.command,
+            cwd = %cwd.display(),
+            "starting Codex app-server process"
+        );
+        let client = CodexJsonRpcClient::spawn(
+            &cfg.command,
+            &cfg.args,
+            &cwd,
+            &cfg.env,
+            session_key.clone(),
+            executor.clone(),
+        )
+        .await?;
+        tracing::info!(
+            executor = %executor,
+            session_key = %session_key,
+            "started Codex app-server process"
+        );
         Ok(Self {
             cfg,
             cwd,
@@ -598,6 +655,8 @@ struct CodexJsonRpcClient {
     server_requests: broadcast::Sender<Value>,
     closed: broadcast::Sender<String>,
     child: Arc<Mutex<Child>>,
+    session_key: String,
+    executor: String,
 }
 
 #[derive(Debug)]
@@ -619,7 +678,18 @@ impl CodexJsonRpcClient {
         args: &[String],
         cwd: &Path,
         env: &BTreeMap<String, String>,
+        session_key: String,
+        executor: String,
     ) -> anyhow::Result<Self> {
+        tracing::info!(
+            target: "agent_router::codex_app_server",
+            executor = %executor,
+            session_key = %session_key,
+            command = %command,
+            arg_count = args.len(),
+            cwd = %cwd.display(),
+            "spawning Codex app-server process"
+        );
         let mut cmd = Command::new(command);
         cmd.args(args).current_dir(cwd);
         for (key, value) in env {
@@ -632,6 +702,15 @@ impl CodexJsonRpcClient {
         let mut child = cmd.spawn().map_err(|err| {
             anyhow::anyhow!("could not start codex app-server command `{command}`: {err}")
         })?;
+        let pid = child.id();
+        tracing::info!(
+            target: "agent_router::codex_app_server",
+            executor = %executor,
+            session_key = %session_key,
+            command = %command,
+            pid = ?pid,
+            "spawned Codex app-server process"
+        );
         let stdin = child
             .stdin
             .take()
@@ -655,6 +734,8 @@ impl CodexJsonRpcClient {
             notifications.clone(),
             server_requests.clone(),
             closed.clone(),
+            session_key.clone(),
+            executor.clone(),
         ));
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
@@ -677,6 +758,8 @@ impl CodexJsonRpcClient {
             server_requests,
             closed,
             child,
+            session_key,
+            executor,
         })
     }
 
@@ -776,7 +859,26 @@ impl CodexJsonRpcClient {
         fail_all_pending(&self.state, reason).await;
         let _ = self.closed.send(reason.to_string());
         let mut child = self.child.lock().await;
-        let _ = child.start_kill();
+        let pid = child.id();
+        tracing::warn!(
+            target: "agent_router::codex_app_server",
+            executor = %self.executor,
+            session_key = %self.session_key,
+            pid = ?pid,
+            reason,
+            "closing Codex app-server process"
+        );
+        if let Err(err) = child.start_kill() {
+            tracing::warn!(
+                target: "agent_router::codex_app_server",
+                executor = %self.executor,
+                session_key = %self.session_key,
+                pid = ?pid,
+                reason,
+                error = %err,
+                "failed to signal Codex app-server process"
+            );
+        }
     }
 
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
@@ -821,6 +923,9 @@ impl CodexJsonRpcClient {
 
 fn json_rpc_result(method: &str, response: Value) -> anyhow::Result<Value> {
     if let Some(error) = response.get("error") {
+        if let Some(message) = internal_json_rpc_error_message(error) {
+            anyhow::bail!("{message}");
+        }
         anyhow::bail!(
             "codex app-server `{method}` failed: {}",
             summarize_json_rpc_error(error)
@@ -829,30 +934,14 @@ fn json_rpc_result(method: &str, response: Value) -> anyhow::Result<Value> {
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
-fn summarize_json_rpc_error(error: &Value) -> String {
-    let code = error
-        .get("code")
-        .map(Value::to_string)
-        .unwrap_or_else(|| "unknown".to_string());
-    let message_state = if error
-        .get("message")
-        .and_then(Value::as_str)
-        .filter(|message| !message.trim().is_empty())
-        .is_some()
-    {
-        "omitted"
-    } else {
-        "absent"
-    };
-    format!("code={code}, message={message_state}")
-}
-
 async fn read_codex_stdout<R>(
     reader: BufReader<R>,
     state: SharedJsonRpcState,
     notifications: broadcast::Sender<Value>,
     server_requests: broadcast::Sender<Value>,
     closed: broadcast::Sender<String>,
+    session_key: String,
+    executor: String,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -868,6 +957,12 @@ async fn read_codex_stdout<R>(
         };
         dispatch_codex_message(message, &state, &notifications, &server_requests).await;
     }
+    tracing::warn!(
+        target: "agent_router::codex_app_server",
+        executor = %executor,
+        session_key = %session_key,
+        "Codex app-server stdout closed"
+    );
     fail_all_pending(&state, "codex app-server closed stdout").await;
     let _ = closed.send("codex app-server closed stdout".to_string());
 }
@@ -909,10 +1004,7 @@ async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
         let _ = tx.send(json!({
             "jsonrpc": "2.0",
             "id": id,
-            "error": {
-                "code": -32000,
-                "message": message,
-            }
+            "error": internal_json_rpc_error(message),
         }));
     }
 }

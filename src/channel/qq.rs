@@ -74,6 +74,7 @@ impl QqBotChannel {
         let gateway_url = self.gateway_url(&token).await?;
         tracing::info!("connecting QQ gateway");
         let (stream, _) = connect_async(gateway_url).await?;
+        tracing::info!("connected QQ gateway");
         let (mut sink, mut stream) = stream.split();
 
         let hello = stream
@@ -183,6 +184,11 @@ impl QqBotChannel {
                 };
                 if matches!(event_type.as_str(), "READY" | "RESUMED") {
                     if let Some(session_id) = data.get("session_id").and_then(Value::as_str) {
+                        tracing::info!(
+                            event_type = %event_type,
+                            session_id = %session_id,
+                            "QQ gateway session established"
+                        );
                         self.record_gateway_session_id(session_id.to_string()).await;
                     }
                     return Ok(());
@@ -279,6 +285,13 @@ impl QqBotChannel {
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
         self.remember_reply_context(&message).await;
+        tracing::info!(
+            session_key = %message.session_key,
+            user_id = %message.user_id,
+            group_id = ?message.group_id,
+            text_len = message.text.len(),
+            "routing QQ message"
+        );
         let mut output = QqRouterOutputSink {
             channel: self.clone(),
             session_key: message.session_key.clone(),
@@ -375,6 +388,13 @@ impl QqBotChannel {
         msg_seq: u32,
         text: &str,
     ) -> anyhow::Result<()> {
+        tracing::info!(
+            target_scope = target.scope(),
+            target_id = %target.id(),
+            msg_seq,
+            text_len = text.len(),
+            "sending QQ message"
+        );
         let token = self.token().await?;
         let url = format!(
             "{}/v2/{}/{}/messages",
@@ -400,6 +420,13 @@ impl QqBotChannel {
             let body = truncate_for_error(resp.text().await.unwrap_or_default());
             anyhow::bail!("QQ send message failed ({status}): {body}");
         }
+        tracing::info!(
+            target_scope = target.scope(),
+            target_id = %target.id(),
+            msg_seq,
+            text_len = text.len(),
+            "sent QQ message"
+        );
         Ok(())
     }
 

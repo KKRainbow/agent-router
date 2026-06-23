@@ -38,6 +38,7 @@ impl SlackSocketModeChannel {
         let url = self.open_socket_url().await?;
         tracing::info!("connecting Slack Socket Mode");
         let (stream, _) = connect_async(url).await?;
+        tracing::info!(bot_user_id = %bot_user_id, "connected Slack Socket Mode");
         let (mut sink, mut stream) = stream.split();
         let channel = Arc::new(self);
         channel.clone().spawn_approval_notifier();
@@ -154,6 +155,14 @@ impl SlackSocketModeChannel {
         {
             return Ok(());
         }
+        let session_key = event.session_key();
+        tracing::info!(
+            channel = %event.channel,
+            user_id = %event.user,
+            session_key = %session_key,
+            text_len = text.len(),
+            "routing Slack message"
+        );
         let mut output = SlackRouterOutputSink {
             channel: self.clone(),
             target: reply_target,
@@ -161,7 +170,7 @@ impl SlackSocketModeChannel {
         router
             .handle(
                 RouterInput {
-                    session_key: event.session_key(),
+                    session_key,
                     text,
                     user_id: Some(event.user),
                 },
@@ -186,6 +195,14 @@ impl SlackSocketModeChannel {
             channel: command.channel_id.clone(),
             thread_ts: None,
         };
+        let session_key = format!("slack:{}:slash:{}", command.channel_id, command.user_id);
+        tracing::info!(
+            channel = %command.channel_id,
+            user_id = %command.user_id,
+            session_key = %session_key,
+            text_len = text.len(),
+            "routing Slack slash command"
+        );
         let mut output = SlackRouterOutputSink {
             channel: self.clone(),
             target: reply_target,
@@ -193,7 +210,7 @@ impl SlackSocketModeChannel {
         router
             .handle(
                 RouterInput {
-                    session_key: format!("slack:{}:slash:{}", command.channel_id, command.user_id),
+                    session_key,
                     text,
                     user_id: Some(command.user_id),
                 },
@@ -262,6 +279,12 @@ impl SlackSocketModeChannel {
             error: Option<String>,
         }
 
+        tracing::info!(
+            channel = %target.channel,
+            thread_ts = ?target.thread_ts,
+            text_len = text.len(),
+            "sending Slack message"
+        );
         let mut body = json!({
             "channel": target.channel,
             "text": text,
@@ -284,6 +307,12 @@ impl SlackSocketModeChannel {
                 resp.error.unwrap_or_else(|| "unknown_error".to_string())
             );
         }
+        tracing::info!(
+            channel = %target.channel,
+            thread_ts = ?target.thread_ts,
+            text_len = text.len(),
+            "sent Slack message"
+        );
         Ok(())
     }
 

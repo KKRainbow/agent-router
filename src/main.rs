@@ -53,20 +53,30 @@ async fn main() -> anyhow::Result<()> {
         approvals.clone(),
     ));
 
-    let mut channels = JoinSet::new();
+    let mut channels: JoinSet<(&'static str, anyhow::Result<()>)> = JoinSet::new();
     if config.slack.enabled {
+        tracing::info!("starting Slack channel");
         let router = router.clone();
         let approvals = approvals.clone();
         channels.spawn(async move {
-            SlackSocketModeChannel::new(config.slack, approvals)
-                .run(router)
-                .await
+            (
+                "slack",
+                SlackSocketModeChannel::new(config.slack, approvals)
+                    .run(router)
+                    .await,
+            )
         });
     }
     if config.qq.enabled {
+        tracing::info!("starting QQ channel");
         let router = router.clone();
         let approvals = approvals.clone();
-        channels.spawn(async move { QqBotChannel::new(config.qq, approvals).run(router).await });
+        channels.spawn(async move {
+            (
+                "qq",
+                QqBotChannel::new(config.qq, approvals).run(router).await,
+            )
+        });
     }
     anyhow::ensure!(
         !channels.is_empty(),
@@ -74,7 +84,17 @@ async fn main() -> anyhow::Result<()> {
     );
 
     while let Some(result) = channels.join_next().await {
-        result??;
+        match result {
+            Ok((channel, Ok(()))) => tracing::info!(channel, "channel task exited"),
+            Ok((channel, Err(err))) => {
+                tracing::warn!(error = %err, channel, "channel task failed");
+                return Err(err);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "channel task join failed");
+                return Err(err.into());
+            }
+        }
     }
     Ok(())
 }
