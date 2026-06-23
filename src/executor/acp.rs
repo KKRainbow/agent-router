@@ -743,12 +743,12 @@ fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
     } else {
         kind.to_string()
     };
-    Some(ExecutorUpdate {
-        kind: normalized_kind,
+    Some(ExecutorUpdate::new(
+        normalized_kind,
         title,
-        text: text.unwrap_or_default(),
+        text.unwrap_or_default(),
         status,
-    })
+    ))
 }
 
 fn extract_text(value: Option<&Value>) -> Option<String> {

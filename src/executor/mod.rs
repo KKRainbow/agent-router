@@ -39,6 +39,29 @@ pub struct ExecutorUpdate {
     pub title: String,
     pub text: String,
     pub status: String,
+    pub channel_event: Option<ExecutorChannelEvent>,
+}
+
+impl ExecutorUpdate {
+    pub fn new(
+        kind: impl Into<String>,
+        title: impl Into<String>,
+        text: impl Into<String>,
+        status: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            title: title.into(),
+            text: text.into(),
+            status: status.into(),
+            channel_event: None,
+        }
+    }
+
+    pub fn with_channel_event(mut self, channel_event: ExecutorChannelEvent) -> Self {
+        self.channel_event = Some(channel_event);
+        self
+    }
 }
 
 impl ExecutorUpdate {
@@ -66,6 +89,37 @@ impl ExecutorUpdate {
         }
         Some(text)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorChannelEvent {
+    pub kind: ExecutorChannelEventKind,
+    pub title: String,
+    pub text: String,
+}
+
+impl ExecutorChannelEvent {
+    pub fn reasoning_summary(text: impl Into<String>) -> Self {
+        Self {
+            kind: ExecutorChannelEventKind::ReasoningSummary,
+            title: "Reasoning".to_string(),
+            text: text.into(),
+        }
+    }
+
+    pub fn tool_call(title: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            kind: ExecutorChannelEventKind::ToolCall,
+            title: title.into(),
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorChannelEventKind {
+    ReasoningSummary,
+    ToolCall,
 }
 
 #[derive(Debug, Clone)]
@@ -149,12 +203,7 @@ pub mod test_support {
             });
             Ok(ExecutorResponse {
                 final_text: "fake response".to_string(),
-                updates: vec![ExecutorUpdate {
-                    kind: "plan".to_string(),
-                    title: "Plan".to_string(),
-                    text: "working".to_string(),
-                    status: String::new(),
-                }],
+                updates: vec![ExecutorUpdate::new("plan", "Plan", "working", "")],
             })
         }
     }
@@ -182,12 +231,7 @@ mod tests {
 
     #[test]
     fn update_summary_truncates_on_char_boundary() {
-        let update = ExecutorUpdate {
-            kind: "tool_call".to_string(),
-            title: "Bash".to_string(),
-            text: format!("{}🙂z", "a".repeat(16)),
-            status: String::new(),
-        };
+        let update = ExecutorUpdate::new("tool_call", "Bash", format!("{}🙂z", "a".repeat(16)), "");
 
         let summary = update.summary(20).unwrap();
 

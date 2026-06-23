@@ -5,7 +5,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     approval::{ApprovalBroker, SharedApprovalBroker},
-    executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorUpdate},
+    executor::{
+        ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
+        ExecutorUpdate,
+    },
     session::{
         ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
         projection::{
@@ -339,25 +342,23 @@ fn channel_event_from_executor_update(
     executor: &str,
     update: &ExecutorUpdate,
 ) -> Option<RouterChannelEvent> {
-    let kind = match update.kind.as_str() {
-        "agent_thought_chunk" => RouterChannelEventKind::ReasoningSummary,
-        "tool_call" => RouterChannelEventKind::ToolCall,
-        _ => return None,
-    };
-    let text = if update.text.trim().is_empty() {
-        update.status.trim()
-    } else {
-        update.text.trim()
-    };
-    if text.is_empty() {
+    let event = update.channel_event.as_ref()?;
+    if event.text.trim().is_empty() {
         return None;
     }
     Some(RouterChannelEvent {
-        kind,
+        kind: router_channel_event_kind(event.kind),
         executor: executor.to_string(),
-        title: update.title.clone(),
-        text: truncate_chars(text, 1_500),
+        title: event.title.clone(),
+        text: truncate_chars(event.text.trim(), 1_500),
     })
+}
+
+fn router_channel_event_kind(kind: ExecutorChannelEventKind) -> RouterChannelEventKind {
+    match kind {
+        ExecutorChannelEventKind::ReasoningSummary => RouterChannelEventKind::ReasoningSummary,
+        ExecutorChannelEventKind::ToolCall => RouterChannelEventKind::ToolCall,
+    }
 }
 
 fn update_binding_after_success(
@@ -396,7 +397,7 @@ mod tests {
     use super::*;
     use crate::{
         approval::{ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection},
-        executor::test_support::FakeExecutorBackend,
+        executor::{ExecutorChannelEvent, test_support::FakeExecutorBackend},
         session::{
             TranscriptMessage, projection::message_fingerprint, store::InMemorySessionStore,
         },
@@ -514,37 +515,32 @@ mod tests {
         let events = channel_events_from_executor_updates(
             "codex",
             &[
-                ExecutorUpdate {
-                    kind: "plan".to_string(),
-                    title: "Plan".to_string(),
-                    text: "working".to_string(),
-                    status: String::new(),
-                },
-                ExecutorUpdate {
-                    kind: "agent_thought_chunk".to_string(),
-                    title: "Reasoning".to_string(),
-                    text: "I should inspect the config.".to_string(),
-                    status: String::new(),
-                },
-                ExecutorUpdate {
-                    kind: "tool_call".to_string(),
-                    title: "Bash".to_string(),
-                    text: "$ cargo test\nok".to_string(),
-                    status: "completed".to_string(),
-                },
+                ExecutorUpdate::new("plan", "Plan", "working", ""),
+                ExecutorUpdate::new(
+                    "agent_thought_chunk",
+                    "Reasoning",
+                    "raw thinking should not leak",
+                    "",
+                ),
+                ExecutorUpdate::new("tool_call", "Bash", "$ cargo test\nok", "completed")
+                    .with_channel_event(ExecutorChannelEvent::tool_call("Bash", "$ cargo test")),
+                ExecutorUpdate::new("agent_thought_chunk", "Reasoning", "summary", "")
+                    .with_channel_event(ExecutorChannelEvent::reasoning_summary(
+                        "I should inspect the config.",
+                    )),
             ],
         );
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind, RouterChannelEventKind::ReasoningSummary);
+        assert_eq!(events[0].kind, RouterChannelEventKind::ToolCall);
         assert_eq!(
             events[0].render_text(),
-            "[codex] Reasoning summary\nI should inspect the config."
+            "[codex] Tool call: Bash\n$ cargo test"
         );
-        assert_eq!(events[1].kind, RouterChannelEventKind::ToolCall);
+        assert_eq!(events[1].kind, RouterChannelEventKind::ReasoningSummary);
         assert_eq!(
             events[1].render_text(),
-            "[codex] Tool call: Bash\n$ cargo test\nok"
+            "[codex] Reasoning summary\nI should inspect the config."
         );
     }
 

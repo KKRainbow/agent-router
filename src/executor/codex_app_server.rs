@@ -22,8 +22,8 @@ use crate::{
     },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorPrepareRequest, ExecutorPromptRequest,
-        ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorPrepareRequest,
+        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
     },
 };
 
@@ -954,58 +954,69 @@ fn collect_codex_notification(
                 .unwrap_or("")
                 .to_string();
             *final_text = text.clone();
-            updates.push(ExecutorUpdate {
-                kind: "agent_message_chunk".to_string(),
-                title: String::new(),
+            updates.push(ExecutorUpdate::new(
+                "agent_message_chunk",
+                String::new(),
                 text,
-                status: String::new(),
-            });
+                String::new(),
+            ));
         }
         "reasoning" => {
-            let text =
-                extract_text(item.get("summary")).or_else(|| extract_text(item.get("content")));
-            updates.push(ExecutorUpdate {
-                kind: "agent_thought_chunk".to_string(),
-                title: "Reasoning".to_string(),
-                text: text.unwrap_or_default(),
-                status: String::new(),
-            });
+            let summary = extract_text(item.get("summary"));
+            let text = summary
+                .clone()
+                .or_else(|| extract_text(item.get("content")))
+                .unwrap_or_default();
+            let mut update =
+                ExecutorUpdate::new("agent_thought_chunk", "Reasoning", text, String::new());
+            if let Some(summary) = summary.filter(|summary| !summary.trim().is_empty()) {
+                update = update.with_channel_event(ExecutorChannelEvent::reasoning_summary(
+                    truncate_text(summary, 1_000),
+                ));
+            }
+            updates.push(update);
         }
         "commandExecution" => {
-            updates.push(ExecutorUpdate {
-                kind: "tool_call".to_string(),
-                title: "Bash".to_string(),
-                text: command_execution_summary(item),
-                status: item
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            });
+            let summary = command_execution_summary(item);
+            let channel_summary = command_execution_channel_summary(item);
+            updates.push(
+                ExecutorUpdate::new(
+                    "tool_call",
+                    "Bash",
+                    summary.clone(),
+                    item.get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                )
+                .with_channel_event(ExecutorChannelEvent::tool_call("Bash", channel_summary)),
+            );
         }
         "fileChange" => {
-            updates.push(ExecutorUpdate {
-                kind: "diff".to_string(),
-                title: "File change".to_string(),
-                text: file_change_summary(item),
-                status: item
-                    .get("status")
+            updates.push(ExecutorUpdate::new(
+                "diff",
+                "File change",
+                file_change_summary(item),
+                item.get("status")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-            });
+            ));
         }
         "mcpToolCall" | "dynamicToolCall" => {
-            updates.push(ExecutorUpdate {
-                kind: "tool_call".to_string(),
-                title: item_type.to_string(),
-                text: truncate_text(item.to_string(), 1_000),
-                status: item
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            });
+            let summary = tool_call_item_summary(item);
+            updates.push(
+                ExecutorUpdate::new(
+                    "tool_call",
+                    item_type.to_string(),
+                    summary.clone(),
+                    item.get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                )
+                .with_channel_event(ExecutorChannelEvent::tool_call(item_type, summary)),
+            );
         }
         _ => {}
     }
@@ -1049,6 +1060,45 @@ fn command_execution_summary(item: &Value) -> String {
         lines.push(output.to_string());
     }
     truncate_text(lines.join("\n"), 2_000)
+}
+
+fn command_execution_channel_summary(item: &Value) -> String {
+    let exit_code = item.get("exitCode").and_then(Value::as_i64);
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut lines = Vec::new();
+    if let Some(exit_code) = exit_code {
+        lines.push(format!("exit: {exit_code}"));
+    }
+    if !status.is_empty() {
+        lines.push(format!("status: {status}"));
+    }
+    if lines.is_empty() {
+        "command execution completed".to_string()
+    } else {
+        truncate_text(lines.join("\n"), 1_000)
+    }
+}
+
+fn tool_call_item_summary(item: &Value) -> String {
+    let name = item
+        .get("name")
+        .or_else(|| item.get("toolName"))
+        .or_else(|| item.get("tool_name"))
+        .or_else(|| item.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool call");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}\nstatus: {status}")
+    }
 }
 
 fn file_change_summary(item: &Value) -> String {
@@ -1161,7 +1211,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use crate::approval::ApprovalBroker;
-    use crate::executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest};
+    use crate::executor::{
+        ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
+    };
 
     use super::*;
 
@@ -1188,6 +1240,69 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    #[test]
+    fn codex_reasoning_channel_event_requires_summary() {
+        let mut final_text = String::new();
+        let mut updates = Vec::new();
+
+        collect_codex_notification(
+            json!({
+                "method": "item/completed",
+                "params": {"item": {"type": "reasoning", "content": "raw thinking"}}
+            }),
+            &mut final_text,
+            &mut updates,
+        )
+        .unwrap();
+
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].channel_event.is_none());
+
+        collect_codex_notification(
+            json!({
+                "method": "item/completed",
+                "params": {"item": {"type": "reasoning", "summary": [{"text": "safe summary"}]}}
+            }),
+            &mut final_text,
+            &mut updates,
+        )
+        .unwrap();
+
+        let event = updates[1].channel_event.as_ref().unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::ReasoningSummary);
+        assert_eq!(event.text, "safe summary");
+    }
+
+    #[test]
+    fn codex_command_channel_event_omits_aggregated_output() {
+        let mut final_text = String::new();
+        let mut updates = Vec::new();
+
+        collect_codex_notification(
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "printenv SECRET_TOKEN",
+                        "aggregatedOutput": "SECRET_TOKEN=super-secret",
+                        "exitCode": 0,
+                        "status": "completed"
+                    }
+                }
+            }),
+            &mut final_text,
+            &mut updates,
+        )
+        .unwrap();
+
+        let event = updates[0].channel_event.as_ref().unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
+        assert!(event.text.contains("exit: 0"));
+        assert!(!event.text.contains("printenv"));
+        assert!(!event.text.contains("super-secret"));
     }
 
     fn write_fake_codex_script(path: &Path, behavior: &str) {
