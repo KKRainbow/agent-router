@@ -23,7 +23,7 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
         ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
-        internal_json_rpc_error, internal_json_rpc_error_message, summarize_json_rpc_error,
+        summarize_json_rpc_error,
     },
 };
 
@@ -410,7 +410,7 @@ struct JsonRpcClient {
 #[derive(Debug, Default)]
 struct JsonRpcState {
     closed: bool,
-    pending: HashMap<u64, oneshot::Sender<Value>>,
+    pending: HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -565,11 +565,8 @@ impl JsonRpcClient {
         }
         let response = rx
             .await
-            .map_err(|_| anyhow::anyhow!("ACP response channel closed"))?;
+            .map_err(|_| anyhow::anyhow!("ACP response channel closed"))??;
         if let Some(error) = response.get("error") {
-            if let Some(message) = internal_json_rpc_error_message(error) {
-                anyhow::bail!("{message}");
-            }
             anyhow::bail!("ACP `{method}` failed: {}", summarize_json_rpc_error(error));
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
@@ -603,12 +600,8 @@ async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
         guard.closed = true;
         guard.pending.drain().collect::<Vec<_>>()
     };
-    for (id, tx) in drained {
-        let _ = tx.send(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": internal_json_rpc_error(message),
-        }));
+    for (_, tx) in drained {
+        let _ = tx.send(Err(anyhow::anyhow!("{message}")));
     }
 }
 
@@ -619,7 +612,7 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
             None => None,
         };
         if let Some(tx) = sender {
-            let _ = tx.send(message);
+            let _ = tx.send(Ok(message));
         }
         return;
     }

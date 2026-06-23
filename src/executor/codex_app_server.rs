@@ -24,8 +24,7 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
         ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate,
-        PreparedExecutor, internal_json_rpc_error, internal_json_rpc_error_message,
-        summarize_json_rpc_error,
+        PreparedExecutor, summarize_json_rpc_error,
     },
 };
 
@@ -381,7 +380,7 @@ impl CodexAppServerSession {
             tokio::select! {
                 response = &mut turn_start.response, if !turn_start_acknowledged => {
                     turn_start_acknowledged = true;
-                    json_rpc_result(&turn_start.method, response?)?;
+                    json_rpc_result(&turn_start.method, response??)?;
                     if turn_completed {
                         break;
                     }
@@ -663,13 +662,13 @@ struct CodexJsonRpcClient {
 struct PendingJsonRpcRequest {
     id: u64,
     method: String,
-    response: oneshot::Receiver<Value>,
+    response: oneshot::Receiver<anyhow::Result<Value>>,
 }
 
 #[derive(Debug, Default)]
 struct JsonRpcState {
     closed: bool,
-    pending: HashMap<u64, oneshot::Sender<Value>>,
+    pending: HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>,
 }
 
 impl CodexJsonRpcClient {
@@ -805,7 +804,8 @@ impl CodexJsonRpcClient {
         let id = request.id;
         let method = request.method;
         let response = match timeout(timeout_duration, request.response).await {
-            Ok(Ok(response)) => response,
+            Ok(Ok(Ok(response))) => response,
+            Ok(Ok(Err(err))) => return Err(err),
             Ok(Err(_)) => anyhow::bail!("codex app-server response channel closed"),
             Err(_) => {
                 self.cancel_pending(id).await;
@@ -923,9 +923,6 @@ impl CodexJsonRpcClient {
 
 fn json_rpc_result(method: &str, response: Value) -> anyhow::Result<Value> {
     if let Some(error) = response.get("error") {
-        if let Some(message) = internal_json_rpc_error_message(error) {
-            anyhow::bail!("{message}");
-        }
         anyhow::bail!(
             "codex app-server `{method}` failed: {}",
             summarize_json_rpc_error(error)
@@ -981,7 +978,7 @@ async fn dispatch_codex_message(
             None => None,
         };
         if let Some(tx) = sender {
-            let _ = tx.send(message);
+            let _ = tx.send(Ok(message));
         }
         return;
     }
@@ -1000,12 +997,8 @@ async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
         guard.closed = true;
         guard.pending.drain().collect::<Vec<_>>()
     };
-    for (id, tx) in drained {
-        let _ = tx.send(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": internal_json_rpc_error(message),
-        }));
+    for (_, tx) in drained {
+        let _ = tx.send(Err(anyhow::anyhow!("{message}")));
     }
 }
 

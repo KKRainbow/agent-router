@@ -3,7 +3,7 @@ pub mod codex_app_server;
 pub mod registry;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::text::truncate_chars;
 
@@ -157,25 +157,6 @@ pub(crate) fn summarize_json_rpc_error(error: &Value) -> String {
     format!("code={code}, message={message_state}")
 }
 
-pub(crate) fn internal_json_rpc_error(message: &str) -> Value {
-    json!({
-        "code": -32000,
-        "message": message,
-        "data": {"source": "agent-router"},
-    })
-}
-
-pub(crate) fn internal_json_rpc_error_message(error: &Value) -> Option<&str> {
-    let source = error
-        .get("data")
-        .and_then(|data| data.get("source"))
-        .and_then(Value::as_str);
-    if source != Some("agent-router") {
-        return None;
-    }
-    error.get("message").and_then(Value::as_str)
-}
-
 #[cfg(test)]
 pub mod test_support {
     use std::{collections::BTreeMap, sync::Arc};
@@ -323,20 +304,5 @@ mod tests {
 
         assert_eq!(summary, "code=unknown, message=absent");
         assert!(!summary.contains("secret"));
-    }
-
-    #[test]
-    fn internal_json_rpc_error_message_requires_router_marker() {
-        let internal = internal_json_rpc_error("ACP process closed stdout");
-        assert_eq!(
-            internal_json_rpc_error_message(&internal),
-            Some("ACP process closed stdout")
-        );
-
-        let external = serde_json::json!({
-            "code": -32000,
-            "message": "secret prompt text",
-        });
-        assert_eq!(internal_json_rpc_error_message(&external), None);
     }
 }
