@@ -22,6 +22,8 @@ const QQ_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+const SESSION_QUEUE_CAPACITY: usize = 16;
+const SESSION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct QqBotChannel {
@@ -32,7 +34,7 @@ pub struct QqBotChannel {
     gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
     reply_contexts: Arc<Mutex<HashMap<String, QqReplyContext>>>,
-    session_workers: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<QqInboundMessage>>>>,
+    session_workers: Arc<Mutex<HashMap<String, mpsc::Sender<QqInboundMessage>>>>,
 }
 
 impl QqBotChannel {
@@ -236,24 +238,34 @@ impl QqBotChannel {
     ) -> anyhow::Result<()> {
         let session_key = message.session_key.clone();
         let sender = self.session_worker(&session_key, router).await;
-        if sender.send(message).is_err() {
-            self.session_workers.lock().await.remove(&session_key);
-            anyhow::bail!("QQ session worker stopped for session `{session_key}`");
+        match sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.session_workers.lock().await.remove(&session_key);
+                anyhow::bail!("QQ session worker stopped for session `{session_key}`");
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    session_key = %session_key,
+                    capacity = SESSION_QUEUE_CAPACITY,
+                    "QQ session queue is full; dropping inbound message"
+                );
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     async fn session_worker(
         &self,
         session_key: &str,
         router: Arc<dyn RouterService>,
-    ) -> mpsc::UnboundedSender<QqInboundMessage> {
+    ) -> mpsc::Sender<QqInboundMessage> {
         let mut workers = self.session_workers.lock().await;
         if let Some(sender) = workers.get(session_key) {
             return sender.clone();
         }
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(SESSION_QUEUE_CAPACITY);
         workers.insert(session_key.to_string(), sender.clone());
         self.clone()
             .spawn_session_worker(session_key.to_string(), router, receiver);
@@ -264,12 +276,21 @@ impl QqBotChannel {
         self,
         session_key: String,
         router: Arc<dyn RouterService>,
-        mut receiver: mpsc::UnboundedReceiver<QqInboundMessage>,
+        mut receiver: mpsc::Receiver<QqInboundMessage>,
     ) {
         tokio::spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                if let Err(err) = self.route_message(message, router.clone()).await {
-                    tracing::warn!(error = %err, session_key = %session_key, "failed to handle QQ session message");
+            loop {
+                match tokio::time::timeout(SESSION_WORKER_IDLE_TIMEOUT, receiver.recv()).await {
+                    Ok(Some(message)) => {
+                        if let Err(err) = self.route_message(message, router.clone()).await {
+                            tracing::warn!(error = %err, session_key = %session_key, "failed to handle QQ session message");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        self.session_workers.lock().await.remove(&session_key);
+                        break;
+                    }
                 }
             }
         });
