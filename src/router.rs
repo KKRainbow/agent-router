@@ -211,10 +211,7 @@ where
             Err(err) => {
                 state.executor_bindings.insert(
                     executor_name.clone(),
-                    ExecutorBinding {
-                        health: ExecutorHealth::Unhealthy,
-                        ..binding
-                    },
+                    update_binding_after_prompt_failure(binding, prepared.external_session_id),
                 );
                 self.store.save(state).await;
                 Err(err)
@@ -269,6 +266,18 @@ fn update_binding_after_success(
         &binding.seen_context,
         &[handoff_fingerprints, new_message_fingerprints].concat(),
     );
+    binding
+}
+
+fn update_binding_after_prompt_failure(
+    mut binding: ExecutorBinding,
+    prepared_session_id: Option<String>,
+) -> ExecutorBinding {
+    binding.health = ExecutorHealth::Unhealthy;
+    if prepared_session_id != binding.external_session_id {
+        binding.external_session_id = prepared_session_id;
+        binding.seen_context.clear();
+    }
     binding
 }
 
@@ -407,5 +416,81 @@ mod tests {
         let prompts = executor.prompts.lock().await;
         assert!(prompts[0].prompt.contains("Recent router transcript"));
         assert!(prompts[0].prompt.contains("user: old"));
+    }
+
+    #[tokio::test]
+    async fn prompt_failure_after_replacement_session_clears_stale_cursor() {
+        #[derive(Debug, Default)]
+        struct FailingAfterPrepare {
+            prepared: tokio::sync::Mutex<Vec<ExecutorPrepareRequest>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExecutorBackend for FailingAfterPrepare {
+            fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+                (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                    name: "kimi".to_string(),
+                    protocol: "fake".to_string(),
+                })
+            }
+
+            fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+                self.get("kimi").into_iter().collect()
+            }
+
+            async fn prepare(
+                &self,
+                request: ExecutorPrepareRequest,
+            ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+                self.prepared.lock().await.push(request);
+                Ok(crate::executor::PreparedExecutor {
+                    external_session_id: Some("replacement-session".to_string()),
+                    started_new_session: true,
+                })
+            }
+
+            async fn prompt(
+                &self,
+                _request: ExecutorPromptRequest,
+            ) -> anyhow::Result<crate::executor::ExecutorResponse> {
+                anyhow::bail!("prompt failed")
+            }
+        }
+
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FailingAfterPrepare::default());
+        let mut state = SessionState::new("slack:C1:T1", "kimi");
+        let old = TranscriptMessage::user("old");
+        state.transcript.push(old.clone());
+        state.executor_bindings.insert(
+            "kimi".to_string(),
+            ExecutorBinding {
+                protocol: "acp".to_string(),
+                external_session_id: Some("stale-session".to_string()),
+                seen_context: vec![message_fingerprint(&old)],
+                ..ExecutorBinding::default()
+            },
+        );
+        store.save(state).await;
+        let router = AgentRouter::new("kimi", store.clone(), executor);
+
+        let err = router
+            .handle(RouterInput {
+                session_key: "slack:C1:T1".to_string(),
+                text: "recover".to_string(),
+                user_id: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("prompt failed"));
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let binding = saved.executor_bindings.get("kimi").unwrap();
+        assert_eq!(
+            binding.external_session_id.as_deref(),
+            Some("replacement-session")
+        );
+        assert!(binding.seen_context.is_empty());
+        assert_eq!(binding.health, ExecutorHealth::Unhealthy);
     }
 }

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -302,6 +302,7 @@ struct JsonRpcClient {
     next_id: AtomicU64,
     updates: broadcast::Sender<ExecutorUpdate>,
     child: Arc<Mutex<Child>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl JsonRpcClient {
@@ -337,12 +338,14 @@ impl JsonRpcClient {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (updates, _) = broadcast::channel(256);
         let child = Arc::new(Mutex::new(child));
+        let closed = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(read_stdout(
             BufReader::new(stdout),
             pending.clone(),
             stdin.clone(),
             updates.clone(),
+            closed.clone(),
         ));
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
@@ -359,6 +362,7 @@ impl JsonRpcClient {
             next_id: AtomicU64::new(1),
             updates,
             child,
+            closed,
         })
     }
 
@@ -367,6 +371,9 @@ impl JsonRpcClient {
     }
 
     fn is_alive(&self) -> bool {
+        if self.closed.load(Ordering::Relaxed) {
+            return false;
+        }
         self.child
             .try_lock()
             .map(|mut child| {
@@ -379,6 +386,10 @@ impl JsonRpcClient {
     }
 
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            !self.closed.load(Ordering::Relaxed),
+            "ACP client stdout is closed"
+        );
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -411,6 +422,7 @@ async fn read_stdout<R>(
     pending: PendingMap,
     stdin: SharedStdin,
     updates: broadcast::Sender<ExecutorUpdate>,
+    closed: Arc<AtomicBool>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -422,6 +434,7 @@ async fn read_stdout<R>(
         };
         dispatch_message(message, &pending, &stdin, &updates).await;
     }
+    closed.store(true, Ordering::Relaxed);
     fail_all_pending(&pending, "ACP process closed stdout").await;
 }
 
