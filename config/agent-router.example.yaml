@@ -11,9 +11,22 @@ executors:
     command: codex
 
 slack:
+  # Optional. When omitted, Slack is enabled if either token is configured.
+  # enabled: true
   # Prefer environment variables for secrets:
   # SLACK_BOT_TOKEN=xoxb-...
   # SLACK_APP_TOKEN=xapp-...
   require_mention: true
   allowed_channels: []
   free_response_channels: []
+
+qq:
+  # Optional. When omitted, QQ is enabled if app_id or client_secret is configured.
+  # enabled: true
+  # Prefer environment variables for secrets:
+  # QQ_APP_ID=...
+  # QQ_CLIENT_SECRET=...
+  # QQ_SANDBOX=false
+  sandbox: false
+  allowed_users: []
+  allowed_groups: []

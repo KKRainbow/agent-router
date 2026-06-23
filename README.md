@@ -30,9 +30,9 @@ adapter as a protocol reference rather than a runtime dependency.
 
 ## MVP
 
-The current MVP runs Slack Socket Mode as the first channel, `kimi acp` as the
-first ACP executor backend, and `codex app-server` as the first app-server
-executor backend:
+The current MVP runs Slack Socket Mode and QQ Official Bot Gateway as the first
+channels, `kimi acp` as the first ACP executor backend, and `codex app-server`
+as the first app-server executor backend:
 
 ```bash
 cargo run -- --config config/agent-router.example.yaml
@@ -50,12 +50,17 @@ tokens into this repository:
 ```bash
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
+QQ_APP_ID=...
+QQ_CLIENT_SECRET=...
 ```
 
-The MVP supports `/agent status` and `/agent <name>` from Slack messages. A
-session starts with `default_executor`, has one `active_executor`, and shares
-context between executor switches by projecting canonical transcript into the
-target executor.
+Slack and QQ are enabled automatically when their credentials are present,
+unless the config explicitly sets `enabled: false`. QQ can be restricted with
+`QQ_ALLOWED_USERS` and `QQ_ALLOWED_GROUPS`, both as comma-separated openid
+lists. The MVP supports `/agent status` and
+`/agent <name>` from channel messages. A session starts with `default_executor`,
+has one `active_executor`, and shares context between executor switches by
+projecting canonical transcript into the target executor.
 
 Example switches:
 

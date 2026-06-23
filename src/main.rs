@@ -2,13 +2,14 @@ use std::{path::PathBuf, sync::Arc};
 
 use agent_router::{
     approval::ApprovalBroker,
-    channel::slack::SlackSocketModeChannel,
+    channel::{qq::QqBotChannel, slack::SlackSocketModeChannel},
     config::{AppConfig, default_config_path, load_dotenv},
     executor::registry::ExecutorRegistry,
     router::{AgentRouter, RouterService},
     session::store::InMemorySessionStore,
 };
 use clap::Parser;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Slack to ACP agent router")]
@@ -52,7 +53,28 @@ async fn main() -> anyhow::Result<()> {
         approvals.clone(),
     ));
 
-    SlackSocketModeChannel::new(config.slack, approvals)
-        .run(router)
-        .await
+    let mut channels = JoinSet::new();
+    if config.slack.enabled {
+        let router = router.clone();
+        let approvals = approvals.clone();
+        channels.spawn(async move {
+            SlackSocketModeChannel::new(config.slack, approvals)
+                .run(router)
+                .await
+        });
+    }
+    if config.qq.enabled {
+        let router = router.clone();
+        let approvals = approvals.clone();
+        channels.spawn(async move { QqBotChannel::new(config.qq, approvals).run(router).await });
+    }
+    anyhow::ensure!(
+        !channels.is_empty(),
+        "no channels enabled; configure Slack or QQ credentials, or set a channel's enabled flag"
+    );
+
+    while let Some(result) = channels.join_next().await {
+        result??;
+    }
+    Ok(())
 }

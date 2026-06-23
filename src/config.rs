@@ -10,6 +10,7 @@ use serde::Deserialize;
 pub struct AppConfig {
     pub router: RouterConfig,
     pub slack: SlackConfig,
+    pub qq: QqConfig,
     pub executors: BTreeMap<String, ExecutorConfig>,
 }
 
@@ -20,11 +21,23 @@ pub struct RouterConfig {
 
 #[derive(Debug, Clone)]
 pub struct SlackConfig {
+    pub enabled: bool,
     pub bot_token: String,
     pub app_token: String,
     pub require_mention: bool,
     pub allowed_channels: BTreeSet<String>,
     pub free_response_channels: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QqConfig {
+    pub enabled: bool,
+    pub app_id: String,
+    pub client_secret: String,
+    pub sandbox: bool,
+    pub intents: u64,
+    pub allowed_users: BTreeSet<String>,
+    pub allowed_groups: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +60,7 @@ pub struct ExecutorConfig {
 struct FileConfig {
     router: Option<FileRouterConfig>,
     slack: Option<FileSlackConfig>,
+    qq: Option<FileQqConfig>,
     executors: Option<BTreeMap<String, FileExecutorConfig>>,
 }
 
@@ -57,11 +71,23 @@ struct FileRouterConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct FileSlackConfig {
+    enabled: Option<bool>,
     bot_token: Option<String>,
     app_token: Option<String>,
     require_mention: Option<bool>,
     allowed_channels: Option<StringList>,
     free_response_channels: Option<StringList>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileQqConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    client_secret: Option<String>,
+    sandbox: Option<bool>,
+    intents: Option<u64>,
+    allowed_users: Option<StringList>,
+    allowed_groups: Option<StringList>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,15 +143,22 @@ impl AppConfig {
             .unwrap_or_else(|| "kimi".to_string());
 
         let slack_file = file_cfg.slack.unwrap_or_default();
+        let slack_bot_token = env_cfg
+            .slack_bot_token
+            .or(slack_file.bot_token)
+            .unwrap_or_default();
+        let slack_app_token = env_cfg
+            .slack_app_token
+            .or(slack_file.app_token)
+            .unwrap_or_default();
+        let slack_enabled = env_cfg
+            .slack_enabled
+            .or(slack_file.enabled)
+            .unwrap_or(!slack_bot_token.is_empty() || !slack_app_token.is_empty());
         let slack = SlackConfig {
-            bot_token: env_cfg
-                .slack_bot_token
-                .or(slack_file.bot_token)
-                .unwrap_or_default(),
-            app_token: env_cfg
-                .slack_app_token
-                .or(slack_file.app_token)
-                .unwrap_or_default(),
+            enabled: slack_enabled,
+            bot_token: slack_bot_token,
+            app_token: slack_app_token,
             require_mention: env_cfg
                 .slack_require_mention
                 .or(slack_file.require_mention)
@@ -137,6 +170,35 @@ impl AppConfig {
             free_response_channels: env_cfg
                 .slack_free_response_channels
                 .or_else(|| slack_file.free_response_channels.map(StringList::into_set))
+                .unwrap_or_default(),
+        };
+
+        let qq_file = file_cfg.qq.unwrap_or_default();
+        let qq_app_id = env_cfg.qq_app_id.or(qq_file.app_id).unwrap_or_default();
+        let qq_client_secret = env_cfg
+            .qq_client_secret
+            .or(qq_file.client_secret)
+            .unwrap_or_default();
+        let qq_enabled = env_cfg
+            .qq_enabled
+            .or(qq_file.enabled)
+            .unwrap_or(!qq_app_id.is_empty() || !qq_client_secret.is_empty());
+        let qq = QqConfig {
+            enabled: qq_enabled,
+            app_id: qq_app_id,
+            client_secret: qq_client_secret,
+            sandbox: env_cfg.qq_sandbox.or(qq_file.sandbox).unwrap_or(false),
+            intents: env_cfg
+                .qq_intents
+                .or(qq_file.intents)
+                .unwrap_or((1_u64 << 25) | (1_u64 << 30)),
+            allowed_users: env_cfg
+                .qq_allowed_users
+                .or_else(|| qq_file.allowed_users.map(StringList::into_set))
+                .unwrap_or_default(),
+            allowed_groups: env_cfg
+                .qq_allowed_groups
+                .or_else(|| qq_file.allowed_groups.map(StringList::into_set))
                 .unwrap_or_default(),
         };
 
@@ -169,6 +231,7 @@ impl AppConfig {
         Ok(Self {
             router: RouterConfig { default_executor },
             slack,
+            qq,
             executors,
         })
     }
@@ -177,22 +240,41 @@ impl AppConfig {
 #[derive(Debug, Default)]
 struct EnvConfig {
     default_executor: Option<String>,
+    slack_enabled: Option<bool>,
     slack_bot_token: Option<String>,
     slack_app_token: Option<String>,
     slack_require_mention: Option<bool>,
     slack_allowed_channels: Option<BTreeSet<String>>,
     slack_free_response_channels: Option<BTreeSet<String>>,
+    qq_enabled: Option<bool>,
+    qq_app_id: Option<String>,
+    qq_client_secret: Option<String>,
+    qq_sandbox: Option<bool>,
+    qq_intents: Option<u64>,
+    qq_allowed_users: Option<BTreeSet<String>>,
+    qq_allowed_groups: Option<BTreeSet<String>>,
 }
 
 impl EnvConfig {
     fn from_process() -> Self {
         Self {
             default_executor: nonempty_env("AGENT_ROUTER_DEFAULT_EXECUTOR"),
+            slack_enabled: env_bool("SLACK_ENABLED"),
             slack_bot_token: nonempty_env("SLACK_BOT_TOKEN"),
             slack_app_token: nonempty_env("SLACK_APP_TOKEN"),
             slack_require_mention: env_bool("SLACK_REQUIRE_MENTION"),
             slack_allowed_channels: env_set("SLACK_ALLOWED_CHANNELS"),
             slack_free_response_channels: env_set("SLACK_FREE_RESPONSE_CHANNELS"),
+            qq_enabled: env_bool("QQ_ENABLED").or_else(|| env_bool("QQBOT_ENABLED")),
+            qq_app_id: nonempty_env("QQ_APP_ID").or_else(|| nonempty_env("QQBOT_APP_ID")),
+            qq_client_secret: nonempty_env("QQ_CLIENT_SECRET")
+                .or_else(|| nonempty_env("QQBOT_CLIENT_SECRET")),
+            qq_sandbox: env_bool("QQ_SANDBOX").or_else(|| env_bool("QQBOT_SANDBOX")),
+            qq_intents: env_u64("QQ_INTENTS").or_else(|| env_u64("QQBOT_INTENTS")),
+            qq_allowed_users: env_set("QQ_ALLOWED_USERS")
+                .or_else(|| env_set("QQBOT_ALLOWED_USERS")),
+            qq_allowed_groups: env_set("QQ_ALLOWED_GROUPS")
+                .or_else(|| env_set("QQBOT_ALLOWED_GROUPS")),
         }
     }
 }
@@ -280,6 +362,12 @@ fn env_bool(name: &str) -> Option<bool> {
         })
 }
 
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 fn env_set(name: &str) -> Option<BTreeSet<String>> {
     env::var(name).ok().map(|value| split_csv(&value))
 }
@@ -305,6 +393,8 @@ mod tests {
         assert_eq!(kimi.protocol, ExecutorProtocol::Acp);
         assert_eq!(kimi.command, "kimi");
         assert_eq!(kimi.args, ["acp"]);
+        assert!(!cfg.slack.enabled);
+        assert!(!cfg.qq.enabled);
     }
 
     #[test]
@@ -334,6 +424,52 @@ executors:
             cfg.slack.free_response_channels,
             ["C3", "C4", "C5"].into_iter().map(str::to_string).collect()
         );
+    }
+
+    #[test]
+    fn parses_qq_config() {
+        let raw = r#"
+qq:
+  enabled: true
+  app_id: app
+  client_secret: secret
+  sandbox: true
+  allowed_users: "u1,u2"
+  allowed_groups: ["g1", "g2,g3"]
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert!(cfg.qq.enabled);
+        assert_eq!(cfg.qq.app_id, "app");
+        assert_eq!(cfg.qq.client_secret, "secret");
+        assert!(cfg.qq.sandbox);
+        assert_eq!(cfg.qq.intents, (1_u64 << 25) | (1_u64 << 30));
+        assert_eq!(
+            cfg.qq.allowed_users,
+            ["u1", "u2"].into_iter().map(str::to_string).collect()
+        );
+        assert_eq!(
+            cfg.qq.allowed_groups,
+            ["g1", "g2", "g3"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn env_qq_credentials_enable_channel() {
+        let cfg = AppConfig::from_file_config(
+            FileConfig::default(),
+            EnvConfig {
+                qq_app_id: Some("app".to_string()),
+                qq_client_secret: Some("secret".to_string()),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cfg.qq.enabled);
+        assert_eq!(cfg.qq.app_id, "app");
+        assert_eq!(cfg.qq.client_secret, "secret");
     }
 
     #[test]

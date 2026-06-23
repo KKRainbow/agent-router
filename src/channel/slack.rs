@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeSet, VecDeque},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -12,6 +9,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
     approval::{SharedApprovalBroker, is_approval_command},
+    channel::EventDeduper,
     config::SlackConfig,
     router::{RouterInput, RouterService},
 };
@@ -412,6 +410,29 @@ fn parse_message_event(payload: &Value, bot_user_id: &str) -> Option<SlackMessag
     })
 }
 
+fn parse_slash_command(payload: &Value) -> Option<SlackSlashCommand> {
+    Some(SlackSlashCommand {
+        command: payload.get("command").and_then(Value::as_str)?.to_string(),
+        text: payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        channel_id: payload
+            .get("channel_id")
+            .or_else(|| payload.get("channel"))
+            .and_then(Value::as_str)?
+            .to_string(),
+        user_id: payload.get("user_id").and_then(Value::as_str)?.to_string(),
+    })
+}
+
+fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
+    text.replace(&format!("<@{bot_user_id}>"), "")
+        .trim()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -447,61 +468,5 @@ mod tests {
         let dm = SlackReplyTarget::from_session_key("slack:dm:D1").unwrap();
         assert_eq!(dm.channel, "D1");
         assert_eq!(dm.thread_ts, None);
-    }
-}
-
-fn parse_slash_command(payload: &Value) -> Option<SlackSlashCommand> {
-    Some(SlackSlashCommand {
-        command: payload.get("command").and_then(Value::as_str)?.to_string(),
-        text: payload
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        channel_id: payload
-            .get("channel_id")
-            .or_else(|| payload.get("channel"))
-            .and_then(Value::as_str)?
-            .to_string(),
-        user_id: payload.get("user_id").and_then(Value::as_str)?.to_string(),
-    })
-}
-
-fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
-    text.replace(&format!("<@{bot_user_id}>"), "")
-        .trim()
-        .to_string()
-}
-
-#[derive(Debug)]
-struct EventDeduper {
-    capacity: usize,
-    seen: BTreeSet<String>,
-    order: VecDeque<String>,
-}
-
-impl EventDeduper {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            seen: BTreeSet::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn insert(&mut self, key: String) -> bool {
-        if key.is_empty() {
-            return true;
-        }
-        if !self.seen.insert(key.clone()) {
-            return false;
-        }
-        self.order.push_back(key);
-        while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
-        }
-        true
     }
 }
