@@ -18,7 +18,8 @@ use tokio::{
 use crate::{
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorRequest, ExecutorResponse, ExecutorUpdate,
+        ExecutorBackend, ExecutorDescriptor, ExecutorPrepareRequest, ExecutorPromptRequest,
+        ExecutorResponse, ExecutorUpdate, PreparedExecutor,
     },
 };
 
@@ -48,10 +49,11 @@ impl AcpExecutorManager {
 
     async fn get_or_create_session(
         &self,
-        request: &ExecutorRequest,
+        session_key: &str,
+        executor: &str,
         cfg: &ExecutorConfig,
     ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
-        let key = (request.session_key.clone(), request.executor.clone());
+        let key = (session_key.to_string(), executor.to_string());
         let cwd = resolve_cwd(cfg.cwd.as_deref())?;
         let existing = self.sessions.lock().await.get(&key).cloned();
         if let Some(existing) = existing {
@@ -64,6 +66,23 @@ impl AcpExecutorManager {
         let mut sessions = self.sessions.lock().await;
         sessions.insert(key, session.clone());
         Ok(session)
+    }
+
+    async fn existing_session(
+        &self,
+        session_key: &str,
+        executor: &str,
+    ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
+        self.sessions
+            .lock()
+            .await
+            .get(&(session_key.to_string(), executor.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "executor `{executor}` has not prepared ACP session for `{session_key}`"
+                )
+            })
     }
 }
 
@@ -86,22 +105,33 @@ impl ExecutorBackend for AcpExecutorManager {
             .collect()
     }
 
-    async fn prompt(&self, request: ExecutorRequest) -> anyhow::Result<ExecutorResponse> {
+    async fn prepare(&self, request: ExecutorPrepareRequest) -> anyhow::Result<PreparedExecutor> {
         let cfg = self
             .executors
             .get(&request.executor)
             .ok_or_else(|| anyhow::anyhow!("executor `{}` is not configured", request.executor))?;
-        let session = self.get_or_create_session(&request, cfg).await?;
+        let session = self
+            .get_or_create_session(&request.session_key, &request.executor, cfg)
+            .await?;
         let mut session = session.lock().await;
         let (external_session_id, started_new_session) = session
             .ensure_session(request.previous_session_id.as_deref())
             .await?;
+        Ok(PreparedExecutor {
+            external_session_id: Some(external_session_id),
+            started_new_session,
+        })
+    }
+
+    async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse> {
+        let session = self
+            .existing_session(&request.session_key, &request.executor)
+            .await?;
+        let mut session = session.lock().await;
         let result = session.prompt(&request.prompt).await?;
         Ok(ExecutorResponse {
             final_text: result.final_text,
-            external_session_id: Some(external_session_id),
             updates: result.updates,
-            started_new_session,
         })
     }
 }
@@ -352,7 +382,7 @@ impl JsonRpcClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        write_json(
+        if let Err(err) = write_json(
             &self.stdin,
             json!({
                 "jsonrpc": "2.0",
@@ -361,7 +391,11 @@ impl JsonRpcClient {
                 "params": params,
             }),
         )
-        .await?;
+        .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
         let response = rx
             .await
             .map_err(|_| anyhow::anyhow!("ACP response channel closed"))?;
@@ -387,6 +421,24 @@ async fn read_stdout<R>(
             continue;
         };
         dispatch_message(message, &pending, &stdin, &updates).await;
+    }
+    fail_all_pending(&pending, "ACP process closed stdout").await;
+}
+
+async fn fail_all_pending(pending: &PendingMap, message: &str) {
+    let drained = {
+        let mut guard = pending.lock().await;
+        guard.drain().collect::<Vec<_>>()
+    };
+    for (id, tx) in drained {
+        let _ = tx.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": message,
+            }
+        }));
     }
 }
 
@@ -546,7 +598,7 @@ fn resolve_cwd(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
 mod tests {
     use std::{collections::BTreeMap, fs};
 
-    use crate::executor::{ExecutorBackend, ExecutorRequest};
+    use crate::executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest};
 
     use super::*;
 
@@ -605,22 +657,93 @@ for line in sys.stdin:
         );
         let manager = AcpExecutorManager::new(executors);
 
+        let prepared = manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "kimi".to_string(),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
         let response = manager
-            .prompt(ExecutorRequest {
+            .prompt(ExecutorPromptRequest {
                 session_key: "session-1".to_string(),
                 executor: "kimi".to_string(),
                 prompt: "hello".to_string(),
-                previous_session_id: None,
             })
             .await
             .unwrap();
 
         assert_eq!(
-            response.external_session_id.as_deref(),
+            prepared.external_session_id.as_deref(),
             Some("fake-session")
         );
         assert_eq!(response.final_text, "reply:hello");
-        assert!(response.started_new_session);
+        assert!(prepared.started_new_session);
         assert_eq!(response.updates[0].kind, "plan");
+    }
+
+    #[tokio::test]
+    async fn acp_prompt_returns_error_when_child_exits_without_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("exiting_acp.py");
+        fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "fake-session"}})
+    elif method == "session/prompt":
+        sys.exit(0)
+"#,
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let manager = AcpExecutorManager::new(executors);
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "kimi".to_string(),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let err = manager
+            .prompt(ExecutorPromptRequest {
+                session_key: "session-1".to_string(),
+                executor: "kimi".to_string(),
+                prompt: "hello".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("closed stdout"));
     }
 }

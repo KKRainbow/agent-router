@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
-    executor::{ExecutorBackend, ExecutorRequest},
+    executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest},
     session::{
         ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
         projection::{
@@ -129,22 +129,42 @@ where
         }
 
         let binding = state.binding_for(&executor_name);
-        let started_new_session = binding.external_session_id.is_none();
+        let prepared = self
+            .executor
+            .prepare(ExecutorPrepareRequest {
+                session_key: input.session_key.clone(),
+                executor: executor_name.clone(),
+                previous_session_id: binding.external_session_id.clone(),
+            })
+            .await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                state.executor_bindings.insert(
+                    executor_name.clone(),
+                    ExecutorBinding {
+                        health: ExecutorHealth::Unhealthy,
+                        ..binding
+                    },
+                );
+                self.store.save(state).await;
+                return Err(err);
+            }
+        };
         let projection = build_context_projection(ProjectionInput {
             transcript: &state.transcript,
             seen_context: &binding.seen_context,
             current_message: &input.text,
-            started_new_session,
+            started_new_session: prepared.started_new_session,
             max_messages: 40,
         });
 
         let response = self
             .executor
-            .prompt(ExecutorRequest {
+            .prompt(ExecutorPromptRequest {
                 session_key: input.session_key.clone(),
                 executor: executor_name.clone(),
                 prompt: projection.prompt,
-                previous_session_id: binding.external_session_id.clone(),
             })
             .await;
 
@@ -164,7 +184,7 @@ where
                 let assistant_entry = TranscriptMessage::assistant(
                     assistant_content,
                     executor_name.clone(),
-                    response.external_session_id.clone(),
+                    prepared.external_session_id.clone(),
                 );
                 let new_fingerprints =
                     visible_message_fingerprints(&[user_entry.clone(), assistant_entry.clone()])
@@ -178,7 +198,7 @@ where
                     executor_name.clone(),
                     update_binding_after_success(
                         binding,
-                        response.external_session_id,
+                        prepared.external_session_id,
                         projection.acknowledged_fingerprints,
                         new_fingerprints,
                     ),
@@ -303,6 +323,10 @@ mod tests {
         let prompts = executor.prompts.lock().await;
         assert!(prompts[0].prompt.contains("user: prior"));
         assert!(prompts[0].prompt.contains("Current user message:\nnext"));
+        drop(prompts);
+        let prepared = executor.prepared.lock().await;
+        assert_eq!(prepared[0].previous_session_id, None);
+        drop(prepared);
         let saved = store.load_or_create("slack:C1:T1", "kimi").await;
         assert_eq!(saved.transcript.len(), 3);
         assert!(
@@ -344,6 +368,44 @@ mod tests {
         let prompts = executor.prompts.lock().await;
         assert!(!prompts[0].prompt.contains("user: old"));
         assert!(prompts[0].prompt.contains("user: new"));
-        assert!(prompts[0].previous_session_id.as_deref() == Some("ext-1"));
+        drop(prompts);
+        let prepared = executor.prepared.lock().await;
+        assert_eq!(prepared[0].previous_session_id.as_deref(), Some("ext-1"));
+    }
+
+    #[tokio::test]
+    async fn fresh_executor_session_gets_full_context_even_with_previous_binding() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend {
+            force_started_new_session: true,
+            ..FakeExecutorBackend::default()
+        });
+        let mut state = SessionState::new("slack:C1:T1", "kimi");
+        let old = TranscriptMessage::user("old");
+        state.transcript.push(old.clone());
+        state.executor_bindings.insert(
+            "kimi".to_string(),
+            ExecutorBinding {
+                protocol: "acp".to_string(),
+                external_session_id: Some("stale-session".to_string()),
+                seen_context: vec![message_fingerprint(&old)],
+                ..ExecutorBinding::default()
+            },
+        );
+        store.save(state).await;
+        let router = AgentRouter::new("kimi", store, executor.clone());
+
+        router
+            .handle(RouterInput {
+                session_key: "slack:C1:T1".to_string(),
+                text: "recover".to_string(),
+                user_id: None,
+            })
+            .await
+            .unwrap();
+
+        let prompts = executor.prompts.lock().await;
+        assert!(prompts[0].prompt.contains("Recent router transcript"));
+        assert!(prompts[0].prompt.contains("user: old"));
     }
 }

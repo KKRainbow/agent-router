@@ -83,7 +83,7 @@ pub fn build_context_projection(input: ProjectionInput<'_>) -> ContextProjection
 
     ContextProjection {
         prompt: parts.join("\n\n"),
-        acknowledged_fingerprints: handoff_entries
+        acknowledged_fingerprints: selected
             .into_iter()
             .map(|(_, fingerprint)| fingerprint)
             .collect(),
@@ -208,5 +208,32 @@ mod tests {
 
         assert_eq!(projection.prompt, "next");
         assert!(projection.acknowledged_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn omitted_context_is_not_marked_acknowledged() {
+        let messages = (0..3)
+            .map(|idx| TranscriptMessage::user(format!("message {idx}")))
+            .collect::<Vec<_>>();
+
+        let projection = build_context_projection(ProjectionInput {
+            transcript: &messages,
+            seen_context: &[],
+            current_message: "next",
+            started_new_session: false,
+            max_messages: 2,
+        });
+
+        assert!(projection.prompt.contains("1 older message(s) omitted"));
+        assert!(!projection.prompt.contains("message 0"));
+        assert!(projection.prompt.contains("message 1"));
+        assert_eq!(projection.acknowledged_fingerprints.len(), 2);
+        assert_eq!(
+            projection.acknowledged_fingerprints,
+            messages[1..]
+                .iter()
+                .map(message_fingerprint)
+                .collect::<Vec<_>>()
+        );
     }
 }

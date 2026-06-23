@@ -9,11 +9,23 @@ pub struct ExecutorDescriptor {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExecutorRequest {
+pub struct ExecutorPrepareRequest {
+    pub session_key: String,
+    pub executor: String,
+    pub previous_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedExecutor {
+    pub external_session_id: Option<String>,
+    pub started_new_session: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutorPromptRequest {
     pub session_key: String,
     pub executor: String,
     pub prompt: String,
-    pub previous_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,16 +67,15 @@ impl ExecutorUpdate {
 #[derive(Debug, Clone)]
 pub struct ExecutorResponse {
     pub final_text: String,
-    pub external_session_id: Option<String>,
     pub updates: Vec<ExecutorUpdate>,
-    pub started_new_session: bool,
 }
 
 #[async_trait]
 pub trait ExecutorBackend: Send + Sync + 'static {
     fn get(&self, name: &str) -> Option<ExecutorDescriptor>;
     fn list(&self) -> Vec<ExecutorDescriptor>;
-    async fn prompt(&self, request: ExecutorRequest) -> anyhow::Result<ExecutorResponse>;
+    async fn prepare(&self, request: ExecutorPrepareRequest) -> anyhow::Result<PreparedExecutor>;
+    async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse>;
 }
 
 #[cfg(test)]
@@ -75,12 +86,22 @@ pub mod test_support {
     use tokio::sync::Mutex;
 
     use super::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorRequest, ExecutorResponse, ExecutorUpdate,
+        ExecutorBackend, ExecutorDescriptor, ExecutorPrepareRequest, ExecutorPromptRequest,
+        ExecutorResponse, ExecutorUpdate, PreparedExecutor,
     };
 
     #[derive(Debug, Default)]
     pub struct FakeExecutorBackend {
         pub prompts: Arc<Mutex<Vec<ExecutorRequest>>>,
+        pub prepared: Arc<Mutex<Vec<ExecutorPrepareRequest>>>,
+        pub force_started_new_session: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ExecutorRequest {
+        pub session_key: String,
+        pub executor: String,
+        pub prompt: String,
     }
 
     #[async_trait]
@@ -99,18 +120,37 @@ pub mod test_support {
             }]
         }
 
-        async fn prompt(&self, request: ExecutorRequest) -> anyhow::Result<ExecutorResponse> {
-            self.prompts.lock().await.push(request);
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+        ) -> anyhow::Result<PreparedExecutor> {
+            self.prepared.lock().await.push(request.clone());
+            let started_new_session =
+                self.force_started_new_session || request.previous_session_id.is_none();
+            Ok(PreparedExecutor {
+                external_session_id: Some(
+                    request
+                        .previous_session_id
+                        .unwrap_or_else(|| "fake-session".to_string()),
+                ),
+                started_new_session,
+            })
+        }
+
+        async fn prompt(&self, request: ExecutorPromptRequest) -> anyhow::Result<ExecutorResponse> {
+            self.prompts.lock().await.push(ExecutorRequest {
+                session_key: request.session_key,
+                executor: request.executor,
+                prompt: request.prompt,
+            });
             Ok(ExecutorResponse {
                 final_text: "fake response".to_string(),
-                external_session_id: Some("fake-session".to_string()),
                 updates: vec![ExecutorUpdate {
                     kind: "plan".to_string(),
                     title: "Plan".to_string(),
                     text: "working".to_string(),
                     status: String::new(),
                 }],
-                started_new_session: false,
             })
         }
     }

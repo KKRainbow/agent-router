@@ -329,10 +329,14 @@ struct SlackReplyTarget {
 
 fn parse_message_event(payload: &Value, bot_user_id: &str) -> Option<SlackMessageEvent> {
     let event = payload.get("event")?;
-    if event.get("type").and_then(Value::as_str) != Some("message") {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    if !matches!(event_type, "message" | "app_mention") {
         return None;
     }
-    if event.get("subtype").is_some() || event.get("bot_id").is_some() {
+    if event_type == "message" && event.get("subtype").is_some() {
+        return None;
+    }
+    if event.get("bot_id").is_some() {
         return None;
     }
     let user = event.get("user").and_then(Value::as_str)?.to_string();
@@ -361,6 +365,33 @@ fn parse_message_event(payload: &Value, bot_user_id: &str) -> Option<SlackMessag
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn parses_app_mention_events() {
+        let payload = json!({
+            "event_id": "Ev1",
+            "event": {
+                "type": "app_mention",
+                "user": "U1",
+                "channel": "C1",
+                "ts": "123.456",
+                "text": "<@BOT> hello"
+            }
+        });
+
+        let event = parse_message_event(&payload, "BOT").unwrap();
+
+        assert_eq!(event.event_key, "Ev1");
+        assert_eq!(event.channel, "C1");
+        assert_eq!(event.text, "<@BOT> hello");
+    }
 }
 
 fn parse_slash_command(payload: &Value) -> Option<SlackSlashCommand> {
