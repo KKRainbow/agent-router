@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
+    approval::{SharedApprovalBroker, is_approval_command},
     config::SlackConfig,
     router::{RouterInput, RouterService},
 };
@@ -18,14 +19,16 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct SlackSocketModeChannel {
     cfg: SlackConfig,
+    approvals: SharedApprovalBroker,
     http: Client,
     seen_events: Arc<Mutex<EventDeduper>>,
 }
 
 impl SlackSocketModeChannel {
-    pub fn new(cfg: SlackConfig) -> Self {
+    pub fn new(cfg: SlackConfig, approvals: SharedApprovalBroker) -> Self {
         Self {
             cfg,
+            approvals,
             http: Client::new(),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(512))),
         }
@@ -39,6 +42,7 @@ impl SlackSocketModeChannel {
         let (stream, _) = connect_async(url).await?;
         let (mut sink, mut stream) = stream.split();
         let channel = Arc::new(self);
+        channel.clone().spawn_approval_notifier();
 
         while let Some(frame) = stream.next().await {
             let frame = frame?;
@@ -75,6 +79,25 @@ impl SlackSocketModeChannel {
             }
         }
         Ok(())
+    }
+
+    fn spawn_approval_notifier(self: Arc<Self>) {
+        let mut prompts = self.approvals.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let prompt = match prompts.recv().await {
+                    Ok(prompt) => prompt,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(target) = SlackReplyTarget::from_session_key(&prompt.session_key) else {
+                    continue;
+                };
+                if let Err(err) = self.post_message(&target, &prompt.render_text()).await {
+                    tracing::warn!(error = %err, "failed to post Slack approval prompt");
+                }
+            }
+        });
     }
 
     async fn handle_envelope(
@@ -119,19 +142,20 @@ impl SlackSocketModeChannel {
         }
         let is_dm = event.channel.starts_with('D');
         let mentioned = event.text.contains(&format!("<@{bot_user_id}>"));
-        if !is_dm
-            && self.cfg.require_mention
-            && !mentioned
-            && !self.cfg.free_response_channels.contains(&event.channel)
-        {
-            return Ok(());
-        }
-
         let text = strip_bot_mention(&event.text, bot_user_id);
+        let approval_command = is_approval_command(&text);
         if text.is_empty() {
             return Ok(());
         }
         let reply_target = event.reply_target();
+        if !is_dm
+            && self.cfg.require_mention
+            && !mentioned
+            && !approval_command
+            && !self.cfg.free_response_channels.contains(&event.channel)
+        {
+            return Ok(());
+        }
         let reply = router
             .handle(RouterInput {
                 session_key: event.session_key(),
@@ -327,6 +351,27 @@ struct SlackReplyTarget {
     thread_ts: Option<String>,
 }
 
+impl SlackReplyTarget {
+    fn from_session_key(session_key: &str) -> Option<Self> {
+        let parts = session_key.split(':').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["slack", "dm", channel] => Some(Self {
+                channel: (*channel).to_string(),
+                thread_ts: None,
+            }),
+            ["slack", "channel", channel, thread_ts] => Some(Self {
+                channel: (*channel).to_string(),
+                thread_ts: Some((*thread_ts).to_string()),
+            }),
+            ["slack", channel, "slash", _user] => Some(Self {
+                channel: (*channel).to_string(),
+                thread_ts: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
 fn parse_message_event(payload: &Value, bot_user_id: &str) -> Option<SlackMessageEvent> {
     let event = payload.get("event")?;
     let event_type = event.get("type").and_then(Value::as_str)?;
@@ -391,6 +436,17 @@ mod tests {
         assert_eq!(event.event_key, "Ev1");
         assert_eq!(event.channel, "C1");
         assert_eq!(event.text, "<@BOT> hello");
+    }
+
+    #[test]
+    fn parses_reply_target_from_session_key() {
+        let threaded = SlackReplyTarget::from_session_key("slack:channel:C1:123.456").unwrap();
+        assert_eq!(threaded.channel, "C1");
+        assert_eq!(threaded.thread_ts.as_deref(), Some("123.456"));
+
+        let dm = SlackReplyTarget::from_session_key("slack:dm:D1").unwrap();
+        assert_eq!(dm.channel, "D1");
+        assert_eq!(dm.thread_ts, None);
     }
 }
 

@@ -26,6 +26,7 @@ pub struct ExecutorPromptRequest {
     pub session_key: String,
     pub executor: String,
     pub prompt: String,
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

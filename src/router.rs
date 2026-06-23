@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
+    approval::{ApprovalBroker, SharedApprovalBroker},
     executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest},
     session::{
         ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
@@ -40,6 +41,7 @@ where
     default_executor: String,
     store: Arc<S>,
     executor: Arc<E>,
+    approvals: SharedApprovalBroker,
     session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -49,10 +51,25 @@ where
     E: ExecutorBackend,
 {
     pub fn new(default_executor: impl Into<String>, store: Arc<S>, executor: Arc<E>) -> Self {
+        Self::with_approvals(
+            default_executor,
+            store,
+            executor,
+            Arc::new(ApprovalBroker::default()),
+        )
+    }
+
+    pub fn with_approvals(
+        default_executor: impl Into<String>,
+        store: Arc<S>,
+        executor: Arc<E>,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
         Self {
             default_executor: default_executor.into(),
             store,
             executor,
+            approvals,
             session_locks: Mutex::new(HashMap::new()),
         }
     }
@@ -165,6 +182,7 @@ where
                 session_key: input.session_key.clone(),
                 executor: executor_name.clone(),
                 prompt: projection.prompt,
+                user_id: input.user_id.clone(),
             })
             .await;
 
@@ -247,6 +265,13 @@ where
     E: ExecutorBackend,
 {
     async fn handle(&self, input: RouterInput) -> anyhow::Result<RouterReply> {
+        if let Some(reply) = self
+            .approvals
+            .resolve_command(&input.session_key, &input.text, input.user_id.as_deref())
+            .await
+        {
+            return Ok(RouterReply { text: reply.text });
+        }
         let lock = self.session_lock(&input.session_key).await;
         let _guard = lock.lock().await;
         self.handle_locked(input).await
@@ -285,11 +310,13 @@ fn update_binding_after_prompt_failure(
 mod tests {
     use super::*;
     use crate::{
+        approval::{ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection},
         executor::test_support::FakeExecutorBackend,
         session::{
             TranscriptMessage, projection::message_fingerprint, store::InMemorySessionStore,
         },
     };
+    use std::time::Duration;
 
     #[tokio::test]
     async fn agent_status_shows_default_and_active_executor() {
@@ -308,6 +335,57 @@ mod tests {
 
         assert!(reply.text.contains("Default executor: kimi"));
         assert!(reply.text.contains("Active executor: kimi"));
+    }
+
+    #[tokio::test]
+    async fn approval_command_resolves_pending_request() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let router =
+            AgentRouter::with_approvals("kimi", store, executor.clone(), approvals.clone());
+        let request_broker = approvals.clone();
+        let pending = tokio::spawn(async move {
+            request_broker
+                .request(ApprovalRequest {
+                    session_key: "slack:C1:T1".to_string(),
+                    executor: "kimi".to_string(),
+                    requester_user_id: Some("U1".to_string()),
+                    title: "Run command".to_string(),
+                    body: "$ cargo test".to_string(),
+                    options: vec![
+                        ApprovalOption {
+                            id: "allow_once".to_string(),
+                            kind: "allow_once".to_string(),
+                            name: "Allow once".to_string(),
+                        },
+                        ApprovalOption {
+                            id: "deny".to_string(),
+                            kind: "reject_once".to_string(),
+                            name: "Deny".to_string(),
+                        },
+                    ],
+                })
+                .await
+        });
+
+        let prompt = prompts.recv().await.unwrap();
+        let reply = router
+            .handle(RouterInput {
+                session_key: "slack:C1:T1".to_string(),
+                text: format!("/approve {}", prompt.id),
+                user_id: Some("U1".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+        assert!(executor.prompts.lock().await.is_empty());
     }
 
     #[tokio::test]

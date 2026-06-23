@@ -16,6 +16,9 @@ use tokio::{
 };
 
 use crate::{
+    approval::{
+        ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection, SharedApprovalBroker,
+    },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
         ExecutorBackend, ExecutorDescriptor, ExecutorPrepareRequest, ExecutorPromptRequest,
@@ -32,17 +35,26 @@ type SessionMap = HashMap<SessionKey, SharedAcpSession>;
 #[derive(Debug)]
 pub struct AcpExecutorManager {
     executors: BTreeMap<String, ExecutorConfig>,
+    approvals: SharedApprovalBroker,
     sessions: Mutex<SessionMap>,
 }
 
 impl AcpExecutorManager {
     pub fn new(executors: BTreeMap<String, ExecutorConfig>) -> Self {
+        Self::with_approvals(executors, Arc::new(ApprovalBroker::default()))
+    }
+
+    pub fn with_approvals(
+        executors: BTreeMap<String, ExecutorConfig>,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
         let executors = executors
             .into_iter()
             .filter(|(_, cfg)| cfg.protocol == ExecutorProtocol::Acp)
             .collect();
         Self {
             executors,
+            approvals,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -62,7 +74,16 @@ impl AcpExecutorManager {
                 return Ok(existing);
             }
         }
-        let session = Arc::new(Mutex::new(AcpSession::start(cfg.clone(), cwd).await?));
+        let session = Arc::new(Mutex::new(
+            AcpSession::start(
+                cfg.clone(),
+                cwd,
+                session_key.to_string(),
+                executor.to_string(),
+                self.approvals.clone(),
+            )
+            .await?,
+        ));
         let mut sessions = self.sessions.lock().await;
         sessions.insert(key, session.clone());
         Ok(session)
@@ -128,7 +149,7 @@ impl ExecutorBackend for AcpExecutorManager {
             .existing_session(&request.session_key, &request.executor)
             .await?;
         let mut session = session.lock().await;
-        let result = session.prompt(&request.prompt).await?;
+        let result = session.prompt(&request.prompt, request.user_id).await?;
         Ok(ExecutorResponse {
             final_text: result.final_text,
             updates: result.updates,
@@ -146,8 +167,23 @@ struct AcpSession {
 }
 
 impl AcpSession {
-    async fn start(cfg: ExecutorConfig, cwd: PathBuf) -> anyhow::Result<Self> {
-        let client = JsonRpcClient::spawn(&cfg.command, &cfg.args, &cwd, &cfg.env).await?;
+    async fn start(
+        cfg: ExecutorConfig,
+        cwd: PathBuf,
+        session_key: String,
+        executor: String,
+        approvals: SharedApprovalBroker,
+    ) -> anyhow::Result<Self> {
+        let client = JsonRpcClient::spawn(
+            &cfg.command,
+            &cfg.args,
+            &cwd,
+            &cfg.env,
+            session_key,
+            executor,
+            approvals,
+        )
+        .await?;
         Ok(Self {
             cfg,
             cwd,
@@ -234,7 +270,18 @@ impl AcpSession {
         Ok((session_id, true))
     }
 
-    async fn prompt(&mut self, prompt: &str) -> anyhow::Result<AcpPromptResult> {
+    async fn prompt(
+        &mut self,
+        prompt: &str,
+        user_id: Option<String>,
+    ) -> anyhow::Result<AcpPromptResult> {
+        self.client.set_active_user(user_id).await;
+        let result = self.prompt_with_active_user(prompt).await;
+        self.client.clear_active_user().await;
+        result
+    }
+
+    async fn prompt_with_active_user(&mut self, prompt: &str) -> anyhow::Result<AcpPromptResult> {
         let session_id = self
             .session_id
             .clone()
@@ -302,6 +349,7 @@ struct JsonRpcClient {
     next_id: AtomicU64,
     updates: broadcast::Sender<ExecutorUpdate>,
     child: Arc<Mutex<Child>>,
+    active_user_id: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -310,12 +358,26 @@ struct JsonRpcState {
     pending: HashMap<u64, oneshot::Sender<Value>>,
 }
 
+#[derive(Debug, Clone)]
+struct JsonRpcServerContext {
+    state: SharedJsonRpcState,
+    stdin: SharedStdin,
+    updates: broadcast::Sender<ExecutorUpdate>,
+    approvals: SharedApprovalBroker,
+    session_key: String,
+    executor: String,
+    active_user_id: Arc<Mutex<Option<String>>>,
+}
+
 impl JsonRpcClient {
     async fn spawn(
         command: &str,
         args: &[String],
         cwd: &Path,
         env: &BTreeMap<String, String>,
+        session_key: String,
+        executor: String,
+        approvals: SharedApprovalBroker,
     ) -> anyhow::Result<Self> {
         let mut cmd = Command::new(command);
         cmd.args(args).current_dir(cwd);
@@ -343,13 +405,18 @@ impl JsonRpcClient {
         let state = Arc::new(Mutex::new(JsonRpcState::default()));
         let (updates, _) = broadcast::channel(256);
         let child = Arc::new(Mutex::new(child));
+        let active_user_id = Arc::new(Mutex::new(None));
+        let server_context = JsonRpcServerContext {
+            state: state.clone(),
+            stdin: stdin.clone(),
+            updates: updates.clone(),
+            approvals,
+            session_key,
+            executor,
+            active_user_id: active_user_id.clone(),
+        };
 
-        tokio::spawn(read_stdout(
-            BufReader::new(stdout),
-            state.clone(),
-            stdin.clone(),
-            updates.clone(),
-        ));
+        tokio::spawn(read_stdout(BufReader::new(stdout), server_context));
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
@@ -365,7 +432,16 @@ impl JsonRpcClient {
             next_id: AtomicU64::new(1),
             updates,
             child,
+            active_user_id,
         })
+    }
+
+    async fn set_active_user(&self, user_id: Option<String>) {
+        *self.active_user_id.lock().await = user_id;
+    }
+
+    async fn clear_active_user(&self) {
+        *self.active_user_id.lock().await = None;
     }
 
     fn subscribe(&self) -> broadcast::Receiver<ExecutorUpdate> {
@@ -424,12 +500,8 @@ impl JsonRpcClient {
     }
 }
 
-async fn read_stdout<R>(
-    reader: BufReader<R>,
-    state: SharedJsonRpcState,
-    stdin: SharedStdin,
-    updates: broadcast::Sender<ExecutorUpdate>,
-) where
+async fn read_stdout<R>(reader: BufReader<R>, context: JsonRpcServerContext)
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = reader.lines();
@@ -438,9 +510,9 @@ async fn read_stdout<R>(
             tracing::debug!(target: "agent_router::acp", raw_stdout = %line, "ignoring non-json ACP stdout");
             continue;
         };
-        dispatch_message(message, &state, &stdin, &updates).await;
+        dispatch_message(message, &context).await;
     }
-    fail_all_pending(&state, "ACP process closed stdout").await;
+    fail_all_pending(&context.state, "ACP process closed stdout").await;
 }
 
 async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
@@ -461,15 +533,10 @@ async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
     }
 }
 
-async fn dispatch_message(
-    message: Value,
-    state: &SharedJsonRpcState,
-    stdin: &SharedStdin,
-    updates: &broadcast::Sender<ExecutorUpdate>,
-) {
+async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     if message.get("method").is_none() {
         let sender = match message.get("id").and_then(Value::as_u64) {
-            Some(id) => state.lock().await.pending.remove(&id),
+            Some(id) => context.state.lock().await.pending.remove(&id),
             None => None,
         };
         if let Some(tx) = sender {
@@ -479,27 +546,33 @@ async fn dispatch_message(
     }
 
     if message.get("id").is_some() {
-        respond_to_server_request(stdin, &message).await;
+        respond_to_server_request(context, &message).await;
         return;
     }
 
     if message.get("method").and_then(Value::as_str) == Some("session/update")
         && let Some(update) = project_acp_update(&message)
     {
-        let _ = updates.send(update);
+        let _ = context.updates.send(update);
     }
 }
 
-async fn respond_to_server_request(stdin: &SharedStdin, message: &Value) {
+async fn respond_to_server_request(context: &JsonRpcServerContext, message: &Value) {
     let id = message.get("id").cloned().unwrap_or(Value::Null);
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let payload = if method == "session/request_permission" {
+        let requester_user_id = context.active_user_id.lock().await.clone();
+        let request = approval_request_from_permission_message(
+            message,
+            &context.session_key,
+            &context.executor,
+            requester_user_id,
+        );
+        let selection = context.approvals.request(request).await;
         json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": {
-                "outcome": {"outcome": "cancelled"}
-            }
+            "result": permission_result(selection),
         })
     } else {
         json!({
@@ -511,7 +584,114 @@ async fn respond_to_server_request(stdin: &SharedStdin, message: &Value) {
             }
         })
     };
-    let _ = write_json(stdin, payload).await;
+    let _ = write_json(&context.stdin, payload).await;
+}
+
+fn approval_request_from_permission_message(
+    message: &Value,
+    session_key: &str,
+    executor: &str,
+    requester_user_id: Option<String>,
+) -> ApprovalRequest {
+    let params = message.get("params").unwrap_or(&Value::Null);
+    let tool_call = params
+        .get("toolCall")
+        .or_else(|| params.get("tool_call"))
+        .unwrap_or(params);
+    let title = tool_call
+        .get("title")
+        .or_else(|| tool_call.get("name"))
+        .or_else(|| tool_call.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("Tool permission")
+        .to_string();
+    ApprovalRequest {
+        session_key: session_key.to_string(),
+        executor: executor.to_string(),
+        requester_user_id,
+        title,
+        body: permission_body(params, tool_call),
+        options: permission_options(params),
+    }
+}
+
+fn permission_body(params: &Value, tool_call: &Value) -> String {
+    let content = extract_text(tool_call.get("content"))
+        .or_else(|| extract_text(tool_call.get("rawInput")))
+        .or_else(|| extract_text(tool_call.get("raw_input")))
+        .or_else(|| extract_text(params.get("toolCall")))
+        .or_else(|| extract_text(params.get("tool_call")))
+        .unwrap_or_default();
+    truncate_text(content, 2_000)
+}
+
+fn permission_options(params: &Value) -> Vec<ApprovalOption> {
+    params
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item
+                        .get("optionId")
+                        .or_else(|| item.get("option_id"))
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)?;
+                    let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+                    let name = item
+                        .get("name")
+                        .or_else(|| item.get("label"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(id);
+                    Some(ApprovalOption {
+                        id: id.to_string(),
+                        kind: kind.to_string(),
+                        name: name.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|options| !options.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                ApprovalOption {
+                    id: "allow_once".to_string(),
+                    kind: "allow_once".to_string(),
+                    name: "Allow once".to_string(),
+                },
+                ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                },
+            ]
+        })
+}
+
+fn permission_result(selection: ApprovalSelection) -> Value {
+    match selection {
+        ApprovalSelection::Selected(option_id) => json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            }
+        }),
+        ApprovalSelection::Cancelled => json!({
+            "outcome": {
+                "outcome": "cancelled",
+            }
+        }),
+    }
+}
+
+fn truncate_text(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
@@ -615,8 +795,9 @@ fn resolve_cwd(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
 
+    use crate::approval::ApprovalBroker;
     use crate::executor::{ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest};
 
     use super::*;
@@ -689,6 +870,7 @@ for line in sys.stdin:
                 session_key: "session-1".to_string(),
                 executor: "kimi".to_string(),
                 prompt: "hello".to_string(),
+                user_id: Some("U1".to_string()),
             })
             .await
             .unwrap();
@@ -700,6 +882,116 @@ for line in sys.stdin:
         assert_eq!(response.final_text, "reply:hello");
         assert!(prepared.started_new_session);
         assert_eq!(response.updates[0].kind, "plan");
+    }
+
+    #[tokio::test]
+    async fn acp_permission_request_waits_for_text_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("approval_acp.py");
+        fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "fake-session"}})
+    elif method == "session/prompt":
+        send({
+            "jsonrpc": "2.0",
+            "id": 900,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "fake-session",
+                "toolCall": {
+                    "title": "Run shell command",
+                    "content": [{"type": "text", "text": "$ cargo test"}]
+                },
+                "options": [
+                    {"optionId": "allow_once", "kind": "allow_once", "name": "Allow once"},
+                    {"optionId": "deny", "kind": "reject_once", "name": "Deny"}
+                ]
+            }
+        })
+    elif request_id == 900:
+        outcome = msg.get("result", {}).get("outcome", {})
+        if outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow_once":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"text": "approved"}}},
+            })
+            send({"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}})
+        else:
+            send({"jsonrpc": "2.0", "id": 3, "error": {"code": -32000, "message": "not approved"}})
+"#,
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(AcpExecutorManager::with_approvals(
+            executors,
+            approvals.clone(),
+        ));
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "kimi".to_string(),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            prompt_manager
+                .prompt(ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "kimi".to_string(),
+                    prompt: "run tests".to_string(),
+                    user_id: Some("U1".to_string()),
+                })
+                .await
+        });
+        let approval_prompt = prompts.recv().await.unwrap();
+        assert!(approval_prompt.body.contains("cargo test"));
+        let reply = approvals
+            .resolve_command(
+                "session-1",
+                &format!("/approve {}", approval_prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+        assert!(reply.text.contains("Approved"));
+
+        let response = prompt_task.await.unwrap().unwrap();
+        assert_eq!(response.final_text, "approved");
     }
 
     #[tokio::test]
@@ -759,6 +1051,7 @@ for line in sys.stdin:
                 session_key: "session-1".to_string(),
                 executor: "kimi".to_string(),
                 prompt: "hello".to_string(),
+                user_id: Some("U1".to_string()),
             })
             .await
             .unwrap_err();

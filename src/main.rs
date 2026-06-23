@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use agent_router::{
+    approval::ApprovalBroker,
     channel::slack::SlackSocketModeChannel,
     config::{AppConfig, default_config_path, load_dotenv},
     executor::acp::AcpExecutorManager,
@@ -39,12 +40,19 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load(config_path.as_deref())?;
 
     let store = Arc::new(InMemorySessionStore::default());
-    let executor = Arc::new(AcpExecutorManager::new(config.executors.clone()));
-    let router: Arc<dyn RouterService> = Arc::new(AgentRouter::new(
+    let approvals = Arc::new(ApprovalBroker::default());
+    let executor = Arc::new(AcpExecutorManager::with_approvals(
+        config.executors.clone(),
+        approvals.clone(),
+    ));
+    let router: Arc<dyn RouterService> = Arc::new(AgentRouter::with_approvals(
         config.router.default_executor.clone(),
         store,
         executor,
+        approvals.clone(),
     ));
 
-    SlackSocketModeChannel::new(config.slack).run(router).await
+    SlackSocketModeChannel::new(config.slack, approvals)
+        .run(router)
+        .await
 }
