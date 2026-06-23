@@ -183,9 +183,10 @@ impl ApprovalBroker {
         user_id: Option<&str>,
     ) -> Option<ApprovalCommandReply> {
         let command = parse_approval_command(text)?;
-        let target_id = {
-            let state = self.state.lock().await;
-            match command.target_id {
+        let explicit_target = command.target_id.is_some();
+        let (pending, target_id, selection) = {
+            let mut state = self.state.lock().await;
+            let target_id = match command.target_id {
                 Some(id) => id,
                 None => state
                     .session_order
@@ -193,63 +194,63 @@ impl ApprovalBroker {
                     .and_then(|ids| ids.front())
                     .cloned()
                     .unwrap_or_default(),
+            };
+            if target_id.is_empty() {
+                return Some(ApprovalCommandReply {
+                    text: "No pending approval for this session.".to_string(),
+                });
             }
-        };
-        if target_id.is_empty() {
-            return Some(ApprovalCommandReply {
-                text: "No pending approval for this session.".to_string(),
-            });
-        }
-
-        let pending = {
-            let mut state = self.state.lock().await;
-            let Some(pending) = state.pending.remove(&target_id) else {
+            let Some(pending) = state.pending.get(&target_id) else {
                 return Some(ApprovalCommandReply {
                     text: format!("Approval {target_id} is not pending."),
                 });
             };
-            remove_session_order(&mut state, &pending.request.session_key, &target_id);
-            pending
-        };
 
-        if pending.request.session_key != session_key {
-            let mut state = self.state.lock().await;
-            state
-                .session_order
-                .entry(pending.request.session_key.clone())
-                .or_default()
-                .push_front(target_id.clone());
-            state.pending.insert(target_id.clone(), pending);
-            return Some(ApprovalCommandReply {
-                text: format!("Approval {target_id} belongs to a different session."),
-            });
-        }
-        if let Some(requester) = pending.request.requester_user_id.as_deref()
-            && user_id.is_some_and(|user_id| user_id != requester)
-        {
-            let mut state = self.state.lock().await;
-            state
-                .session_order
-                .entry(pending.request.session_key.clone())
-                .or_default()
-                .push_front(target_id.clone());
-            state.pending.insert(target_id.clone(), pending);
-            return Some(ApprovalCommandReply {
-                text: format!("Approval {target_id} can only be resolved by the requester."),
-            });
-        }
+            if let Some(requester) = pending.request.requester_user_id.as_deref() {
+                match user_id {
+                    Some(user_id) if user_id == requester => {}
+                    Some(_) => {
+                        return Some(ApprovalCommandReply {
+                            text: format!(
+                                "Approval {target_id} can only be resolved by the requester."
+                            ),
+                        });
+                    }
+                    None => {
+                        return Some(ApprovalCommandReply {
+                            text: format!(
+                                "Approval {target_id} requires requester identity to resolve."
+                            ),
+                        });
+                    }
+                }
+            }
 
-        let selection = match command.decision {
-            ApprovalDecision::Approve => pending
-                .request
-                .allow_option_id()
-                .map(ApprovalSelection::Selected)
-                .unwrap_or(ApprovalSelection::Cancelled),
-            ApprovalDecision::Deny => pending
-                .request
-                .deny_option_id()
-                .map(ApprovalSelection::Selected)
-                .unwrap_or(ApprovalSelection::Cancelled),
+            let same_session = pending.request.session_key == session_key;
+            let same_requester_explicit =
+                explicit_target && pending.request.requester_user_id.is_some();
+            if !same_session && !same_requester_explicit {
+                return Some(ApprovalCommandReply {
+                    text: format!("Approval {target_id} belongs to a different session."),
+                });
+            }
+
+            let selection = match command.decision {
+                ApprovalDecision::Approve => pending
+                    .request
+                    .allow_option_id()
+                    .map(ApprovalSelection::Selected)
+                    .unwrap_or(ApprovalSelection::Cancelled),
+                ApprovalDecision::Deny => pending
+                    .request
+                    .deny_option_id()
+                    .map(ApprovalSelection::Selected)
+                    .unwrap_or(ApprovalSelection::Cancelled),
+            };
+            let session_key = pending.request.session_key.clone();
+            let pending = state.pending.remove(&target_id).unwrap();
+            remove_session_order(&mut state, &session_key, &target_id);
+            (pending, target_id, selection)
         };
         let _ = pending.responder.send(selection);
 
@@ -354,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_user_cannot_resolve_requester_approval() {
-        let broker = Arc::new(ApprovalBroker::new(Duration::from_millis(50)));
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
         let mut prompts = broker.subscribe();
         let request_broker = broker.clone();
         let pending = tokio::spawn(async move { request_broker.request(request("s1")).await });
@@ -366,6 +367,70 @@ mod tests {
             .unwrap();
 
         assert!(reply.text.contains("requester"));
-        assert_eq!(pending.await.unwrap(), ApprovalSelection::Cancelled);
+
+        let reply = broker
+            .resolve_command("s1", &format!("/approve {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_user_id_cannot_resolve_bound_approval() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move { request_broker.request(request("s1")).await });
+        let prompt = prompts.recv().await.unwrap();
+
+        let reply = broker
+            .resolve_command("s1", &format!("/approve {}", prompt.id), None)
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("requires requester identity"));
+        let reply = broker
+            .resolve_command("s1", &format!("/deny {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_id_can_be_resolved_from_requester_slash_session() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            request_broker
+                .request(request("slack:channel:C1:123.456"))
+                .await
+        });
+        let prompt = prompts.recv().await.unwrap();
+
+        let reply = broker
+            .resolve_command(
+                "slack:C1:slash:U1",
+                &format!("/approve {}", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
     }
 }
