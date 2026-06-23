@@ -1,0 +1,311 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::{Path, PathBuf},
+};
+
+use serde::Deserialize;
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub router: RouterConfig,
+    pub slack: SlackConfig,
+    pub executors: BTreeMap<String, ExecutorConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouterConfig {
+    pub default_executor: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlackConfig {
+    pub bot_token: String,
+    pub app_token: String,
+    pub require_mention: bool,
+    pub allowed_channels: BTreeSet<String>,
+    pub free_response_channels: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutorProtocol {
+    Acp,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutorConfig {
+    pub name: String,
+    pub protocol: ExecutorProtocol,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileConfig {
+    router: Option<FileRouterConfig>,
+    slack: Option<FileSlackConfig>,
+    executors: Option<BTreeMap<String, FileExecutorConfig>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileRouterConfig {
+    default_executor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSlackConfig {
+    bot_token: Option<String>,
+    app_token: Option<String>,
+    require_mention: Option<bool>,
+    allowed_channels: Option<StringList>,
+    free_response_channels: Option<StringList>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringList {
+    String(String),
+    List(Vec<String>),
+}
+
+impl StringList {
+    fn into_set(self) -> BTreeSet<String> {
+        match self {
+            Self::String(raw) => split_csv(&raw),
+            Self::List(items) => items
+                .into_iter()
+                .flat_map(|item| split_csv(&item))
+                .collect::<BTreeSet<_>>(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FileExecutorConfig {
+    protocol: Option<String>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    cwd: Option<PathBuf>,
+    env: Option<BTreeMap<String, String>>,
+}
+
+impl AppConfig {
+    pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
+        let file_cfg = match path {
+            Some(path) if path.exists() => {
+                let text = std::fs::read_to_string(path)?;
+                serde_yaml::from_str::<FileConfig>(&text)?
+            }
+            _ => FileConfig::default(),
+        };
+        Self::from_file_config(file_cfg, EnvConfig::from_process())
+    }
+
+    fn from_file_config(file_cfg: FileConfig, env_cfg: EnvConfig) -> anyhow::Result<Self> {
+        let default_executor = env_cfg
+            .default_executor
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                file_cfg
+                    .router
+                    .as_ref()
+                    .and_then(|router| router.default_executor.clone())
+            })
+            .unwrap_or_else(|| "kimi".to_string());
+
+        let slack_file = file_cfg.slack.unwrap_or_default();
+        let slack = SlackConfig {
+            bot_token: env_cfg
+                .slack_bot_token
+                .or(slack_file.bot_token)
+                .unwrap_or_default(),
+            app_token: env_cfg
+                .slack_app_token
+                .or(slack_file.app_token)
+                .unwrap_or_default(),
+            require_mention: env_cfg
+                .slack_require_mention
+                .or(slack_file.require_mention)
+                .unwrap_or(true),
+            allowed_channels: env_cfg
+                .slack_allowed_channels
+                .or_else(|| slack_file.allowed_channels.map(StringList::into_set))
+                .unwrap_or_default(),
+            free_response_channels: env_cfg
+                .slack_free_response_channels
+                .or_else(|| slack_file.free_response_channels.map(StringList::into_set))
+                .unwrap_or_default(),
+        };
+
+        let mut executors = BTreeMap::new();
+        if let Some(raw_executors) = file_cfg.executors {
+            for (name, raw) in raw_executors {
+                let cfg = parse_executor_config(name, raw)?;
+                executors.insert(cfg.name.clone(), cfg);
+            }
+        }
+        if executors.is_empty() {
+            executors.insert(
+                "kimi".to_string(),
+                ExecutorConfig {
+                    name: "kimi".to_string(),
+                    protocol: ExecutorProtocol::Acp,
+                    command: "kimi".to_string(),
+                    args: vec!["acp".to_string()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            );
+        }
+
+        anyhow::ensure!(
+            executors.contains_key(&default_executor),
+            "default executor `{default_executor}` is not configured"
+        );
+
+        Ok(Self {
+            router: RouterConfig { default_executor },
+            slack,
+            executors,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct EnvConfig {
+    default_executor: Option<String>,
+    slack_bot_token: Option<String>,
+    slack_app_token: Option<String>,
+    slack_require_mention: Option<bool>,
+    slack_allowed_channels: Option<BTreeSet<String>>,
+    slack_free_response_channels: Option<BTreeSet<String>>,
+}
+
+impl EnvConfig {
+    fn from_process() -> Self {
+        Self {
+            default_executor: nonempty_env("AGENT_ROUTER_DEFAULT_EXECUTOR"),
+            slack_bot_token: nonempty_env("SLACK_BOT_TOKEN"),
+            slack_app_token: nonempty_env("SLACK_APP_TOKEN"),
+            slack_require_mention: env_bool("SLACK_REQUIRE_MENTION"),
+            slack_allowed_channels: env_set("SLACK_ALLOWED_CHANNELS"),
+            slack_free_response_channels: env_set("SLACK_FREE_RESPONSE_CHANNELS"),
+        }
+    }
+}
+
+pub fn load_dotenv(path: Option<&Path>) {
+    if let Some(path) = path {
+        let _ = dotenvy::from_path(path);
+        return;
+    }
+    for candidate in [Path::new(".env"), Path::new("../.env")] {
+        if candidate.exists() {
+            let _ = dotenvy::from_path(candidate);
+            return;
+        }
+    }
+    let _ = dotenvy::dotenv();
+}
+
+pub fn default_config_path() -> Option<PathBuf> {
+    [
+        PathBuf::from("agent-router.yaml"),
+        PathBuf::from("config/agent-router.yaml"),
+        PathBuf::from("../config.yaml"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
+}
+
+fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Result<ExecutorConfig> {
+    let protocol = match raw.protocol.as_deref().unwrap_or("acp") {
+        "acp" => ExecutorProtocol::Acp,
+        other => anyhow::bail!("executors.{name}.protocol `{other}` is not supported in MVP"),
+    };
+    let command = raw
+        .command
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("executors.{name}.command is required"))?;
+    Ok(ExecutorConfig {
+        name,
+        protocol,
+        command,
+        args: raw.args.unwrap_or_default(),
+        cwd: raw.cwd,
+        env: raw.env.unwrap_or_default(),
+    })
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn env_set(name: &str) -> Option<BTreeSet<String>> {
+    env::var(name).ok().map(|value| split_csv(&value))
+}
+
+fn split_csv(raw: &str) -> BTreeSet<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_uses_kimi_acp_executor() {
+        let cfg = AppConfig::from_file_config(FileConfig::default(), EnvConfig::default()).unwrap();
+
+        assert_eq!(cfg.router.default_executor, "kimi");
+        let kimi = cfg.executors.get("kimi").unwrap();
+        assert_eq!(kimi.protocol, ExecutorProtocol::Acp);
+        assert_eq!(kimi.command, "kimi");
+        assert_eq!(kimi.args, ["acp"]);
+    }
+
+    #[test]
+    fn parses_slack_channel_lists_and_executor_config() {
+        let raw = r#"
+router:
+  default_executor: kimi
+slack:
+  require_mention: false
+  allowed_channels: "C1,C2"
+  free_response_channels: ["C3", "C4,C5"]
+executors:
+  kimi:
+    protocol: acp
+    command: kimi
+    args: ["acp"]
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert!(!cfg.slack.require_mention);
+        assert_eq!(
+            cfg.slack.allowed_channels,
+            ["C1".to_string(), "C2".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            cfg.slack.free_response_channels,
+            ["C3", "C4", "C5"].into_iter().map(str::to_string).collect()
+        );
+    }
+}
