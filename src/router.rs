@@ -141,9 +141,9 @@ where
             .load_or_create(&input.session_key, &self.default_executor)
             .await;
         let executor_name = state.active_executor.clone();
-        if self.executor.get(&executor_name).is_none() {
-            anyhow::bail!("active executor `{executor_name}` is not configured");
-        }
+        let descriptor = self.executor.get(&executor_name).ok_or_else(|| {
+            anyhow::anyhow!("active executor `{executor_name}` is not configured")
+        })?;
 
         let binding = state.binding_for(&executor_name);
         let prepared = self
@@ -160,6 +160,7 @@ where
                 state.executor_bindings.insert(
                     executor_name.clone(),
                     ExecutorBinding {
+                        protocol: descriptor.protocol.clone(),
                         health: ExecutorHealth::Unhealthy,
                         ..binding
                     },
@@ -217,6 +218,7 @@ where
                     update_binding_after_success(
                         binding,
                         prepared.external_session_id,
+                        descriptor.protocol,
                         projection.acknowledged_fingerprints,
                         new_fingerprints,
                     ),
@@ -229,7 +231,11 @@ where
             Err(err) => {
                 state.executor_bindings.insert(
                     executor_name.clone(),
-                    update_binding_after_prompt_failure(binding, prepared.external_session_id),
+                    update_binding_after_prompt_failure(
+                        binding,
+                        prepared.external_session_id,
+                        descriptor.protocol,
+                    ),
                 );
                 self.store.save(state).await;
                 Err(err)
@@ -281,10 +287,11 @@ where
 fn update_binding_after_success(
     mut binding: ExecutorBinding,
     external_session_id: Option<String>,
+    protocol: String,
     handoff_fingerprints: Vec<String>,
     new_message_fingerprints: Vec<String>,
 ) -> ExecutorBinding {
-    binding.protocol = "acp".to_string();
+    binding.protocol = protocol;
     binding.external_session_id = external_session_id;
     binding.health = ExecutorHealth::Healthy;
     binding.seen_context = merge_seen_context(
@@ -297,7 +304,9 @@ fn update_binding_after_success(
 fn update_binding_after_prompt_failure(
     mut binding: ExecutorBinding,
     prepared_session_id: Option<String>,
+    protocol: String,
 ) -> ExecutorBinding {
+    binding.protocol = protocol;
     binding.health = ExecutorHealth::Unhealthy;
     if prepared_session_id != binding.external_session_id {
         binding.external_session_id = prepared_session_id;
@@ -421,6 +430,7 @@ mod tests {
                 .external_session_id
                 .is_some()
         );
+        assert_eq!(saved.executor_bindings["kimi"].protocol, "fake");
     }
 
     #[tokio::test]

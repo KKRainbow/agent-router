@@ -13,6 +13,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::{Mutex, broadcast, oneshot},
+    time::{Duration, sleep, timeout},
 };
 
 use crate::{
@@ -32,10 +33,26 @@ type SessionMap = HashMap<SessionKey, SharedCodexSession>;
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 
+#[derive(Debug, Clone, Copy)]
+struct CodexRuntimeLimits {
+    rpc_timeout: Duration,
+    turn_timeout: Duration,
+}
+
+impl Default for CodexRuntimeLimits {
+    fn default() -> Self {
+        Self {
+            rpc_timeout: Duration::from_secs(30),
+            turn_timeout: Duration::from_secs(600),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CodexAppServerManager {
     executors: BTreeMap<String, ExecutorConfig>,
     approvals: SharedApprovalBroker,
+    limits: CodexRuntimeLimits,
     sessions: Mutex<SessionMap>,
 }
 
@@ -48,6 +65,14 @@ impl CodexAppServerManager {
         executors: BTreeMap<String, ExecutorConfig>,
         approvals: SharedApprovalBroker,
     ) -> Self {
+        Self::with_limits(executors, approvals, CodexRuntimeLimits::default())
+    }
+
+    fn with_limits(
+        executors: BTreeMap<String, ExecutorConfig>,
+        approvals: SharedApprovalBroker,
+        limits: CodexRuntimeLimits,
+    ) -> Self {
         let executors = executors
             .into_iter()
             .filter(|(_, cfg)| cfg.protocol == ExecutorProtocol::AppServer)
@@ -55,6 +80,7 @@ impl CodexAppServerManager {
         Self {
             executors,
             approvals,
+            limits,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -81,6 +107,7 @@ impl CodexAppServerManager {
                 session_key.to_string(),
                 executor.to_string(),
                 self.approvals.clone(),
+                self.limits,
             )
             .await?,
         ));
@@ -158,6 +185,8 @@ struct CodexAppServerSession {
     session_key: String,
     executor: String,
     approvals: SharedApprovalBroker,
+    pending_file_changes: HashMap<String, String>,
+    limits: CodexRuntimeLimits,
     thread_id: Option<String>,
     initialized: bool,
 }
@@ -169,6 +198,7 @@ impl CodexAppServerSession {
         session_key: String,
         executor: String,
         approvals: SharedApprovalBroker,
+        limits: CodexRuntimeLimits,
     ) -> anyhow::Result<Self> {
         let client = CodexJsonRpcClient::spawn(&cfg.command, &cfg.args, &cwd, &cfg.env).await?;
         Ok(Self {
@@ -178,6 +208,8 @@ impl CodexAppServerSession {
             session_key,
             executor,
             approvals,
+            pending_file_changes: HashMap::new(),
+            limits,
             thread_id: None,
             initialized: false,
         })
@@ -195,7 +227,8 @@ impl CodexAppServerSession {
         if self.initialized {
             return Ok(());
         }
-        self.client
+        let initialized = self
+            .client
             .request(
                 "initialize",
                 json!({
@@ -206,8 +239,15 @@ impl CodexAppServerSession {
                     },
                     "capabilities": {},
                 }),
+                self.limits.rpc_timeout,
             )
-            .await?;
+            .await;
+        if let Err(err) = initialized {
+            self.client
+                .close("codex app-server initialize failed")
+                .await;
+            return Err(err);
+        }
         self.client.notify("initialized", json!({})).await?;
         self.initialized = true;
         Ok(())
@@ -220,8 +260,21 @@ impl CodexAppServerSession {
         }
         let result = self
             .client
-            .request("thread/start", json!({ "cwd": self.cwd }))
-            .await?;
+            .request(
+                "thread/start",
+                json!({ "cwd": self.cwd }),
+                self.limits.rpc_timeout,
+            )
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                self.client
+                    .close("codex app-server thread/start failed")
+                    .await;
+                return Err(err);
+            }
+        };
         let thread_id = thread_id_from_result(&result)
             .ok_or_else(|| anyhow::anyhow!("codex thread/start did not return thread id"))?;
         self.thread_id = Some(thread_id.clone());
@@ -255,6 +308,10 @@ impl CodexAppServerSession {
         let mut updates = Vec::new();
         let mut turn_start_acknowledged = false;
         let mut turn_completed = false;
+        let turn_start_timeout = sleep(self.limits.rpc_timeout);
+        let turn_timeout = sleep(self.limits.turn_timeout);
+        tokio::pin!(turn_start_timeout);
+        tokio::pin!(turn_timeout);
         loop {
             tokio::select! {
                 response = &mut turn_start.response, if !turn_start_acknowledged => {
@@ -266,7 +323,15 @@ impl CodexAppServerSession {
                 }
                 request = server_requests.recv() => {
                     match request {
-                        Ok(request) => self.handle_server_request(request, user_id.clone()).await?,
+                        Ok(request) => {
+                            self.drain_ready_notifications(
+                                &mut notifications,
+                                &mut final_text,
+                                &mut updates,
+                                &mut turn_completed,
+                            )?;
+                            self.handle_server_request(request, user_id.clone()).await?;
+                        }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => {
                             anyhow::bail!("codex app-server request stream closed")
@@ -276,11 +341,14 @@ impl CodexAppServerSession {
                 notification = notifications.recv() => {
                     match notification {
                         Ok(notification) => {
-                            if collect_codex_notification(notification, &mut final_text, &mut updates) {
-                                turn_completed = true;
-                                if turn_start_acknowledged {
-                                    break;
-                                }
+                            self.handle_notification(
+                                notification,
+                                &mut final_text,
+                                &mut updates,
+                                &mut turn_completed,
+                            )?;
+                            if turn_completed && turn_start_acknowledged {
+                                break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -293,6 +361,22 @@ impl CodexAppServerSession {
                     let reason = reason.unwrap_or_else(|_| "codex app-server closed".to_string());
                     anyhow::bail!("{reason}");
                 }
+                _ = &mut turn_start_timeout, if !turn_start_acknowledged => {
+                    self.client.cancel_pending(turn_start.id).await;
+                    self.client.close("codex app-server turn/start timed out").await;
+                    anyhow::bail!(
+                        "codex app-server `turn/start` timed out after {}s",
+                        self.limits.rpc_timeout.as_secs()
+                    );
+                }
+                _ = &mut turn_timeout => {
+                    self.client.cancel_pending(turn_start.id).await;
+                    self.client.close("codex app-server turn timed out").await;
+                    anyhow::bail!(
+                        "codex app-server turn timed out after {}s",
+                        self.limits.turn_timeout.as_secs()
+                    );
+                }
             }
         }
 
@@ -300,6 +384,43 @@ impl CodexAppServerSession {
             final_text,
             updates,
         })
+    }
+
+    fn drain_ready_notifications(
+        &mut self,
+        notifications: &mut broadcast::Receiver<Value>,
+        final_text: &mut String,
+        updates: &mut Vec<ExecutorUpdate>,
+        turn_completed: &mut bool,
+    ) -> anyhow::Result<()> {
+        for _ in 0..8 {
+            match notifications.try_recv() {
+                Ok(notification) => {
+                    self.handle_notification(notification, final_text, updates, turn_completed)?;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    anyhow::bail!("codex app-server notification stream closed")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_notification(
+        &mut self,
+        notification: Value,
+        final_text: &mut String,
+        updates: &mut Vec<ExecutorUpdate>,
+        turn_completed: &mut bool,
+    ) -> anyhow::Result<()> {
+        self.track_pending_file_change(&notification);
+        match collect_codex_notification(notification, final_text, updates)? {
+            CodexNotificationOutcome::Pending => {}
+            CodexNotificationOutcome::TurnCompleted => *turn_completed = true,
+        }
+        Ok(())
     }
 
     async fn handle_server_request(
@@ -318,6 +439,7 @@ impl CodexAppServerSession {
                     user_id,
                     method,
                     params,
+                    self.pending_file_change_summary(params),
                 );
                 let decision = match self.approvals.request(request).await {
                     ApprovalSelection::Selected(option_id) if option_id == "accept" => "accept",
@@ -327,9 +449,21 @@ impl CodexAppServerSession {
                     .respond(id, json!({ "decision": decision }))
                     .await?;
             }
-            "item/permissions/requestApproval" | "mcpServer/elicitation/request" => {
+            "item/permissions/requestApproval" => {
                 self.client
                     .respond(id, json!({ "decision": "decline" }))
+                    .await?;
+            }
+            "mcpServer/elicitation/request" => {
+                self.client
+                    .respond(
+                        id,
+                        json!({
+                            "action": "decline",
+                            "content": Value::Null,
+                            "_meta": Value::Null,
+                        }),
+                    )
                     .await?;
             }
             _ => {
@@ -344,6 +478,41 @@ impl CodexAppServerSession {
         }
         Ok(())
     }
+
+    fn track_pending_file_change(&mut self, notification: &Value) {
+        let method = notification
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if method != "item/started" && method != "item/completed" {
+            return;
+        }
+        let Some(item) = notification
+            .get("params")
+            .and_then(|params| params.get("item"))
+        else {
+            return;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("fileChange") {
+            return;
+        }
+        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+        if item_id.is_empty() {
+            return;
+        }
+        if method == "item/completed" {
+            self.pending_file_changes.remove(item_id);
+            return;
+        }
+        let summary = summarize_file_change(item);
+        self.pending_file_changes
+            .insert(item_id.to_string(), summary);
+    }
+
+    fn pending_file_change_summary(&self, params: &Value) -> Option<String> {
+        let item_id = params.get("itemId").and_then(Value::as_str)?;
+        self.pending_file_changes.get(item_id).cloned()
+    }
 }
 
 fn codex_approval_request(
@@ -352,6 +521,7 @@ fn codex_approval_request(
     requester_user_id: Option<String>,
     method: &str,
     params: &Value,
+    pending_file_change: Option<String>,
 ) -> ApprovalRequest {
     let (title, body) = match method {
         "item/commandExecution/requestApproval" => {
@@ -387,6 +557,9 @@ fn codex_approval_request(
             }
             if !item_id.is_empty() {
                 lines.push(format!("item: {item_id}"));
+            }
+            if let Some(summary) = pending_file_change.filter(|summary| !summary.is_empty()) {
+                lines.push(format!("changes: {summary}"));
             }
             ("Codex file change approval".to_string(), lines.join("\n"))
         }
@@ -426,6 +599,7 @@ struct CodexJsonRpcClient {
 
 #[derive(Debug)]
 struct PendingJsonRpcRequest {
+    id: u64,
     method: String,
     response: oneshot::Receiver<Value>,
 }
@@ -483,7 +657,11 @@ impl CodexJsonRpcClient {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "agent_router::codex_app_server", stderr = %line);
+                    tracing::debug!(
+                        target: "agent_router::codex_app_server",
+                        bytes = line.len(),
+                        "codex app-server emitted stderr"
+                    );
                 }
             });
         }
@@ -531,13 +709,26 @@ impl CodexJsonRpcClient {
             .unwrap_or(true)
     }
 
-    async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Duration,
+    ) -> anyhow::Result<Value> {
         let request = self.request_started(method, params).await?;
+        let id = request.id;
         let method = request.method;
-        let response = request
-            .response
-            .await
-            .map_err(|_| anyhow::anyhow!("codex app-server response channel closed"))?;
+        let response = match timeout(timeout_duration, request.response).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => anyhow::bail!("codex app-server response channel closed"),
+            Err(_) => {
+                self.cancel_pending(id).await;
+                anyhow::bail!(
+                    "codex app-server `{method}` timed out after {}s",
+                    timeout_duration.as_secs()
+                );
+            }
+        };
         json_rpc_result(&method, response)
     }
 
@@ -568,9 +759,21 @@ impl CodexJsonRpcClient {
             return Err(err);
         }
         Ok(PendingJsonRpcRequest {
+            id,
             method: method.to_string(),
             response: rx,
         })
+    }
+
+    async fn cancel_pending(&self, id: u64) {
+        self.state.lock().await.pending.remove(&id);
+    }
+
+    async fn close(&self, reason: &str) {
+        fail_all_pending(&self.state, reason).await;
+        let _ = self.closed.send(reason.to_string());
+        let mut child = self.child.lock().await;
+        let _ = child.start_kill();
     }
 
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
@@ -615,9 +818,30 @@ impl CodexJsonRpcClient {
 
 fn json_rpc_result(method: &str, response: Value) -> anyhow::Result<Value> {
     if let Some(error) = response.get("error") {
-        anyhow::bail!("codex app-server `{method}` failed: {error}");
+        anyhow::bail!(
+            "codex app-server `{method}` failed: {}",
+            summarize_json_rpc_error(error)
+        );
     }
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn summarize_json_rpc_error(error: &Value) -> String {
+    let code = error
+        .get("code")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    let message_state = if error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .is_some()
+    {
+        "omitted"
+    } else {
+        "absent"
+    };
+    format!("code={code}, message={message_state}")
 }
 
 async fn read_codex_stdout<R>(
@@ -632,7 +856,11 @@ async fn read_codex_stdout<R>(
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
-            tracing::debug!(target: "agent_router::codex_app_server", raw_stdout = %line, "ignoring non-json codex stdout");
+            tracing::debug!(
+                target: "agent_router::codex_app_server",
+                bytes = line.len(),
+                "ignoring non-json codex stdout"
+            );
             continue;
         };
         dispatch_codex_message(message, &state, &notifications, &server_requests).await;
@@ -695,26 +923,33 @@ async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexNotificationOutcome {
+    Pending,
+    TurnCompleted,
+}
+
 fn collect_codex_notification(
     notification: Value,
     final_text: &mut String,
     updates: &mut Vec<ExecutorUpdate>,
-) -> bool {
+) -> anyhow::Result<CodexNotificationOutcome> {
     let method = notification
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("");
     if method == "turn/completed" {
-        return true;
+        validate_turn_completed(&notification)?;
+        return Ok(CodexNotificationOutcome::TurnCompleted);
     }
     if method != "item/completed" {
-        return false;
+        return Ok(CodexNotificationOutcome::Pending);
     }
     let Some(item) = notification
         .get("params")
         .and_then(|params| params.get("item"))
     else {
-        return false;
+        return Ok(CodexNotificationOutcome::Pending);
     };
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
     match item_type {
@@ -780,7 +1015,23 @@ fn collect_codex_notification(
         }
         _ => {}
     }
-    false
+    Ok(CodexNotificationOutcome::Pending)
+}
+
+fn validate_turn_completed(notification: &Value) -> anyhow::Result<()> {
+    let turn = notification
+        .get("params")
+        .and_then(|params| params.get("turn"))
+        .unwrap_or(&Value::Null);
+    let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
+    if status.is_empty() || status == "completed" {
+        return Ok(());
+    }
+    let error = turn
+        .get("error")
+        .map(summarize_json_rpc_error)
+        .unwrap_or_else(|| "no error details".to_string());
+    anyhow::bail!("codex app-server turn ended with status `{status}`: {error}")
 }
 
 fn command_execution_summary(item: &Value) -> String {
@@ -807,20 +1058,55 @@ fn command_execution_summary(item: &Value) -> String {
 }
 
 fn file_change_summary(item: &Value) -> String {
+    summarize_file_change(item)
+}
+
+fn summarize_file_change(item: &Value) -> String {
     let changes = item
         .get("changes")
         .and_then(Value::as_array)
-        .map(|changes| {
-            changes
-                .iter()
-                .filter_map(|change| change.get("path").and_then(Value::as_str))
-                .take(8)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
+        .cloned()
         .unwrap_or_default();
     let status = item.get("status").and_then(Value::as_str).unwrap_or("");
-    truncate_text(format!("status={status}; changes={changes}"), 2_000)
+    if changes.is_empty() {
+        let summary = if status.is_empty() {
+            "1 change pending".to_string()
+        } else {
+            format!("status={status}; 1 change pending")
+        };
+        return truncate_text(summary, 2_000);
+    }
+    let mut kinds = BTreeMap::<String, usize>::new();
+    let paths = changes
+        .iter()
+        .filter_map(|change| {
+            let kind = change
+                .get("kind")
+                .and_then(|kind| kind.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("update");
+            *kinds.entry(kind.to_string()).or_default() += 1;
+            change.get("path").and_then(Value::as_str)
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    let counts = kinds
+        .into_iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let paths = paths.join(", ");
+    let mut parts = Vec::new();
+    if !status.is_empty() {
+        parts.push(format!("status={status}"));
+    }
+    if !counts.is_empty() {
+        parts.push(counts);
+    }
+    if !paths.is_empty() {
+        parts.push(paths);
+    }
+    truncate_text(parts.join("; "), 2_000)
 }
 
 fn extract_text(value: Option<&Value>) -> Option<String> {
@@ -910,19 +1196,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn codex_manager_prompts_fake_app_server() {
-        let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("fake_codex.py");
+    fn write_fake_codex_script(path: &Path, behavior: &str) {
         fs::write(
-            &script,
-            r#"#!/usr/bin/env python3
+            path,
+            format!(
+                r#"#!/usr/bin/env python3
 import json
 import sys
 
 def send(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
+
+turn_request_id = None
 
 for line in sys.stdin:
     if not line.strip():
@@ -931,12 +1217,26 @@ for line in sys.stdin:
     method = msg.get("method")
     request_id = msg.get("id")
     if method == "initialize":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {"userAgent": "fake"}})
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"userAgent": "fake"}}}})
     elif method == "initialized":
         pass
     elif method == "thread/start":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": "thread-1"}}})
-    elif method == "turn/start":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"thread": {{"id": "thread-1"}}}}}})
+{behavior}
+"#
+            ),
+        )
+        .unwrap();
+        make_executable(path);
+    }
+
+    #[tokio::test]
+    async fn codex_manager_prompts_fake_app_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fake_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
         send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-1"}}})
         send({
             "jsonrpc": "2.0",
@@ -949,9 +1249,7 @@ for line in sys.stdin:
             "params": {"turn": {"id": "turn-1", "status": "completed"}},
         })
 "#,
-        )
-        .unwrap();
-        make_executable(&script);
+        );
         let manager = CodexAppServerManager::new(executor_config(&script, tmp.path()));
 
         let prepared = manager
@@ -981,31 +1279,9 @@ for line in sys.stdin:
     async fn codex_command_approval_waits_for_text_approval() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("approval_codex.py");
-        fs::write(
+        write_fake_codex_script(
             &script,
-            r#"#!/usr/bin/env python3
-import json
-import sys
-
-def send(payload):
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
-
-turn_request_id = None
-
-for line in sys.stdin:
-    if not line.strip():
-        continue
-    msg = json.loads(line)
-    method = msg.get("method")
-    request_id = msg.get("id")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {"userAgent": "fake"}})
-    elif method == "initialized":
-        pass
-    elif method == "thread/start":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": "thread-1"}}})
-    elif method == "turn/start":
+            r#"    elif method == "turn/start":
         turn_request_id = request_id
         send({
             "jsonrpc": "2.0",
@@ -1029,9 +1305,7 @@ for line in sys.stdin:
         else:
             send({"jsonrpc": "2.0", "id": turn_request_id, "error": {"code": -32000, "message": "not approved"}})
 "#,
-        )
-        .unwrap();
-        make_executable(&script);
+        );
         let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
         let mut prompts = approvals.subscribe();
         let manager = Arc::new(CodexAppServerManager::with_approvals(
@@ -1071,5 +1345,235 @@ for line in sys.stdin:
 
         let response = prompt_task.await.unwrap().unwrap();
         assert_eq!(response.final_text, "approved");
+    }
+
+    #[tokio::test]
+    async fn codex_failed_turn_status_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("failed_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-1"}}})
+        send({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {"code": 123, "message": "secret error detail"},
+                },
+            },
+        })
+"#,
+        );
+        let manager = CodexAppServerManager::new(executor_config(&script, tmp.path()));
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let err = manager
+            .prompt(ExecutorPromptRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                prompt: "fail".to_string(),
+                user_id: Some("U1".to_string()),
+            })
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("status `failed`"));
+        assert!(message.contains("code=123"));
+        assert!(!message.contains("secret error detail"));
+    }
+
+    #[tokio::test]
+    async fn codex_file_change_approval_includes_cached_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("file_change_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
+        turn_request_id = request_id
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-1"}}})
+        send({
+            "jsonrpc": "2.0",
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "patch-1",
+                    "type": "fileChange",
+                    "changes": [
+                        {"kind": {"type": "modify"}, "path": "src/lib.rs"},
+                        {"kind": {"type": "add"}, "path": "src/new.rs"},
+                    ],
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "id": 901,
+            "method": "item/fileChange/requestApproval",
+            "params": {"itemId": "patch-1", "grantRoot": "/repo", "reason": "apply patch"},
+        })
+    elif request_id == 901:
+        if msg.get("result", {}).get("decision") == "accept":
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {"item": {"type": "agentMessage", "text": "patched"}},
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            })
+"#,
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(CodexAppServerManager::with_approvals(
+            executor_config(&script, tmp.path()),
+            approvals.clone(),
+        ));
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            prompt_manager
+                .prompt(ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    prompt: "patch".to_string(),
+                    user_id: Some("U1".to_string()),
+                })
+                .await
+        });
+        let approval_prompt = prompts.recv().await.unwrap();
+        assert!(approval_prompt.body.contains("src/lib.rs"));
+        assert!(approval_prompt.body.contains("src/new.rs"));
+        assert!(approval_prompt.body.contains("1 add"));
+        assert!(approval_prompt.body.contains("1 modify"));
+        approvals
+            .resolve_command(
+                "session-1",
+                &format!("/approve {}", approval_prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        let response = prompt_task.await.unwrap().unwrap();
+        assert_eq!(response.final_text, "patched");
+    }
+
+    #[tokio::test]
+    async fn codex_mcp_elicitation_declines_with_action_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("elicitation_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
+        turn_request_id = request_id
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-1"}}})
+        send({
+            "jsonrpc": "2.0",
+            "id": 902,
+            "method": "mcpServer/elicitation/request",
+            "params": {"serverName": "external"},
+        })
+    elif request_id == 902:
+        result = msg.get("result", {})
+        if result.get("action") == "decline" and "decision" not in result:
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {"item": {"type": "agentMessage", "text": "declined"}},
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            })
+        else:
+            send({"jsonrpc": "2.0", "id": turn_request_id, "error": {"code": -32000, "message": "wrong shape"}})
+"#,
+        );
+        let manager = CodexAppServerManager::new(executor_config(&script, tmp.path()));
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let response = manager
+            .prompt(ExecutorPromptRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                prompt: "elicit".to_string(),
+                user_id: Some("U1".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.final_text, "declined");
+    }
+
+    #[tokio::test]
+    async fn codex_turn_start_timeout_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("stuck_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
+        pass
+"#,
+        );
+        let manager = CodexAppServerManager::with_limits(
+            executor_config(&script, tmp.path()),
+            Arc::new(ApprovalBroker::default()),
+            CodexRuntimeLimits {
+                rpc_timeout: Duration::from_millis(50),
+                turn_timeout: Duration::from_secs(1),
+            },
+        );
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let err = manager
+            .prompt(ExecutorPromptRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                prompt: "hang".to_string(),
+                user_id: Some("U1".to_string()),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("turn/start"));
+        assert!(err.to_string().contains("timed out"));
     }
 }
