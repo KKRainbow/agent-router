@@ -20,8 +20,8 @@ use crate::{
         render_live_compact_channel_events,
     },
     session::context::{
-        ContextArtifactInput, ContextFileContent, ContextFileInput, ContextSyncIssueInput,
-        ContextSyncRequest, sanitize_path_segment,
+        ContextArtifactInput, ContextArtifactRecord, ContextFileContent, ContextFileInput,
+        ContextSyncIssueInput, ContextSyncRequest, sanitize_path_segment,
     },
 };
 
@@ -232,9 +232,15 @@ impl SlackSocketModeChannel {
             "routing Slack message"
         );
         let context = if self.should_sync_context(&text) {
+            let existing_context = router.context_artifacts(&session_key, "slack").await?;
             Some(
-                self.current_thread_context_request(&event, &session_key, bot_user_id)
-                    .await,
+                self.current_thread_context_request(
+                    &event,
+                    &session_key,
+                    bot_user_id,
+                    &existing_context,
+                )
+                .await,
             )
         } else {
             None
@@ -506,6 +512,7 @@ impl SlackSocketModeChannel {
         event: &SlackMessageEvent,
         session_key: &str,
         bot_user_id: &str,
+        existing_context: &[ContextArtifactRecord],
     ) -> SlackContextSyncBuild {
         let thread_ts = event.thread_root_ts();
         let mut unresolved = Vec::new();
@@ -586,13 +593,24 @@ impl SlackSocketModeChannel {
                     );
                     unresolved.push(ContextSyncIssueInput {
                         kind: "linked_thread".to_string(),
-                        reference: link.url,
+                        reference: slack_thread_reference(&link.channel, &link.thread_ts),
                         reason: "linked thread channel is not allowed".to_string(),
                     });
                     continue;
                 }
                 if linked_thread_fetches >= self.cfg.context_sync.max_linked_threads_per_turn {
-                    break;
+                    tracing::info!(
+                        linked_channel = %link.channel,
+                        linked_thread_ts = %link.thread_ts,
+                        source_message_ts = %link.source_message_ts,
+                        "skipping Slack linked thread due fetch limit"
+                    );
+                    unresolved.push(ContextSyncIssueInput {
+                        kind: "linked_thread".to_string(),
+                        reference: slack_thread_reference(&link.channel, &link.thread_ts),
+                        reason: "linked thread fetch limit reached".to_string(),
+                    });
+                    continue;
                 }
                 linked_thread_fetches += 1;
                 tracing::info!(
@@ -616,7 +634,7 @@ impl SlackSocketModeChannel {
                             );
                             unresolved.push(ContextSyncIssueInput {
                                 kind: "linked_thread_cache".to_string(),
-                                reference: link.url.clone(),
+                                reference: slack_thread_reference(&link.channel, &link.thread_ts),
                                 reason,
                             });
                         }
@@ -644,7 +662,7 @@ impl SlackSocketModeChannel {
                         );
                         unresolved.push(ContextSyncIssueInput {
                             kind: "linked_thread".to_string(),
-                            reference: link.url,
+                            reference: slack_thread_reference(&link.channel, &link.thread_ts),
                             reason: err.to_string(),
                         });
                     }
@@ -671,7 +689,7 @@ impl SlackSocketModeChannel {
         let file_selection = select_file_sync_attempts(
             session_key,
             file_refs,
-            &self.file_sync_state().await,
+            &self.file_sync_state(session_key, existing_context).await,
             self.cfg.context_sync.max_files_per_turn,
         );
         skipped_cached_files += file_selection.skipped_synced_files.len();
@@ -886,12 +904,13 @@ impl SlackSocketModeChannel {
         })
     }
 
-    async fn file_sync_state(&self) -> SlackFileSyncState {
+    async fn file_sync_state(
+        &self,
+        session_key: &str,
+        existing_context: &[ContextArtifactRecord],
+    ) -> SlackFileSyncState {
         let cache = self.context_cache.lock().await;
-        SlackFileSyncState {
-            synced_files: cache.synced_files.clone(),
-            failed_files: cache.failed_files.clone(),
-        }
+        file_sync_state_from_context_artifacts(session_key, existing_context, &cache)
     }
 
     async fn mark_file_sync_succeeded(&self, cache_key: String) {
@@ -926,6 +945,62 @@ struct SlackContextSyncBuild {
     request: ContextSyncRequest,
     succeeded_file_sync_keys: Vec<String>,
     failed_file_sync_keys: Vec<String>,
+}
+
+fn file_sync_state_from_context_artifacts(
+    session_key: &str,
+    records: &[ContextArtifactRecord],
+    cache: &SlackContextCache,
+) -> SlackFileSyncState {
+    let mut state = SlackFileSyncState {
+        synced_files: cache.synced_files.clone(),
+        failed_files: cache.failed_files.clone(),
+    };
+    for record in records {
+        if record.source != "slack" {
+            continue;
+        }
+        if record.kind == "slack_file" {
+            if let Some(file_id) = context_record_file_id(record) {
+                let key = format!("{session_key}:{file_id}");
+                state.failed_files.remove(&key);
+                state.synced_files.insert(key);
+            }
+        } else if record.kind == "manifest" {
+            for file_id in context_record_unresolved_file_ids(record) {
+                let key = format!("{session_key}:{file_id}");
+                if !state.synced_files.contains(&key) {
+                    state.failed_files.insert(key);
+                }
+            }
+        }
+    }
+    state
+}
+
+fn context_record_file_id(record: &ContextArtifactRecord) -> Option<String> {
+    record
+        .metadata
+        .get("file_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| record.id.strip_prefix("slack:file:").map(ToOwned::to_owned))
+}
+
+fn context_record_unresolved_file_ids(record: &ContextArtifactRecord) -> Vec<String> {
+    record
+        .metadata
+        .get("unresolved")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|issue| {
+            (issue.get("kind").and_then(Value::as_str) == Some("file"))
+                .then(|| issue.get("reference").and_then(Value::as_str))
+                .flatten()
+                .map(ToOwned::to_owned)
+        })
+        .collect()
 }
 
 struct SlackRouterOutputSink {
@@ -1514,6 +1589,10 @@ fn slack_thread_cache_key(channel: &str, thread_ts: &str) -> String {
     format!("{channel}:{thread_ts}")
 }
 
+fn slack_thread_reference(channel: &str, thread_ts: &str) -> String {
+    format!("{channel}:{thread_ts}")
+}
+
 fn context_error_reason(err: &anyhow::Error) -> String {
     let raw = err.to_string();
     if raw.contains("url_private") || raw.contains("slack-files.com") || raw.contains("http") {
@@ -1614,11 +1693,10 @@ fn linked_thread_artifact(linked_thread: &LinkedSlackThread) -> ContextArtifactI
     let mut metadata = BTreeMap::new();
     metadata.insert("channel".to_string(), json!(channel));
     metadata.insert("thread_ts".to_string(), json!(thread_ts));
-    let mut resolves_unresolved =
-        vec![json!({"kind": "linked_thread", "reference": &linked_thread.link.url})];
+    let thread_ref = slack_thread_reference(channel, thread_ts);
+    let mut resolves_unresolved = vec![json!({"kind": "linked_thread", "reference": &thread_ref})];
     if linked_thread.fresh {
-        resolves_unresolved
-            .push(json!({"kind": "linked_thread_cache", "reference": &linked_thread.link.url}));
+        resolves_unresolved.push(json!({"kind": "linked_thread_cache", "reference": &thread_ref}));
     }
     metadata.insert(
         "resolves_unresolved".to_string(),
@@ -2049,6 +2127,62 @@ mod tests {
     }
 
     #[test]
+    fn file_sync_state_uses_persisted_artifacts_and_unresolved_manifest() {
+        let mut file_metadata = BTreeMap::new();
+        file_metadata.insert("file_id".to_string(), json!("F1"));
+        let mut manifest_metadata = BTreeMap::new();
+        manifest_metadata.insert(
+            "unresolved".to_string(),
+            json!([
+                {"kind": "file", "reference": "F2"},
+                {"kind": "linked_thread", "reference": "C2:222.000"},
+            ]),
+        );
+        let records = vec![
+            ContextArtifactRecord {
+                id: "slack:file:F1".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Slack file F1".to_string(),
+                source_locator: None,
+                paths: vec!["slack/files/F1/metadata.json".to_string()],
+                fingerprint: "artifact:file".to_string(),
+                updated_at_ms: 1,
+                metadata: file_metadata,
+            },
+            ContextArtifactRecord {
+                id: "slack:manifest".to_string(),
+                source: "slack".to_string(),
+                kind: "manifest".to_string(),
+                title: "manifest".to_string(),
+                source_locator: None,
+                paths: vec!["slack/manifest.json".to_string()],
+                fingerprint: "artifact:manifest".to_string(),
+                updated_at_ms: 1,
+                metadata: manifest_metadata,
+            },
+        ];
+
+        let state = file_sync_state_from_context_artifacts(
+            "session",
+            &records,
+            &SlackContextCache::default(),
+        );
+        let selection = select_file_sync_attempts(
+            "session",
+            vec![file_ref("F1"), file_ref("F2"), file_ref("F3")],
+            &state,
+            2,
+        );
+
+        assert_eq!(selection.skipped_synced_files.len(), 1);
+        assert_eq!(selection.skipped_synced_files[0].id, "F1");
+        assert_eq!(selection.attempts.len(), 2);
+        assert_eq!(selection.attempts[0].1.id, "F3");
+        assert_eq!(selection.attempts[1].1.id, "F2");
+    }
+
+    #[test]
     fn parses_slack_thread_permalinks_from_mrkdwn() {
         let message = SlackThreadMessage {
             ts: "111.000".to_string(),
@@ -2339,13 +2473,11 @@ mod tests {
             .unwrap();
         assert!(linked_resolves.iter().any(|entry| {
             entry["kind"].as_str() == Some("linked_thread")
-                && entry["reference"].as_str()
-                    == Some("https://example.slack.com/archives/C2/p222000000")
+                && entry["reference"].as_str() == Some("C2:222.000")
         }));
         assert!(!linked_resolves.iter().any(|entry| {
             entry["kind"].as_str() == Some("linked_thread_cache")
-                && entry["reference"].as_str()
-                    == Some("https://example.slack.com/archives/C2/p222000000")
+                && entry["reference"].as_str() == Some("C2:222.000")
         }));
     }
 

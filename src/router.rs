@@ -17,8 +17,8 @@ use crate::{
         ExecutorPromptRequest, ExecutorUpdate,
     },
     session::{
-        ApprovalMode, ContextSyncRequest, ExecutorBinding, ExecutorHealth, SessionState,
-        TranscriptMessage,
+        ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding, ExecutorHealth,
+        SessionState, TranscriptMessage,
         context::write_context_sync,
         projection::{
             ProjectionInput, build_context_projection, merge_seen_context,
@@ -287,6 +287,14 @@ pub trait RouterOutputSink: Send {
 
 #[async_trait]
 pub trait RouterService: Send + Sync + 'static {
+    async fn context_artifacts(
+        &self,
+        _session_key: &str,
+        _source: &str,
+    ) -> anyhow::Result<Vec<ContextArtifactRecord>> {
+        Ok(Vec::new())
+    }
+
     async fn sync_context(&self, _request: ContextSyncRequest) -> anyhow::Result<()> {
         Ok(())
     }
@@ -834,6 +842,27 @@ where
     S: SessionStore,
     E: ExecutorBackend,
 {
+    async fn context_artifacts(
+        &self,
+        session_key: &str,
+        source: &str,
+    ) -> anyhow::Result<Vec<ContextArtifactRecord>> {
+        let lock = self.session_lock(session_key).await;
+        let _guard = lock.lock().await;
+        Ok(self
+            .store
+            .load(session_key)
+            .await
+            .map(|state| {
+                state
+                    .context_artifacts
+                    .into_iter()
+                    .filter(|record| record.source == source)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn sync_context(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
         let lock = self.session_lock(&request.session_key).await;
         let _guard = lock.lock().await;

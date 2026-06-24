@@ -181,6 +181,18 @@ pub fn write_context_sync(
 
     let mut manifest_metadata = BTreeMap::new();
     manifest_metadata.insert("unresolved_count".to_string(), json!(unresolved.len()));
+    manifest_metadata.insert(
+        "unresolved".to_string(),
+        json!(
+            unresolved
+                .iter()
+                .map(|issue| json!({
+                    "kind": &issue.kind,
+                    "reference": &issue.reference,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
     let manifest_record = ContextArtifactRecord {
         id: format!("{}:manifest", request.source),
         source: request.source,
@@ -466,6 +478,18 @@ mod tests {
             Some("slack_current_thread")
         );
         assert_eq!(manifest["unresolved"].as_array().unwrap().len(), 1);
+        let manifest_record = records
+            .iter()
+            .find(|record| record.kind == "manifest")
+            .unwrap();
+        let unresolved = manifest_record
+            .metadata
+            .get("unresolved")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0]["kind"].as_str(), Some("current_thread_cache"));
+        assert_eq!(unresolved[0]["reference"].as_str(), Some("C1:111.000"));
     }
 
     #[test]
