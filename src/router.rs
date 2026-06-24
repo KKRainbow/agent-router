@@ -150,10 +150,11 @@ impl CompactToolItem {
 }
 
 fn push_compact_count(counts: &mut Vec<(String, usize)>, label: String) {
-    if let Some((_, count)) = counts.iter_mut().find(|(existing, _)| existing == &label) {
-        *count += 1;
+    if let Some(index) = counts.iter().position(|(existing, _)| existing == &label) {
+        let (_, count) = counts.remove(index);
+        counts.insert(0, (label, count + 1));
     } else {
-        counts.push((label, 1));
+        counts.insert(0, (label, 1));
     }
 }
 
@@ -1711,7 +1712,26 @@ mod tests {
         assert_eq!(
             render_compact_channel_events(&events).as_deref(),
             Some(
-                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `sleep 3` x3\n- `cargo test -q`\nTools:\n- read_file"
+                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `cargo test -q`\n- `sleep 3` x3\nTools:\n- read_file"
+            )
+        );
+    }
+
+    #[test]
+    fn compact_channel_events_show_recent_commands_before_more() {
+        let events = (1..=8)
+            .map(|index| RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "Base".to_string(),
+                text: format!("$ cmd {index}\nexit: 0\nstatus: completed"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            render_live_compact_channel_events(&events).as_deref(),
+            Some(
+                "[codex] Activity\nCommands:\n- `cmd 8`\n- `cmd 7`\n- `cmd 6`\n- `cmd 5`\n- `cmd 4`\n- `cmd 3`\n- 2 more"
             )
         );
     }
