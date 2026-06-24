@@ -171,7 +171,7 @@ struct StagedContextFile {
 impl StagedContextFile {
     fn install(&self) -> anyhow::Result<InstalledContextFile> {
         let backup_path = match std::fs::symlink_metadata(&self.target_path) {
-            Ok(_) => {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
                 let backup_path = unique_context_backup_path(&self.target_path)?;
                 std::fs::rename(&self.target_path, &backup_path).with_context(|| {
                     format!(
@@ -180,6 +180,9 @@ impl StagedContextFile {
                     )
                 })?;
                 Some(backup_path)
+            }
+            Ok(_) => {
+                anyhow::bail!("context path is not a file: {}", self.target_path.display());
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
@@ -1396,6 +1399,33 @@ mod tests {
             std::fs::read_to_string(&manifest_path).unwrap(),
             original_manifest
         );
+    }
+
+    #[test]
+    fn context_sync_rejects_existing_directory_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("slack/current-thread.md")).unwrap();
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("thread".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        assert!(write_context_sync(tmp.path(), request, &[]).is_err());
+        assert!(tmp.path().join("slack/current-thread.md").is_dir());
     }
 
     #[test]

@@ -951,7 +951,9 @@ impl SlackSocketModeChannel {
                 }
             }
             Err(err) if slack_error_clears_thread_cache(&err) => {
-                self.context_cache.lock().await.threads.remove(&key);
+                if self.context_generation_is_current(context_turn).await {
+                    self.context_cache.lock().await.threads.remove(&key);
+                }
                 Err(err)
             }
             Err(err) => Err(err),
@@ -3248,6 +3250,52 @@ mod tests {
                 .await
                 .threads
                 .contains_key(&slack_thread_cache_key("C1", "111.000"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_context_generation_does_not_clear_thread_cache() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let key = slack_thread_cache_key("C1", "111.000");
+        channel.context_cache.lock().await.threads.insert(
+            key.clone(),
+            vec![SlackThreadMessage {
+                ts: "111.000".to_string(),
+                user: Some("U1".to_string()),
+                bot_id: None,
+                text: "fresh context".to_string(),
+                files: Vec::new(),
+            }],
+        );
+        channel.remember_context_generation("session", 2).await;
+        let stale_turn = SlackContextTurn {
+            session_key: "session".to_string(),
+            generation: 1,
+        };
+
+        let result =
+            channel
+                .fetch_thread_messages_cached_with(
+                    "C1",
+                    "111.000",
+                    async move {
+                        Err(SlackApiError::new("conversations.replies", "not_in_channel").into())
+                    },
+                    Some(&stale_turn),
+                )
+                .await;
+
+        assert!(result.is_err());
+        assert!(
+            channel
+                .context_cache
+                .lock()
+                .await
+                .threads
+                .contains_key(&key)
         );
     }
 
