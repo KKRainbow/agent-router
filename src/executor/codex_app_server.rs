@@ -1559,6 +1559,8 @@ fn codex_message_requires_turn_id(message: &Value) -> bool {
             | "turn/completed"
             | "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "mcpServer/elicitation/request"
     )
 }
 
@@ -1934,6 +1936,7 @@ TURN_SCOPED_METHODS = {{
     "turn/completed",
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
     "mcpServer/elicitation/request",
 }}
 
@@ -2876,7 +2879,7 @@ for line in sys.stdin:
         }
 
         let (new_notifications_tx, mut new_notifications) = mpsc::unbounded_channel();
-        let (new_requests_tx, _new_requests) = mpsc::unbounded_channel();
+        let (new_requests_tx, mut new_requests) = mpsc::unbounded_channel();
         {
             let generation = event_streams.lock().unwrap().open(
                 "thread-1".to_string(),
@@ -2930,6 +2933,26 @@ for line in sys.stdin:
         )
         .await;
         assert!(new_notifications.try_recv().is_err());
+
+        for method in [
+            "mcpServer/elicitation/request",
+            "item/permissions/requestApproval",
+        ] {
+            dispatch_codex_message(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 100,
+                    "method": method,
+                    "params": {
+                        "threadId": "thread-1",
+                    },
+                }),
+                &state,
+                &event_streams,
+            )
+            .await;
+        }
+        assert!(new_requests.try_recv().is_err());
 
         dispatch_codex_message(
             json!({
