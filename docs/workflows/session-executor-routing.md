@@ -198,3 +198,7 @@ routing state machine.
 
 The draft implementation plan is documented separately in
 `docs/workflows/orchestrator-initial-routing.md`.
+
+That draft treats an orchestrator-enabled session as temporarily unassigned
+before the first normal user message, so the orchestrator can choose the first
+real `active_executor` without making `default_executor` ambiguous.
