@@ -101,6 +101,22 @@ impl AcpExecutorManager {
         Ok(session)
     }
 
+    async fn discard_session_if_same(
+        &self,
+        session_key: &str,
+        executor: &str,
+        session: &Arc<Mutex<AcpSession>>,
+    ) {
+        let key = (session_key.to_string(), executor.to_string());
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, session))
+        {
+            sessions.remove(&key);
+        }
+    }
+
     async fn existing_session(
         &self,
         session_key: &str,
@@ -165,6 +181,11 @@ impl ExecutorBackend for AcpExecutorManager {
             )
             .await?;
         if cancel.is_cancelled().await {
+            self.discard_session_if_same(&request.session_key, &request.executor, &session)
+                .await;
+            let mut session = session.lock().await;
+            session.client.close("ACP prepare cancelled").await;
+            session.session_id = None;
             anyhow::bail!("ACP prepare cancelled");
         }
         let mut session = session.lock().await;

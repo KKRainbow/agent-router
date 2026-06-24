@@ -272,6 +272,22 @@ impl CodexAppServerManager {
         Ok(session)
     }
 
+    async fn discard_session_if_same(
+        &self,
+        session_key: &str,
+        executor: &str,
+        session: &SharedCodexSession,
+    ) {
+        let key = (session_key.to_string(), executor.to_string());
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, session))
+        {
+            sessions.remove(&key);
+        }
+    }
+
     async fn existing_session(
         &self,
         session_key: &str,
@@ -335,6 +351,13 @@ impl ExecutorBackend for CodexAppServerManager {
             )
             .await?;
         if cancel.is_cancelled().await {
+            self.discard_session_if_same(&request.session_key, &request.executor, &session)
+                .await;
+            let session = session.lock().await;
+            session
+                .client
+                .close("Codex app-server prepare cancelled")
+                .await;
             anyhow::bail!("Codex app-server prepare cancelled");
         }
         let mut session = session.lock().await;
