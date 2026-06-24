@@ -372,6 +372,7 @@ fn remove_context_artifact_files(
     base_path: &Path,
     records: &[ContextArtifactRecord],
 ) -> anyhow::Result<()> {
+    let base_abs = cwd.join(base_path);
     for record in records {
         for path in &record.paths {
             validate_source_context_path(base_path, Path::new(path))?;
@@ -383,6 +384,34 @@ fn remove_context_artifact_files(
                     return Err(err)
                         .with_context(|| format!("remove context artifact {}", path.display()));
                 }
+            }
+            prune_empty_context_dirs(path.parent(), &base_abs)?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_empty_context_dirs(mut dir: Option<&Path>, base_path: &Path) -> anyhow::Result<()> {
+    while let Some(path) = dir {
+        if path == base_path {
+            break;
+        }
+        if !path.starts_with(base_path) {
+            break;
+        }
+        match std::fs::remove_dir(path) {
+            Ok(()) => dir = path.parent(),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("remove empty context directory {}", path.display()));
             }
         }
     }
@@ -917,6 +946,50 @@ mod tests {
                 .join("slack/linked-threads/C3-333.000.md")
                 .exists()
         );
+    }
+
+    #[test]
+    fn write_context_sync_removes_empty_artifact_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("slack/files/F1/original")).unwrap();
+        std::fs::write(tmp.path().join("slack/files/F1/metadata.json"), "{}").unwrap();
+        std::fs::write(
+            tmp.path().join("slack/files/F1/original/file.txt"),
+            "content",
+        )
+        .unwrap();
+        let existing = vec![ContextArtifactRecord {
+            id: "slack:file:F1".to_string(),
+            source: "slack".to_string(),
+            kind: "slack_file".to_string(),
+            title: "Slack file F1".to_string(),
+            source_locator: None,
+            paths: vec![
+                "slack/files/F1/metadata.json".to_string(),
+                "slack/files/F1/original/file.txt".to_string(),
+            ],
+            fingerprint: "artifact:file".to_string(),
+            updated_at_ms: 1,
+            metadata: BTreeMap::new(),
+        }];
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: Vec::new(),
+            remove_artifacts: vec![ContextArtifactRemovalInput::Exact {
+                id: "slack:file:F1".to_string(),
+                kind: "slack_file".to_string(),
+            }],
+            unresolved: Vec::new(),
+        };
+
+        let records = write_context_sync(tmp.path(), request, &existing).unwrap();
+
+        assert!(!records.iter().any(|record| record.id == "slack:file:F1"));
+        assert!(!tmp.path().join("slack/files/F1").exists());
+        assert!(!tmp.path().join("slack/files").exists());
+        assert!(tmp.path().join("slack").exists());
     }
 
     #[test]
