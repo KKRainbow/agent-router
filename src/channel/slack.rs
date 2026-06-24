@@ -560,6 +560,7 @@ impl SlackSocketModeChannel {
                     if slack_error_is_access_denied(&err) {
                         remove_artifacts
                             .push(slack_current_thread_removal(&event.channel, &thread_ts));
+                        remove_artifacts.push(slack_all_linked_threads_removal());
                     }
                     tracing::info!(
                         channel = %event.channel,
@@ -817,6 +818,10 @@ impl SlackSocketModeChannel {
                     messages: cached,
                     stale_reason: Some(context_error_reason(&err)),
                 })
+            }
+            Err(err) if slack_error_clears_thread_cache(&err) => {
+                self.context_cache.lock().await.threads.remove(&key);
+                Err(err)
             }
             Err(err) => Err(err),
         }
@@ -1273,6 +1278,10 @@ fn slack_error_is_access_denied(err: &anyhow::Error) -> bool {
 
 fn slack_error_allows_cached_context(err: &anyhow::Error) -> bool {
     !slack_error_is_access_denied(err)
+}
+
+fn slack_error_clears_thread_cache(err: &anyhow::Error) -> bool {
+    slack_error_is_access_denied(err)
 }
 
 #[derive(Debug, Clone)]
@@ -1754,15 +1763,21 @@ fn slack_thread_reference(channel: &str, thread_ts: &str) -> String {
 }
 
 fn slack_current_thread_removal(channel: &str, thread_ts: &str) -> ContextArtifactRemovalInput {
-    ContextArtifactRemovalInput {
+    ContextArtifactRemovalInput::Exact {
         id: format!("slack:thread:{channel}:{thread_ts}"),
         kind: "slack_current_thread".to_string(),
     }
 }
 
 fn slack_linked_thread_removal(channel: &str, thread_ts: &str) -> ContextArtifactRemovalInput {
-    ContextArtifactRemovalInput {
+    ContextArtifactRemovalInput::Exact {
         id: format!("slack:linked-thread:{channel}:{thread_ts}"),
+        kind: "slack_linked_thread".to_string(),
+    }
+}
+
+fn slack_all_linked_threads_removal() -> ContextArtifactRemovalInput {
+    ContextArtifactRemovalInput::Kind {
         kind: "slack_linked_thread".to_string(),
     }
 }
@@ -2484,18 +2499,37 @@ mod tests {
             anyhow::Error::new(SlackApiError::new("conversations.replies", "rate_limited"));
 
         assert!(!slack_error_allows_cached_context(&denied));
+        assert!(slack_error_clears_thread_cache(&denied));
         assert!(slack_error_allows_cached_context(&rate_limited));
+        assert!(!slack_error_clears_thread_cache(&rate_limited));
     }
 
     #[test]
     fn access_denied_thread_removals_target_prior_artifacts() {
         let current = slack_current_thread_removal("C1", "111.000");
         let linked = slack_linked_thread_removal("C2", "222.000");
+        let all_linked = slack_all_linked_threads_removal();
 
-        assert_eq!(current.id, "slack:thread:C1:111.000");
-        assert_eq!(current.kind, "slack_current_thread");
-        assert_eq!(linked.id, "slack:linked-thread:C2:222.000");
-        assert_eq!(linked.kind, "slack_linked_thread");
+        match current {
+            ContextArtifactRemovalInput::Exact { kind, id } => {
+                assert_eq!(id, "slack:thread:C1:111.000");
+                assert_eq!(kind, "slack_current_thread");
+            }
+            ContextArtifactRemovalInput::Kind { .. } => panic!("expected exact removal"),
+        }
+        match linked {
+            ContextArtifactRemovalInput::Exact { kind, id } => {
+                assert_eq!(id, "slack:linked-thread:C2:222.000");
+                assert_eq!(kind, "slack_linked_thread");
+            }
+            ContextArtifactRemovalInput::Kind { .. } => panic!("expected exact removal"),
+        }
+        match all_linked {
+            ContextArtifactRemovalInput::Kind { kind } => {
+                assert_eq!(kind, "slack_linked_thread");
+            }
+            ContextArtifactRemovalInput::Exact { .. } => panic!("expected kind removal"),
+        }
     }
 
     #[test]

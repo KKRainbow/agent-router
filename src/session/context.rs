@@ -37,9 +37,9 @@ pub struct ContextFileInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct ContextArtifactRemovalInput {
-    pub id: String,
-    pub kind: String,
+pub enum ContextArtifactRemovalInput {
+    Exact { kind: String, id: String },
+    Kind { kind: String },
 }
 
 #[derive(Debug, Clone)]
@@ -126,13 +126,22 @@ pub fn write_context_sync(
         .filter(|record| record.source == request.source && record.kind != "manifest")
         .cloned()
         .collect::<Vec<_>>();
-    let removed_artifacts = request
-        .remove_artifacts
-        .into_iter()
-        .map(|removal| (removal.kind, removal.id))
-        .collect::<BTreeSet<_>>();
-    source_records
-        .retain(|record| !removed_artifacts.contains(&(record.kind.clone(), record.id.clone())));
+    let mut removed_artifacts = BTreeSet::new();
+    let mut removed_kinds = BTreeSet::new();
+    for removal in request.remove_artifacts {
+        match removal {
+            ContextArtifactRemovalInput::Exact { kind, id } => {
+                removed_artifacts.insert((kind, id));
+            }
+            ContextArtifactRemovalInput::Kind { kind } => {
+                removed_kinds.insert(kind);
+            }
+        }
+    }
+    source_records.retain(|record| {
+        !removed_kinds.contains(&record.kind)
+            && !removed_artifacts.contains(&(record.kind.clone(), record.id.clone()))
+    });
     for record in &source_records {
         for path in &record.paths {
             validate_source_context_path(&request.base_path, Path::new(path))?;
@@ -693,7 +702,7 @@ mod tests {
             source: "slack".to_string(),
             base_path: PathBuf::from("slack"),
             artifacts: Vec::new(),
-            remove_artifacts: vec![ContextArtifactRemovalInput {
+            remove_artifacts: vec![ContextArtifactRemovalInput::Exact {
                 id: "slack:thread:C1:111.000".to_string(),
                 kind: "slack_current_thread".to_string(),
             }],
@@ -710,6 +719,54 @@ mod tests {
         let manifest = std::fs::read_to_string(tmp.path().join("slack/manifest.json")).unwrap();
         let manifest = serde_json::from_str::<Value>(&manifest).unwrap();
         assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_context_sync_removes_all_requested_source_artifact_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = vec![
+            ContextArtifactRecord {
+                id: "slack:linked-thread:C2:222.000".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_linked_thread".to_string(),
+                title: "Linked Slack thread".to_string(),
+                source_locator: None,
+                paths: vec!["slack/linked-threads/C2-222.000.md".to_string()],
+                fingerprint: "artifact:linked".to_string(),
+                updated_at_ms: 1,
+                metadata: BTreeMap::new(),
+            },
+            ContextArtifactRecord {
+                id: "slack:file:F1".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Slack file F1".to_string(),
+                source_locator: None,
+                paths: vec!["slack/files/F1/metadata.json".to_string()],
+                fingerprint: "artifact:file".to_string(),
+                updated_at_ms: 1,
+                metadata: BTreeMap::new(),
+            },
+        ];
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: Vec::new(),
+            remove_artifacts: vec![ContextArtifactRemovalInput::Kind {
+                kind: "slack_linked_thread".to_string(),
+            }],
+            unresolved: Vec::new(),
+        };
+
+        let records = write_context_sync(tmp.path(), request, &existing).unwrap();
+
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.kind == "slack_linked_thread")
+        );
+        assert!(records.iter().any(|record| record.kind == "slack_file"));
     }
 
     #[test]
