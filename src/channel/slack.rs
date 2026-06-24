@@ -810,11 +810,13 @@ impl SlackSocketModeChannel {
                 })
             }
             Err(err) if slack_error_allows_cached_context(&err) => {
-                let cached = {
+                let fetch = {
                     let cache = self.context_cache.lock().await;
-                    cache.threads.get(&key).cloned().unwrap_or_default()
+                    cached_thread_fetch_after_error(&err, || {
+                        cache.threads.get(&key).cloned().unwrap_or_default()
+                    })
                 };
-                if let Some(fetch) = cached_thread_fetch_after_error(&err, cached) {
+                if let Some(fetch) = fetch {
                     Ok(fetch)
                 } else {
                     Err(err)
@@ -1292,9 +1294,13 @@ fn slack_error_clears_thread_cache(err: &anyhow::Error) -> bool {
 
 fn cached_thread_fetch_after_error(
     err: &anyhow::Error,
-    cached: Vec<SlackThreadMessage>,
+    current_cache: impl FnOnce() -> Vec<SlackThreadMessage>,
 ) -> Option<SlackThreadFetch> {
-    if !slack_error_allows_cached_context(err) || cached.is_empty() {
+    if !slack_error_allows_cached_context(err) {
+        return None;
+    }
+    let cached = current_cache();
+    if cached.is_empty() {
         return None;
     }
     Some(SlackThreadFetch {
@@ -2532,7 +2538,7 @@ mod tests {
     fn transient_thread_errors_only_reuse_current_cache_snapshot() {
         let rate_limited =
             anyhow::Error::new(SlackApiError::new("conversations.replies", "rate_limited"));
-        let cached = vec![SlackThreadMessage {
+        let current_cache = vec![SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
             bot_id: None,
@@ -2540,10 +2546,30 @@ mod tests {
             files: Vec::new(),
         }];
 
-        let fetch = cached_thread_fetch_after_error(&rate_limited, cached).unwrap();
+        let mut cache_read = false;
+        let fetch = cached_thread_fetch_after_error(&rate_limited, || {
+            cache_read = true;
+            current_cache
+        })
+        .unwrap();
         assert_eq!(fetch.messages.len(), 1);
         assert!(fetch.stale_reason.is_some());
-        assert!(cached_thread_fetch_after_error(&rate_limited, Vec::new()).is_none());
+        assert!(cache_read);
+        assert!(cached_thread_fetch_after_error(&rate_limited, Vec::new).is_none());
+
+        let denied = anyhow::Error::new(SlackApiError::new(
+            "conversations.replies",
+            "not_in_channel",
+        ));
+        let mut denied_cache_read = false;
+        assert!(
+            cached_thread_fetch_after_error(&denied, || {
+                denied_cache_read = true;
+                Vec::new()
+            })
+            .is_none()
+        );
+        assert!(!denied_cache_read);
     }
 
     #[test]
