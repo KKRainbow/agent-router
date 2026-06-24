@@ -2393,6 +2393,97 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn codex_many_early_approval_requests_are_ordered_and_answered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("many_ordered_requests_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
+        turn_request_id = request_id
+        response_ids = []
+        for index in range(80):
+            send({
+                "jsonrpc": "2.0",
+                "id": 1000 + index,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "cmd " + str(index), "cwd": "/tmp", "reason": "test"},
+            })
+    elif 1000 <= request_id < 1080:
+        response_ids.append(request_id)
+        if len(response_ids) == 80:
+            if response_ids == list(range(1000, 1080)):
+                send({"jsonrpc": "2.0", "id": turn_request_id, "result": {"turn": {"id": "turn-1"}}})
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "item/completed",
+                    "params": {"item": {"type": "agentMessage", "text": "answered"}},
+                })
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                })
+            else:
+                send({"jsonrpc": "2.0", "id": turn_request_id, "error": {"code": -32000, "message": "out of order"}})
+"#,
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(CodexAppServerManager::with_limits(
+            executor_config(&script, tmp.path()),
+            approvals.clone(),
+            CodexRuntimeLimits {
+                rpc_timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(5),
+            },
+        ));
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                cwd: None,
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        session_key: "session-1".to_string(),
+                        executor: "codex".to_string(),
+                        prompt: "many approvals".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                )
+                .await
+        });
+
+        for index in 0..80 {
+            let prompt = timeout(Duration::from_secs(2), prompts.recv())
+                .await
+                .expect("approval prompt timed out")
+                .unwrap();
+            assert!(prompt.body.contains(&format!("$ cmd {index}")));
+            approvals
+                .resolve_command("session-1", &format!("/deny {}", prompt.id), Some("U1"))
+                .await
+                .unwrap();
+        }
+
+        let response = timeout(Duration::from_secs(2), prompt_task)
+            .await
+            .expect("prompt task timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.final_text, "answered");
+    }
+
+    #[tokio::test]
     async fn codex_turn_idle_timeout_returns_error_without_activity() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("idle_codex.py");
