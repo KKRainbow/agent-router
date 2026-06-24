@@ -92,9 +92,10 @@ impl CodexAppServerManager {
         session_key: &str,
         executor: &str,
         cfg: &ExecutorConfig,
+        session_cwd: Option<&Path>,
     ) -> anyhow::Result<SharedCodexSession> {
         let key = (session_key.to_string(), executor.to_string());
-        let cwd = resolve_cwd(cfg.cwd.as_deref())?;
+        let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
         let existing = self.sessions.lock().await.get(&key).cloned();
         if let Some(existing) = existing {
             let matches = existing.lock().await.matches(cfg, &cwd);
@@ -165,7 +166,12 @@ impl ExecutorBackend for CodexAppServerManager {
             "preparing Codex app-server executor session"
         );
         let session = self
-            .get_or_create_session(&request.session_key, &request.executor, cfg)
+            .get_or_create_session(
+                &request.session_key,
+                &request.executor,
+                cfg,
+                request.cwd.as_deref(),
+            )
             .await?;
         let mut session = session.lock().await;
         let (thread_id, started_new_session) = session.ensure_thread().await?;
@@ -1462,6 +1468,37 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn codex_prepare_prefers_session_cwd_over_executor_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executor_cwd = tmp.path().join("executor-cwd");
+        let session_cwd = tmp.path().join("session-cwd");
+        fs::create_dir_all(&executor_cwd).unwrap();
+        fs::create_dir_all(&session_cwd).unwrap();
+        let script = tmp.path().join("fake_codex.py");
+        write_fake_codex_script(&script, "");
+        let manager = CodexAppServerManager::new(executor_config(&script, &executor_cwd));
+
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                cwd: Some(session_cwd.clone()),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let session = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        assert_eq!(
+            session.lock().await.cwd,
+            session_cwd.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn codex_manager_prompts_fake_app_server() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fake_codex.py");
@@ -1487,6 +1524,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "codex".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await
@@ -1551,6 +1589,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "codex".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await
@@ -1612,6 +1651,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "codex".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await
@@ -1696,6 +1736,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "codex".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await
@@ -1771,6 +1812,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "codex".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await
@@ -1815,6 +1857,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "codex".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await

@@ -53,13 +53,16 @@ async fn main() -> anyhow::Result<()> {
         config.executors.clone(),
         approvals.clone(),
     ));
-    let router: Arc<dyn RouterService> = Arc::new(AgentRouter::with_approval_mode(
-        config.router.default_executor.clone(),
-        config.approval.default_mode,
-        store,
-        executor,
-        approvals.clone(),
-    ));
+    let router: Arc<dyn RouterService> = Arc::new(
+        AgentRouter::with_approval_mode(
+            config.router.default_executor.clone(),
+            config.approval.default_mode,
+            store,
+            executor,
+            approvals.clone(),
+        )
+        .with_workspace_root(config.workspace.root.clone()),
+    );
 
     let mut channels: JoinSet<(&'static str, anyhow::Result<()>)> = JoinSet::new();
     if config.slack.enabled {

@@ -12,6 +12,7 @@ use crate::session::ApprovalMode;
 pub struct AppConfig {
     pub router: RouterConfig,
     pub approval: ApprovalConfig,
+    pub workspace: WorkspaceConfig,
     pub slack: SlackConfig,
     pub qq: QqConfig,
     pub executors: BTreeMap<String, ExecutorConfig>,
@@ -25,6 +26,11 @@ pub struct ApprovalConfig {
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     pub default_executor: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceConfig {
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +74,7 @@ pub struct ExecutorConfig {
 struct FileConfig {
     router: Option<FileRouterConfig>,
     approval: Option<FileApprovalConfig>,
+    workspace: Option<FileWorkspaceConfig>,
     slack: Option<FileSlackConfig>,
     qq: Option<FileQqConfig>,
     executors: Option<BTreeMap<String, FileExecutorConfig>>,
@@ -81,6 +88,11 @@ struct FileApprovalConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileRouterConfig {
     default_executor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileWorkspaceConfig {
+    root: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -165,6 +177,12 @@ impl AppConfig {
             .unwrap_or_default();
         let approval = ApprovalConfig {
             default_mode: default_approval_mode,
+        };
+        let workspace_file = file_cfg.workspace.unwrap_or_default();
+        let workspace = WorkspaceConfig {
+            root: workspace_file
+                .root
+                .filter(|root| !root.as_os_str().is_empty()),
         };
 
         let slack_file = file_cfg.slack.unwrap_or_default();
@@ -256,6 +274,7 @@ impl AppConfig {
         Ok(Self {
             router: RouterConfig { default_executor },
             approval,
+            workspace,
             slack,
             qq,
             executors,
@@ -503,6 +522,21 @@ approval:
         let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
 
         assert_eq!(cfg.approval.default_mode, ApprovalMode::Yolo);
+    }
+
+    #[test]
+    fn parses_workspace_root() {
+        let raw = r#"
+workspace:
+  root: /tmp/hermes-workspaces
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert_eq!(
+            cfg.workspace.root.as_deref(),
+            Some(Path::new("/tmp/hermes-workspaces"))
+        );
     }
 
     #[test]

@@ -65,9 +65,10 @@ impl AcpExecutorManager {
         session_key: &str,
         executor: &str,
         cfg: &ExecutorConfig,
+        session_cwd: Option<&Path>,
     ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
         let key = (session_key.to_string(), executor.to_string());
-        let cwd = resolve_cwd(cfg.cwd.as_deref())?;
+        let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
         let existing = self.sessions.lock().await.get(&key).cloned();
         if let Some(existing) = existing {
             let matches = existing.lock().await.matches(cfg, &cwd);
@@ -139,7 +140,12 @@ impl ExecutorBackend for AcpExecutorManager {
             "preparing ACP executor session"
         );
         let session = self
-            .get_or_create_session(&request.session_key, &request.executor, cfg)
+            .get_or_create_session(
+                &request.session_key,
+                &request.executor,
+                cfg,
+                request.cwd.as_deref(),
+            )
             .await?;
         let mut session = session.lock().await;
         let (external_session_id, started_new_session) = session
@@ -908,6 +914,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_prepare_prefers_session_cwd_over_executor_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executor_cwd = tmp.path().join("executor-cwd");
+        let session_cwd = tmp.path().join("session-cwd");
+        fs::create_dir_all(&executor_cwd).unwrap();
+        fs::create_dir_all(&session_cwd).unwrap();
+        let script = tmp.path().join("fake_acp.py");
+        fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "fake-session"}})
+"#,
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(executor_cwd),
+                env: BTreeMap::new(),
+            },
+        );
+        let manager = AcpExecutorManager::new(executors);
+
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "kimi".to_string(),
+                cwd: Some(session_cwd.clone()),
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let session = manager.existing_session("session-1", "kimi").await.unwrap();
+        assert_eq!(
+            session.lock().await.cwd,
+            session_cwd.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn acp_manager_prompts_fake_stdio_server() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fake_acp.py");
@@ -966,6 +1035,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "kimi".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await
@@ -1071,6 +1141,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "kimi".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await
@@ -1154,6 +1225,7 @@ for line in sys.stdin:
             .prepare(ExecutorPrepareRequest {
                 session_key: "session-1".to_string(),
                 executor: "kimi".to_string(),
+                cwd: None,
                 previous_session_id: None,
             })
             .await

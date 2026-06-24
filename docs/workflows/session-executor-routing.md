@@ -25,7 +25,10 @@ Each executor backend keeps its own private state.
 - The canonical transcript is unified and safe to show to the user.
 - Shared context is derived from the canonical transcript and router-owned
   session metadata.
-- Each executor can keep private state, such as an ACP session id, cwd,
+- When `workspace.root` is configured, each session gets a stable cwd under
+  that root; executor-level `cwd` remains the fallback when no session cwd is
+  allocated.
+- Each executor can keep private state, such as an ACP session id,
   permission mode, model hint, or protocol-specific cache.
 - Backend raw logs, stderr, secrets, and full internal reasoning are not
   forwarded directly to user channels.
@@ -40,6 +43,9 @@ Version 1 supports only ACP as the backend protocol.
 Configured executors should therefore look like ACP backends first:
 
 ```yaml
+workspace:
+  root: /data/project/hermes-workspaces
+
 executors:
   kimi:
     protocol: acp
@@ -95,6 +101,7 @@ Each router session stores:
 - `session_key`
 - `default_executor`
 - `active_executor`
+- session cwd, when `workspace.root` is configured
 - canonical user-visible transcript
 - per-executor backend bindings
 - safe projected event log
@@ -104,7 +111,7 @@ Each executor binding stores protocol-specific private state:
 - protocol name
 - external session id
 - backend process or connection identity
-- cwd
+- effective cwd used for that backend session
 - permission mode
 - MCP server selection
 - model hint

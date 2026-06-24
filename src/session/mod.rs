@@ -4,6 +4,7 @@ pub(crate) mod work_queue;
 
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -101,6 +102,8 @@ pub struct SessionState {
     pub active_executor: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode_override: Option<ApprovalMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     pub transcript: Vec<TranscriptMessage>,
     pub executor_bindings: BTreeMap<String, ExecutorBinding>,
 }
@@ -113,6 +116,7 @@ impl SessionState {
             active_executor: default_executor.clone(),
             default_executor,
             approval_mode_override: None,
+            cwd: None,
             transcript: Vec::new(),
             executor_bindings: BTreeMap::new(),
         }

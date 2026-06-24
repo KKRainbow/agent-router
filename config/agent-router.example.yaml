@@ -6,6 +6,10 @@ approval:
   # yolo: auto-approve one-shot allow options unless a session overrides it.
   default_mode: normal
 
+workspace:
+  # Optional. When set, each router session runs under a stable child directory.
+  # root: /data/project/hermes-workspaces
+
 executors:
   kimi:
     protocol: acp

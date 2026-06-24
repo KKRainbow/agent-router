@@ -4,6 +4,7 @@ pub mod registry;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::text::truncate_chars;
 
@@ -17,6 +18,7 @@ pub struct ExecutorDescriptor {
 pub struct ExecutorPrepareRequest {
     pub session_key: String,
     pub executor: String,
+    pub cwd: Option<PathBuf>,
     pub previous_session_id: Option<String>,
 }
 

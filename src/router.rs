@@ -1,6 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -138,6 +143,7 @@ where
     store: Arc<S>,
     executor: Arc<E>,
     approvals: SharedApprovalBroker,
+    workspace_root: Option<PathBuf>,
     session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -183,8 +189,14 @@ where
             store,
             executor,
             approvals,
+            workspace_root: None,
             session_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: Option<PathBuf>) -> Self {
+        self.workspace_root = workspace_root;
+        self
     }
 
     async fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
@@ -333,9 +345,17 @@ where
         let descriptor = self.executor.get(&executor_name).ok_or_else(|| {
             anyhow::anyhow!("active executor `{executor_name}` is not configured")
         })?;
+        let session_cwd = self.ensure_session_cwd(&mut state)?;
+        if session_cwd.is_some() {
+            self.store.save(state.clone()).await;
+        }
         tracing::info!(
             session_key = %input.session_key,
             executor = %executor_name,
+            cwd = session_cwd
+                .as_deref()
+                .map(|cwd| cwd.display().to_string())
+                .unwrap_or_else(|| "executor-default".to_string()),
             text_len = input.text.len(),
             "routing turn to active executor"
         );
@@ -346,6 +366,7 @@ where
             .prepare(ExecutorPrepareRequest {
                 session_key: input.session_key.clone(),
                 executor: executor_name.clone(),
+                cwd: session_cwd.clone(),
                 previous_session_id: binding.external_session_id.clone(),
             })
             .await;
@@ -357,7 +378,7 @@ where
                     ExecutorBinding {
                         protocol: descriptor.protocol.clone(),
                         health: ExecutorHealth::Unhealthy,
-                        ..binding
+                        ..binding_with_session_cwd(binding, session_cwd.as_deref())
                     },
                 );
                 self.store.save(state).await;
@@ -420,6 +441,7 @@ where
                         binding,
                         prepared.external_session_id,
                         descriptor.protocol,
+                        session_cwd.as_deref(),
                         projection.acknowledged_fingerprints,
                         new_fingerprints,
                     ),
@@ -440,6 +462,7 @@ where
                         binding,
                         prepared.external_session_id,
                         descriptor.protocol,
+                        session_cwd.as_deref(),
                     ),
                 );
                 self.store.save(state).await;
@@ -458,8 +481,11 @@ where
         let mut lines = vec![
             format!("Default executor: {}", state.default_executor),
             format!("Active executor: {}", state.active_executor),
-            "Executors:".to_string(),
         ];
+        if let Some(cwd) = &state.cwd {
+            lines.push(format!("Session cwd: {}", cwd.display()));
+        }
+        lines.push("Executors:".to_string());
         for descriptor in self.executor.list() {
             let binding = state.executor_bindings.get(&descriptor.name);
             let suffix = binding
@@ -472,6 +498,24 @@ where
             ));
         }
         lines.join("\n")
+    }
+
+    fn ensure_session_cwd(&self, state: &mut SessionState) -> anyhow::Result<Option<PathBuf>> {
+        let Some(root) = &self.workspace_root else {
+            return Ok(None);
+        };
+        let cwd = match &state.cwd {
+            Some(cwd) => cwd.clone(),
+            None => {
+                let cwd = root.join(session_workspace_dir_name(&state.session_key));
+                state.cwd = Some(cwd.clone());
+                cwd
+            }
+        };
+        std::fs::create_dir_all(&cwd)?;
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        state.cwd = Some(cwd.clone());
+        Ok(Some(cwd))
     }
 
     fn render_yolo_status_with_prefix(&self, prefix: &str, state: &SessionState) -> String {
@@ -580,12 +624,14 @@ fn update_binding_after_success(
     mut binding: ExecutorBinding,
     external_session_id: Option<String>,
     protocol: String,
+    cwd: Option<&Path>,
     handoff_fingerprints: Vec<String>,
     new_message_fingerprints: Vec<String>,
 ) -> ExecutorBinding {
     binding.protocol = protocol;
     binding.external_session_id = external_session_id;
     binding.health = ExecutorHealth::Healthy;
+    binding = binding_with_session_cwd(binding, cwd);
     binding.seen_context = merge_seen_context(
         &binding.seen_context,
         &[handoff_fingerprints, new_message_fingerprints].concat(),
@@ -597,14 +643,57 @@ fn update_binding_after_prompt_failure(
     mut binding: ExecutorBinding,
     prepared_session_id: Option<String>,
     protocol: String,
+    cwd: Option<&Path>,
 ) -> ExecutorBinding {
     binding.protocol = protocol;
     binding.health = ExecutorHealth::Unhealthy;
+    binding = binding_with_session_cwd(binding, cwd);
     if prepared_session_id != binding.external_session_id {
         binding.external_session_id = prepared_session_id;
         binding.seen_context.clear();
     }
     binding
+}
+
+fn binding_with_session_cwd(mut binding: ExecutorBinding, cwd: Option<&Path>) -> ExecutorBinding {
+    if let Some(cwd) = cwd {
+        binding.cwd = Some(cwd.display().to_string());
+    }
+    binding
+}
+
+fn session_workspace_dir_name(session_key: &str) -> String {
+    let raw_prefix = session_key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let mut prefix = raw_prefix
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if prefix.is_empty() {
+        prefix = "session".to_string();
+    }
+    if prefix.len() > 48 {
+        prefix.truncate(48);
+        prefix = prefix.trim_end_matches('-').to_string();
+        if prefix.is_empty() {
+            prefix = "session".to_string();
+        }
+    }
+    let digest = Sha256::digest(session_key.as_bytes());
+    let hash = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}-{hash}")
 }
 
 #[cfg(test)]
@@ -988,6 +1077,77 @@ mod tests {
                 .is_some()
         );
         assert_eq!(saved.executor_bindings["kimi"].protocol, "fake");
+    }
+
+    #[tokio::test]
+    async fn workspace_root_assigns_stable_distinct_session_cwds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_workspace_root(Some(workspace_root.clone()));
+        let mut output = CollectingRouterOutputSink::default();
+
+        for (session_key, text) in [
+            ("slack:dm:D1:111.000", "first"),
+            ("slack:dm:D1:222.000", "second"),
+            ("slack:dm:D1:111.000", "third"),
+        ] {
+            router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: text.to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+        }
+
+        let prepared = executor.prepared.lock().await;
+        let first_cwd = prepared[0].cwd.as_ref().unwrap();
+        let second_cwd = prepared[1].cwd.as_ref().unwrap();
+        let third_cwd = prepared[2].cwd.as_ref().unwrap();
+
+        assert!(first_cwd.starts_with(workspace_root.canonicalize().unwrap()));
+        assert!(first_cwd.is_dir());
+        assert!(second_cwd.is_dir());
+        assert_ne!(first_cwd, second_cwd);
+        assert_eq!(first_cwd, third_cwd);
+        assert!(
+            !first_cwd
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(':')
+        );
+
+        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let first_cwd_text = first_cwd.display().to_string();
+        assert_eq!(
+            saved.cwd.as_ref().unwrap().canonicalize().unwrap(),
+            first_cwd.clone()
+        );
+        assert_eq!(
+            saved.executor_bindings["kimi"].cwd.as_deref(),
+            Some(first_cwd_text.as_str())
+        );
+    }
+
+    #[test]
+    fn session_workspace_dir_name_is_safe_and_stable() {
+        let name = session_workspace_dir_name("slack:dm:D1:111.000");
+
+        assert!(name.starts_with("slack-dm-d1-111-000-"));
+        assert!(
+            name.chars()
+                .all(|ch| { ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' })
+        );
+        assert_eq!(name, session_workspace_dir_name("slack:dm:D1:111.000"));
+        assert_ne!(name, session_workspace_dir_name("slack:dm:D1:222.000"));
     }
 
     #[test]
