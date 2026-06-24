@@ -21,9 +21,9 @@ use crate::{
     },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
-        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
-        summarize_json_rpc_error,
+        ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
+        ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate,
+        PreparedExecutor, summarize_json_rpc_error,
     },
 };
 
@@ -797,15 +797,33 @@ fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
         .or_else(|| update.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("update");
-    let text = extract_text(update.get("content")).or_else(|| extract_text(update.get("text")));
+    let lower_kind = kind.to_ascii_lowercase();
+    let is_tool_update = lower_kind.contains("tool");
+    let tool = if is_tool_update {
+        update
+            .get("toolCall")
+            .or_else(|| update.get("tool_call"))
+            .unwrap_or(update)
+    } else {
+        update
+    };
+    let text = extract_text(update.get("content"))
+        .or_else(|| extract_text(update.get("text")))
+        .or_else(|| extract_text(tool.get("content")))
+        .or_else(|| extract_text(tool.get("rawInput")))
+        .or_else(|| extract_text(tool.get("raw_input")));
     let title = update
         .get("title")
         .or_else(|| update.get("name"))
+        .or_else(|| tool.get("title"))
+        .or_else(|| tool.get("name"))
+        .or_else(|| tool.get("kind"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
     let status = update
         .get("status")
+        .or_else(|| tool.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
@@ -813,7 +831,7 @@ fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
         "agent_message_chunk".to_string()
     } else if matches!(kind, "agent_thought_chunk" | "agent_thought") {
         "agent_thought_chunk".to_string()
-    } else if kind.contains("tool") {
+    } else if is_tool_update {
         format!("tool_{kind}")
     } else if kind.contains("plan") {
         "plan".to_string()
@@ -824,12 +842,41 @@ fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
     } else {
         kind.to_string()
     };
-    Some(ExecutorUpdate::new(
-        normalized_kind,
-        title,
-        text.unwrap_or_default(),
-        status,
-    ))
+    let text = text.unwrap_or_default();
+    let mut update =
+        ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
+    if is_tool_update {
+        update = update.with_channel_event(ExecutorChannelEvent::tool_call(
+            acp_tool_title(&title),
+            acp_tool_channel_summary(&title, &text, &status),
+        ));
+    }
+    Some(update)
+}
+
+fn acp_tool_title(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        "External agent tool".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+fn acp_tool_channel_summary(title: &str, text: &str, status: &str) -> String {
+    let mut lines = Vec::new();
+    let text = text.trim();
+    if !text.is_empty() {
+        lines.push(text.to_string());
+    }
+    let status = status.trim();
+    if !status.is_empty() {
+        lines.push(format!("status: {status}"));
+    }
+    if lines.is_empty() {
+        lines.push(acp_tool_title(title));
+    }
+    truncate_text(lines.join("\n"), 1_000)
 }
 
 fn extract_text(value: Option<&Value>) -> Option<String> {
@@ -880,7 +927,7 @@ mod tests {
 
     use crate::approval::ApprovalBroker;
     use crate::executor::{
-        ExecutorBackend, ExecutorPrepareRequest, ExecutorPromptRequest,
+        ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
         test_support::CollectingExecutorEventSink,
     };
 
@@ -911,6 +958,79 @@ mod tests {
                 .any(|option| option.id == "allow_once")
         );
         assert_eq!(request.allow_once_option_id(), None);
+    }
+
+    #[test]
+    fn acp_tool_update_projects_channel_event() {
+        let update = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Bash",
+                    "content": {"text": "$ cargo test"},
+                    "status": "completed"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(update.kind, "tool_tool_call");
+        assert_eq!(update.title, "Bash");
+        assert_eq!(update.text, "$ cargo test");
+        assert_eq!(update.status, "completed");
+        let event = update.channel_event.unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
+        assert_eq!(event.title, "Bash");
+        assert_eq!(event.text, "$ cargo test\nstatus: completed");
+
+        let nested = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCall": {
+                        "name": "read_file",
+                        "content": {"text": "src/main.rs"},
+                        "status": "failed"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let event = nested.channel_event.unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
+        assert_eq!(event.title, "read_file");
+        assert_eq!(event.text, "src/main.rs\nstatus: failed");
+    }
+
+    #[test]
+    fn acp_non_tool_updates_do_not_project_channel_events() {
+        let agent_message = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"text": "final answer"}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(agent_message.kind, "agent_message_chunk");
+        assert!(agent_message.channel_event.is_none());
+
+        let thought = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"text": "raw thought"}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(thought.kind, "agent_thought_chunk");
+        assert!(thought.channel_event.is_none());
     }
 
     #[tokio::test]
