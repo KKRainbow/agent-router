@@ -401,14 +401,8 @@ fn prune_empty_context_dirs(mut dir: Option<&Path>, base_path: &Path) -> anyhow:
         }
         match std::fs::remove_dir(path) {
             Ok(()) => dir = path.parent(),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                ) =>
-            {
-                break;
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => dir = path.parent(),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("remove empty context directory {}", path.display()));
@@ -990,6 +984,20 @@ mod tests {
         assert!(!tmp.path().join("slack/files/F1").exists());
         assert!(!tmp.path().join("slack/files").exists());
         assert!(tmp.path().join("slack").exists());
+    }
+
+    #[test]
+    fn prune_empty_context_dirs_continues_past_missing_child_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("slack");
+        let file_dir = base.join("files/F1");
+        std::fs::create_dir_all(&file_dir).unwrap();
+
+        prune_empty_context_dirs(Some(&file_dir.join("original")), &base).unwrap();
+
+        assert!(!file_dir.exists());
+        assert!(!base.join("files").exists());
+        assert!(base.exists());
     }
 
     #[test]
