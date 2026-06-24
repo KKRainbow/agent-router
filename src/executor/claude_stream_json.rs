@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, broadcast, oneshot};
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
 use crate::approval::{
     ApprovalBroker, ApprovalCancellation, ApprovalOption, ApprovalRequest, ApprovalSelection,
@@ -21,9 +21,8 @@ use crate::approval::{
 use crate::config::{ExecutorConfig, ExecutorProtocol};
 use crate::executor::{
     ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
-    ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
-    ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
-    TurnCancellation,
+    ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest,
+    ExecutorResponse, ExecutorUpdate, PreparedExecutor, TurnCancellation,
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -64,9 +63,16 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantContent {
-    Text { text: String },
-    Thinking { thinking: String },
-    ToolUse { name: String, input: serde_json::Value },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    ToolUse {
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -81,7 +87,9 @@ pub enum UserContent {
         content: serde_json::Value,
         is_error: Option<bool>,
     },
-    Text { text: String },
+    Text {
+        text: String,
+    },
 }
 
 pub fn parse_event_line(line: &str) -> Option<ClaudeEvent> {
@@ -965,15 +973,18 @@ async fn handle_event_line(
         return;
     };
 
-    if let ClaudeEvent::System { session_id: id, .. }
-        | ClaudeEvent::Result { session_id: id, .. } = &event
+    if let ClaudeEvent::System { session_id: id, .. } | ClaudeEvent::Result { session_id: id, .. } =
+        &event
         && let Some(id) = id.clone()
     {
         *session_id.lock().await = Some(id);
     }
 
     match event {
-        ClaudeEvent::ControlRequest { request_id, request } => {
+        ClaudeEvent::ControlRequest {
+            request_id,
+            request,
+        } => {
             let approval_req = build_approval_request(
                 session_key,
                 executor,
@@ -1126,11 +1137,9 @@ fn event_to_updates(event: ClaudeEvent) -> Vec<ExecutorUpdate> {
                     AssistantContent::ToolUse { name, input } => {
                         let text = serde_json::to_string(&input).unwrap_or_default();
                         updates.push(
-                            ExecutorUpdate::new("tool_call", &name, &text, "")
-                                .with_channel_event(ExecutorChannelEvent::tool_call(
-                                    name,
-                                    text.clone(),
-                                )),
+                            ExecutorUpdate::new("tool_call", &name, &text, "").with_channel_event(
+                                ExecutorChannelEvent::tool_call(name, text.clone()),
+                            ),
                         );
                     }
                 }
@@ -1150,11 +1159,11 @@ fn event_to_updates(event: ClaudeEvent) -> Vec<ExecutorUpdate> {
             }
         }
         ClaudeEvent::Result {
-            result,
-            subtype,
-            ..
+            result, subtype, ..
         } => {
-            if !is_compaction_result(subtype.as_deref()) && let Some(text) = result {
+            if !is_compaction_result(subtype.as_deref())
+                && let Some(text) = result
+            {
                 updates.push(ExecutorUpdate::new("result", "Result", text, ""));
             }
         }

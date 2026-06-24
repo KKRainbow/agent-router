@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Fake Claude Code CLI for integration tests.
 read -r _first_line
 cat <<'JSON'

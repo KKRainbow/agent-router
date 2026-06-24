@@ -8,8 +8,8 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorInterruptRequest,
         ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, PreparedExecutor,
-        TurnCancellation, acp::AcpExecutorManager,
-        claude_stream_json::ClaudeStreamJsonManager, codex_app_server::CodexAppServerManager,
+        TurnCancellation, acp::AcpExecutorManager, claude_stream_json::ClaudeStreamJsonManager,
+        codex_app_server::CodexAppServerManager,
     },
 };
 
