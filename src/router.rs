@@ -836,7 +836,6 @@ where
             }
         };
         ensure_dir_path_without_symlinks(&cwd)?;
-        let cwd = cwd.canonicalize().unwrap_or(cwd);
         state.cwd = Some(cwd.clone());
         Ok(Some(cwd))
     }
@@ -1194,13 +1193,15 @@ fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
                         );
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        std::fs::create_dir(&current).map_err(|err| {
-                            anyhow::anyhow!(
+                        if let Err(err) = std::fs::create_dir(&current)
+                            && err.kind() != std::io::ErrorKind::AlreadyExists
+                        {
+                            return Err(anyhow::anyhow!(
                                 "create session cwd directory {}: {}",
                                 current.display(),
                                 err
-                            )
-                        })?;
+                            ));
+                        }
                         let metadata = std::fs::symlink_metadata(&current).map_err(|err| {
                             anyhow::anyhow!(
                                 "stat session cwd directory {}: {}",
@@ -1770,6 +1771,53 @@ mod tests {
                 },
                 &mut output,
             )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        assert!(!outside.join("slack").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_context_rejects_symlink_session_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let session_key = "slack:channel:C1:111.000";
+        symlink(
+            &outside,
+            workspace_root.join(session_workspace_dir_name(session_key)),
+        )
+        .unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router =
+            AgentRouter::new("kimi", store, executor).with_workspace_root(Some(workspace_root));
+
+        let err = router
+            .sync_context(ContextSyncRequest {
+                session_key: session_key.to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:thread:C1:111.000".to_string(),
+                    kind: "slack_current_thread".to_string(),
+                    title: "Current Slack thread".to_string(),
+                    source_locator: Some("slack://C1/111.000".to_string()),
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/current-thread.md"),
+                        content: ContextFileContent::Text("thread".to_string()),
+                    }],
+                    metadata: BTreeMap::new(),
+                }],
+                remove_artifacts: Vec::new(),
+                unresolved: Vec::new(),
+            })
             .await
             .unwrap_err();
 
