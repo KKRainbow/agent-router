@@ -518,6 +518,7 @@ impl ClaudeSession {
         loop {
             tokio::select! {
                 _reason = cancel.cancelled() => {
+                    *self.active_user_id.lock().await = None;
                     self.close().await;
                     return ExecutorPromptOutcome::Cancelled;
                 }
@@ -529,10 +530,12 @@ impl ClaudeSession {
                                 break;
                             }
                             if let Err(err) = events.send(update).await {
+                                *self.active_user_id.lock().await = None;
                                 return ExecutorPromptOutcome::Failed(err);
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
+                            *self.active_user_id.lock().await = None;
                             return ExecutorPromptOutcome::Failed(anyhow::anyhow!(
                                 "claude update channel closed"
                             ));
@@ -551,6 +554,7 @@ impl ClaudeSession {
                         continue;
                     }
                     if let Err(err) = events.send(update).await {
+                        *self.active_user_id.lock().await = None;
                         return ExecutorPromptOutcome::Failed(err);
                     }
                 }
