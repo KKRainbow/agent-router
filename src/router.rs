@@ -437,6 +437,61 @@ struct PreparedContextSync {
     session_cwd: PathBuf,
 }
 
+impl PreparedContextSync {
+    async fn commit<S>(mut self, store: &S) -> anyhow::Result<()>
+    where
+        S: SessionStore + ?Sized,
+    {
+        let records = self.plan.commit()?;
+        self.state.context_artifacts = records;
+        store.save(self.state).await;
+        tracing::info!(
+            session_key = %self.session_key,
+            source = %self.source,
+            context_records = self.record_count,
+            unresolved_count = self.unresolved_count,
+            cwd = %self.session_cwd.display(),
+            "synced session context artifacts"
+        );
+        Ok(())
+    }
+
+    async fn commit_if_current<S>(mut self, turn: &TurnGuard, store: &S) -> anyhow::Result<bool>
+    where
+        S: SessionStore + ?Sized,
+    {
+        let cancel = turn.cancellation();
+        if cancel.is_cancelled().await || !turn.is_current().await {
+            return Ok(false);
+        }
+        let installed = self.plan.install()?;
+        if cancel.is_cancelled().await || !turn.is_current().await {
+            drop(installed);
+            return Ok(false);
+        }
+        let old_state = self.state.clone();
+        let records = installed.records().to_vec();
+        self.state.context_artifacts = records;
+        store.save(self.state).await;
+        if cancel.is_cancelled().await || !turn.is_current().await {
+            drop(installed);
+            store.save(old_state).await;
+            return Ok(false);
+        }
+        installed.finish();
+        tracing::info!(
+            session_key = %self.session_key,
+            source = %self.source,
+            context_records = self.record_count,
+            unresolved_count = self.unresolved_count,
+            cwd = %self.session_cwd.display(),
+            generation = turn.generation(),
+            "synced session context artifacts"
+        );
+        Ok(true)
+    }
+}
+
 impl<S, E> AgentRouter<S, E>
 where
     S: SessionStore,
@@ -633,60 +688,9 @@ where
         }))
     }
 
-    async fn commit_context_sync(&self, mut prepared: PreparedContextSync) -> anyhow::Result<()> {
-        let records = prepared.plan.commit()?;
-        prepared.state.context_artifacts = records;
-        self.store.save(prepared.state).await;
-        tracing::info!(
-            session_key = %prepared.session_key,
-            source = %prepared.source,
-            context_records = prepared.record_count,
-            unresolved_count = prepared.unresolved_count,
-            cwd = %prepared.session_cwd.display(),
-            "synced session context artifacts"
-        );
-        Ok(())
-    }
-
-    async fn commit_context_sync_if_current(
-        &self,
-        turn: &TurnGuard,
-        mut prepared: PreparedContextSync,
-    ) -> anyhow::Result<bool> {
-        let cancel = turn.cancellation();
-        if cancel.is_cancelled().await || !turn.is_current().await {
-            return Ok(false);
-        }
-        let installed = prepared.plan.install()?;
-        if cancel.is_cancelled().await || !turn.is_current().await {
-            drop(installed);
-            return Ok(false);
-        }
-        let old_state = prepared.state.clone();
-        let records = installed.records().to_vec();
-        prepared.state.context_artifacts = records;
-        self.store.save(prepared.state).await;
-        if cancel.is_cancelled().await || !turn.is_current().await {
-            drop(installed);
-            self.store.save(old_state).await;
-            return Ok(false);
-        }
-        installed.finish();
-        tracing::info!(
-            session_key = %prepared.session_key,
-            source = %prepared.source,
-            context_records = prepared.record_count,
-            unresolved_count = prepared.unresolved_count,
-            cwd = %prepared.session_cwd.display(),
-            generation = turn.generation(),
-            "synced session context artifacts"
-        );
-        Ok(true)
-    }
-
     async fn sync_context_locked(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
         if let Some(prepared) = self.prepare_context_sync_locked(request).await? {
-            self.commit_context_sync(prepared).await?;
+            prepared.commit(self.store.as_ref()).await?;
         }
         Ok(())
     }
@@ -868,14 +872,14 @@ where
                     }
                 };
                 if let Some(prepared) = prepared {
-                    let committed = match self.commit_context_sync_if_current(&turn, prepared).await
-                    {
-                        Ok(committed) => committed,
-                        Err(err) => {
-                            let _ = turn.finish_if_current().await;
-                            return Err(err);
-                        }
-                    };
+                    let committed =
+                        match prepared.commit_if_current(&turn, self.store.as_ref()).await {
+                            Ok(committed) => committed,
+                            Err(err) => {
+                                let _ = turn.finish_if_current().await;
+                                return Err(err);
+                            }
+                        };
                     if !committed {
                         tracing::debug!(
                             session_key = %session_key,
