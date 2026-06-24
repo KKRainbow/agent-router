@@ -390,7 +390,7 @@ pub struct ClaudeSession {
     approvals: SharedApprovalBroker,
     session_key: String,
     executor: String,
-    alive: AtomicBool,
+    alive: Arc<AtomicBool>,
     _shutdown_tx: oneshot::Sender<()>,
 }
 
@@ -437,6 +437,7 @@ impl ClaudeSession {
         let session_id = Arc::new(Mutex::new(None));
         let active_user_id = Arc::new(Mutex::new(None));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let alive = Arc::new(AtomicBool::new(true));
 
         tokio::spawn(read_stdout(
             BufReader::new(stdout),
@@ -449,6 +450,7 @@ impl ClaudeSession {
             executor.clone(),
             stdin.clone(),
             child.clone(),
+            alive.clone(),
             shutdown_rx,
         ));
 
@@ -463,7 +465,7 @@ impl ClaudeSession {
             approvals,
             session_key,
             executor,
-            alive: AtomicBool::new(true),
+            alive,
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -502,10 +504,11 @@ async fn read_stdout<R, E>(
     session_id: Arc<Mutex<Option<String>>>,
     _active_user_id: Arc<Mutex<Option<String>>>,
     _approvals: SharedApprovalBroker,
-    session_key: String,
-    executor: String,
-    stdin: SharedStdin,
+    _session_key: String,
+    _executor: String,
+    _stdin: SharedStdin,
     child: Arc<Mutex<Child>>,
+    alive: Arc<AtomicBool>,
     mut shutdown: oneshot::Receiver<()>,
 ) where
     R: AsyncBufReadExt + Unpin,
@@ -526,17 +529,7 @@ async fn read_stdout<R, E>(
                 match res {
                     Ok(0) => break,
                     Ok(_) => {
-                        handle_event_line(
-                            &stdout_line,
-                            updates.clone(),
-                            &session_id,
-                            _approvals.clone(),
-                            session_key.clone(),
-                            executor.clone(),
-                            &_active_user_id,
-                            stdin.clone(),
-                        )
-                        .await;
+                        handle_event_line(&stdout_line, updates.clone(), &session_id).await;
                     }
                     Err(err) => {
                         tracing::warn!(target: "agent_router::claude", error = %err, "stdout read error");
@@ -562,6 +555,7 @@ async fn read_stdout<R, E>(
         }
     }
 
+    alive.store(false, Ordering::Relaxed);
     let mut child = child.lock().await;
     if let Err(err) = child.start_kill() {
         tracing::warn!(target: "agent_router::claude", error = %err, "failed to kill claude child");
@@ -569,18 +563,11 @@ async fn read_stdout<R, E>(
     let _ = child.wait().await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_event_line(
     line: &str,
     updates: broadcast::Sender<ExecutorUpdate>,
     session_id: &Arc<Mutex<Option<String>>>,
-    _approvals: SharedApprovalBroker,
-    session_key: String,
-    executor: String,
-    _user_id: &Arc<Mutex<Option<String>>>,
-    stdin: SharedStdin,
 ) {
-    let _ = (session_key, executor, stdin);
     let Some(event) = parse_event_line(line) else {
         return;
     };
