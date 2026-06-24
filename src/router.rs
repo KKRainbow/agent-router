@@ -53,6 +53,7 @@ pub struct RouterChannelEvent {
 impl RouterChannelEvent {
     pub fn render_text(&self) -> String {
         let heading = match self.kind {
+            RouterChannelEventKind::AgentProgress => "Progress".to_string(),
             RouterChannelEventKind::ReasoningSummary => "Reasoning summary".to_string(),
             RouterChannelEventKind::ToolCall if self.title.trim().is_empty() => {
                 "Tool call".to_string()
@@ -76,6 +77,7 @@ fn render_compact_channel_events_inner(
     suppress_single_successful_tool: bool,
 ) -> Option<String> {
     let first = events.first()?;
+    let mut latest_progress = None;
     let mut latest_reasoning = None;
     let mut tool_total = 0usize;
     let mut command_counts: Vec<(String, usize)> = Vec::new();
@@ -84,6 +86,9 @@ fn render_compact_channel_events_inner(
 
     for event in events {
         match event.kind {
+            RouterChannelEventKind::AgentProgress => {
+                latest_progress = Some(truncate_chars(one_line(&event.text).as_str(), 240));
+            }
             RouterChannelEventKind::ReasoningSummary => {
                 latest_reasoning = Some(truncate_chars(one_line(&event.text).as_str(), 240));
             }
@@ -106,6 +111,7 @@ fn render_compact_channel_events_inner(
     }
 
     if suppress_single_successful_tool
+        && latest_progress.is_none()
         && latest_reasoning.is_none()
         && attention.is_empty()
         && tool_total <= 1
@@ -130,6 +136,11 @@ fn render_compact_channel_events_inner(
         if remaining > 0 {
             lines.push(format!("- {remaining} more"));
         }
+    }
+    if let Some(progress) = latest_progress
+        && !progress.is_empty()
+    {
+        lines.push(format!("Progress: {progress}"));
     }
     Some(lines.join("\n"))
 }
@@ -275,6 +286,7 @@ fn one_line(text: &str) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouterChannelEventKind {
+    AgentProgress,
     ReasoningSummary,
     ToolCall,
 }
@@ -505,7 +517,16 @@ where
         let session_key = request.session_key.clone();
         let source = request.source.clone();
         let unresolved_count = request.unresolved.len();
-        let records = write_context_sync(&session_cwd, request, &state.context_artifacts)?;
+        let existing_context = if state
+            .context_artifacts
+            .iter()
+            .any(|record| record.source == source)
+        {
+            state.context_artifacts.clone()
+        } else {
+            read_context_artifacts_from_manifest(&session_cwd, &source, Path::new(&source))?
+        };
+        let records = write_context_sync(&session_cwd, request, &existing_context)?;
         let record_count = records.len();
         state.context_artifacts = records;
         self.store.save(state).await;
@@ -971,6 +992,7 @@ fn channel_event_from_executor_update(
 
 fn router_channel_event_kind(kind: ExecutorChannelEventKind) -> RouterChannelEventKind {
     match kind {
+        ExecutorChannelEventKind::AgentProgress => RouterChannelEventKind::AgentProgress,
         ExecutorChannelEventKind::ReasoningSummary => RouterChannelEventKind::ReasoningSummary,
         ExecutorChannelEventKind::ToolCall => RouterChannelEventKind::ToolCall,
     }
@@ -1062,12 +1084,15 @@ mod tests {
         executor::{ExecutorChannelEvent, test_support::FakeExecutorBackend},
         session::{
             TranscriptMessage,
-            context::{ContextArtifactInput, ContextFileContent, ContextFileInput},
+            context::{
+                ContextArtifactInput, ContextFileContent, ContextFileInput, ContextSyncIssueInput,
+            },
             projection::message_fingerprint,
             store::InMemorySessionStore,
         },
     };
-    use std::time::Duration;
+    use serde_json::json;
+    use std::{collections::BTreeMap, time::Duration};
 
     #[derive(Debug, Default)]
     struct CollectingRouterOutputSink {
@@ -1643,10 +1668,74 @@ mod tests {
         assert!(!prompts[1].prompt.contains("Synced session context files"));
     }
 
+    #[tokio::test]
+    async fn context_artifacts_can_be_recovered_from_workspace_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:channel:C1:111.000";
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let first_store = Arc::new(InMemorySessionStore::default());
+        let first_router = AgentRouter::new("kimi", first_store, executor.clone())
+            .with_workspace_root(Some(workspace_root.clone()));
+
+        first_router
+            .sync_context(ContextSyncRequest {
+                session_key: session_key.to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:file:F1".to_string(),
+                    kind: "slack_file".to_string(),
+                    title: "Slack file F1".to_string(),
+                    source_locator: None,
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/files/F1/metadata.json"),
+                        content: ContextFileContent::Text("{}".to_string()),
+                    }],
+                    metadata: BTreeMap::from([("file_id".to_string(), json!("F1"))]),
+                }],
+                unresolved: vec![ContextSyncIssueInput {
+                    kind: "file".to_string(),
+                    reference: "F2".to_string(),
+                    reason: "transient".to_string(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let restarted_store = Arc::new(InMemorySessionStore::default());
+        let restarted_router = AgentRouter::new("kimi", restarted_store, executor)
+            .with_workspace_root(Some(workspace_root));
+        let artifacts = restarted_router
+            .context_artifacts(session_key, "slack")
+            .await
+            .unwrap();
+
+        assert!(artifacts.iter().any(|record| record.kind == "slack_file"));
+        let manifest = artifacts
+            .iter()
+            .find(|record| record.kind == "manifest")
+            .unwrap();
+        assert_eq!(manifest.metadata["unresolved_count"].as_u64(), Some(1));
+        assert_eq!(
+            manifest.metadata["unresolved"][0]["reference"].as_str(),
+            Some("F2")
+        );
+    }
+
     #[test]
-    fn channel_events_include_reasoning_and_tool_updates_only() {
+    fn channel_events_include_progress_reasoning_and_tool_updates_only() {
         let updates = [
             ExecutorUpdate::new("plan", "Plan", "working", ""),
+            ExecutorUpdate::new(
+                "agent_message_chunk",
+                "",
+                "I will inspect the config first.",
+                "",
+            )
+            .with_channel_event(ExecutorChannelEvent::agent_progress(
+                "I will inspect the config first.",
+            )),
             ExecutorUpdate::new(
                 "agent_thought_chunk",
                 "Reasoning",
@@ -1665,15 +1754,20 @@ mod tests {
             .filter_map(|update| channel_event_from_executor_update("codex", update))
             .collect::<Vec<_>>();
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind, RouterChannelEventKind::ToolCall);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind, RouterChannelEventKind::AgentProgress);
         assert_eq!(
             events[0].render_text(),
-            "[codex] Tool call: Bash\n$ cargo test"
+            "[codex] Progress\nI will inspect the config first."
         );
-        assert_eq!(events[1].kind, RouterChannelEventKind::ReasoningSummary);
+        assert_eq!(events[1].kind, RouterChannelEventKind::ToolCall);
         assert_eq!(
             events[1].render_text(),
+            "[codex] Tool call: Bash\n$ cargo test"
+        );
+        assert_eq!(events[2].kind, RouterChannelEventKind::ReasoningSummary);
+        assert_eq!(
+            events[2].render_text(),
             "[codex] Reasoning summary\nI should inspect the config."
         );
     }
@@ -1706,8 +1800,37 @@ mod tests {
     }
 
     #[test]
+    fn compact_channel_events_include_latest_progress() {
+        let events = vec![
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "codex".to_string(),
+                title: "Progress".to_string(),
+                text: "I will inspect the config first.".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "codex".to_string(),
+                title: "Progress".to_string(),
+                text: "Now I will add the focused test.".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            render_compact_channel_events(&events).as_deref(),
+            Some("[codex] Activity\nProgress: Now I will add the focused test.")
+        );
+    }
+
+    #[test]
     fn compact_channel_events_group_activity() {
         let events = vec![
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "codex".to_string(),
+                title: "Progress".to_string(),
+                text: "I will inspect the failing test first.".to_string(),
+            },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ReasoningSummary,
                 executor: "codex".to_string(),
@@ -1749,7 +1872,7 @@ mod tests {
         assert_eq!(
             render_compact_channel_events(&events).as_deref(),
             Some(
-                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `cargo test -q`\n- `sleep 3` x3\nTools:\n- read_file"
+                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `cargo test -q`\n- `sleep 3` x3\nTools:\n- read_file\nProgress: I will inspect the failing test first."
             )
         );
     }

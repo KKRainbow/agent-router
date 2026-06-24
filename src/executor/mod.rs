@@ -95,6 +95,14 @@ pub struct ExecutorChannelEvent {
 }
 
 impl ExecutorChannelEvent {
+    pub fn agent_progress(text: impl Into<String>) -> Self {
+        Self {
+            kind: ExecutorChannelEventKind::AgentProgress,
+            title: "Progress".to_string(),
+            text: text.into(),
+        }
+    }
+
     pub fn reasoning_summary(text: impl Into<String>) -> Self {
         Self {
             kind: ExecutorChannelEventKind::ReasoningSummary,
@@ -114,6 +122,7 @@ impl ExecutorChannelEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutorChannelEventKind {
+    AgentProgress,
     ReasoningSummary,
     ToolCall,
 }

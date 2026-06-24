@@ -1106,13 +1106,19 @@ fn collect_codex_notification(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            *final_text = text.clone();
-            updates.push(ExecutorUpdate::new(
+            let phase = item.get("phase").and_then(Value::as_str).unwrap_or("");
+            let mut update = ExecutorUpdate::new(
                 "agent_message_chunk",
                 String::new(),
-                text,
+                text.clone(),
                 String::new(),
-            ));
+            );
+            if phase == "commentary" {
+                update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text));
+            } else {
+                *final_text = text;
+            }
+            updates.push(update);
         }
         "reasoning" => {
             let summary = extract_text(item.get("summary"));
@@ -1446,6 +1452,79 @@ mod tests {
             collected.updates[0].summary(700).as_deref(),
             Some("Reasoning: safe summary")
         );
+    }
+
+    #[test]
+    fn codex_commentary_agent_message_emits_progress_event() {
+        let mut final_text = String::new();
+
+        let collected = collect_codex_notification(
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": "I will inspect the config first."
+                    }
+                }
+            }),
+            &mut final_text,
+        )
+        .unwrap();
+
+        assert!(final_text.is_empty());
+        assert_eq!(collected.updates.len(), 1);
+        assert_eq!(collected.updates[0].kind, "agent_message_chunk");
+        assert_eq!(
+            collected.updates[0].text,
+            "I will inspect the config first."
+        );
+        let event = collected.updates[0].channel_event.as_ref().unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::AgentProgress);
+        assert_eq!(event.text, "I will inspect the config first.");
+    }
+
+    #[test]
+    fn codex_final_agent_message_does_not_emit_progress_event() {
+        let mut final_text = String::new();
+
+        let collected = collect_codex_notification(
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "done"
+                    }
+                }
+            }),
+            &mut final_text,
+        )
+        .unwrap();
+
+        assert_eq!(final_text, "done");
+        assert_eq!(collected.updates.len(), 1);
+        assert!(collected.updates[0].channel_event.is_none());
+    }
+
+    #[test]
+    fn codex_legacy_agent_message_remains_final_reply_only() {
+        let mut final_text = String::new();
+
+        let collected = collect_codex_notification(
+            json!({
+                "method": "item/completed",
+                "params": {"item": {"type": "agentMessage", "text": "legacy reply"}}
+            }),
+            &mut final_text,
+        )
+        .unwrap();
+
+        assert_eq!(final_text, "legacy reply");
+        assert_eq!(collected.updates.len(), 1);
+        assert!(collected.updates[0].channel_event.is_none());
     }
 
     #[test]
