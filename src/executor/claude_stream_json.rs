@@ -12,7 +12,10 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::approval::SharedApprovalBroker;
 use crate::config::ExecutorConfig;
-use crate::executor::{ExecutorChannelEvent, ExecutorUpdate};
+use crate::executor::{
+    ExecutorChannelEvent, ExecutorEventSink, ExecutorPromptOutcome, ExecutorResponse,
+    ExecutorUpdate, TurnCancellation,
+};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -493,6 +496,87 @@ impl ClaudeSession {
             .context("write to claude stdin")?;
         stdin.flush().await.context("flush claude stdin")?;
         Ok(())
+    }
+
+    pub async fn run_turn(
+        &self,
+        prompt: &str,
+        user_id: Option<String>,
+        events: &mut dyn ExecutorEventSink,
+        cancel: TurnCancellation,
+    ) -> ExecutorPromptOutcome {
+        *self.active_user_id.lock().await = user_id;
+
+        if let Err(err) = self.send_prompt(prompt).await {
+            *self.active_user_id.lock().await = None;
+            return ExecutorPromptOutcome::Failed(err);
+        }
+
+        let mut rx = self.subscribe();
+        let mut final_text;
+
+        loop {
+            tokio::select! {
+                _reason = cancel.cancelled() => {
+                    self.close().await;
+                    return ExecutorPromptOutcome::Cancelled;
+                }
+                update = rx.recv() => {
+                    match update {
+                        Ok(update) => {
+                            if update.kind == "result" {
+                                final_text = update.text;
+                                break;
+                            }
+                            if let Err(err) = events.send(update).await {
+                                return ExecutorPromptOutcome::Failed(err);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return ExecutorPromptOutcome::Failed(anyhow::anyhow!(
+                                "claude update channel closed"
+                            ));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            }
+        }
+
+        loop {
+            match rx.try_recv() {
+                Ok(update) => {
+                    if update.kind == "result" {
+                        final_text = update.text;
+                        continue;
+                    }
+                    if let Err(err) = events.send(update).await {
+                        return ExecutorPromptOutcome::Failed(err);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+
+        *self.active_user_id.lock().await = None;
+        ExecutorPromptOutcome::Completed(ExecutorResponse { final_text })
+    }
+
+    pub async fn close(&self) {
+        self.alive.store(false, Ordering::Relaxed);
+
+        let mut stdin = self.stdin.lock().await;
+        if let Err(err) = stdin.shutdown().await {
+            tracing::warn!(target: "agent_router::claude", error = %err, "failed to shutdown claude stdin");
+        }
+        drop(stdin);
+
+        let mut child = self.child.lock().await;
+        if let Err(err) = child.start_kill() {
+            tracing::warn!(target: "agent_router::claude", error = %err, "failed to kill claude child");
+        }
     }
 }
 
