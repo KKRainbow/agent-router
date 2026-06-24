@@ -39,6 +39,9 @@ impl ExecutorRegistry {
         match cfg.protocol {
             ExecutorProtocol::Acp => Ok(&self.acp),
             ExecutorProtocol::AppServer => Ok(&self.codex_app_server),
+            ExecutorProtocol::ClaudeStreamJson => {
+                anyhow::bail!("executor `{executor}` protocol `claude_stream_json` is not yet implemented")
+            }
         }
     }
 }

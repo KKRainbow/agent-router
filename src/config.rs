@@ -80,6 +80,7 @@ pub enum ChannelEventMode {
 pub enum ExecutorProtocol {
     Acp,
     AppServer,
+    ClaudeStreamJson,
 }
 
 #[derive(Debug, Clone)]
@@ -451,12 +452,14 @@ fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Resul
     let protocol = match raw.protocol.as_deref().unwrap_or("acp") {
         "acp" => ExecutorProtocol::Acp,
         "app_server" | "codex_app_server" => ExecutorProtocol::AppServer,
+        "claude_stream_json" => ExecutorProtocol::ClaudeStreamJson,
         other => anyhow::bail!("executors.{name}.protocol `{other}` is not supported in MVP"),
     };
     let command = raw
         .command
         .filter(|value| !value.trim().is_empty())
         .or_else(|| (protocol == ExecutorProtocol::AppServer).then(|| "codex".to_string()))
+        .or_else(|| (protocol == ExecutorProtocol::ClaudeStreamJson).then(|| "claude".to_string()))
         .ok_or_else(|| anyhow::anyhow!("executors.{name}.command is required"))?;
     let args = match raw.args {
         Some(args) => args,
@@ -731,6 +734,32 @@ executors:
         assert_eq!(codex.protocol, ExecutorProtocol::AppServer);
         assert_eq!(codex.command, "codex");
         assert_eq!(codex.args, ["app-server"]);
+    }
+
+    #[test]
+    fn parses_claude_stream_json_executor_config() {
+        let raw = r#"
+router:
+  default_executor: claude
+executors:
+  claude:
+    protocol: claude_stream_json
+    args: ["--verbose"]
+    env:
+      CLAUDE_CODE_DIR: /tmp/claude
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let claude = cfg.executors.get("claude").unwrap();
+
+        assert_eq!(cfg.router.default_executor, "claude");
+        assert_eq!(claude.protocol, ExecutorProtocol::ClaudeStreamJson);
+        assert_eq!(claude.command, "claude");
+        assert_eq!(claude.args, ["--verbose"]);
+        assert_eq!(
+            claude.env.get("CLAUDE_CODE_DIR"),
+            Some(&"/tmp/claude".to_string())
+        );
     }
 
     #[test]
