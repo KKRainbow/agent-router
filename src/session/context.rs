@@ -104,7 +104,7 @@ pub fn write_context_sync(
         .flat_map(context_resolved_issue_keys)
         .collect::<BTreeSet<_>>();
     let unresolved = merge_context_unresolved(
-        read_existing_unresolved(cwd, &request.source, existing)?,
+        read_existing_unresolved(cwd, &request.source, &request.base_path, existing)?,
         request.unresolved,
         &resolved_issue_keys,
     );
@@ -296,6 +296,7 @@ pub fn merge_context_artifacts(
 fn read_existing_unresolved(
     cwd: &Path,
     source: &str,
+    base_path: &Path,
     existing: &[ContextArtifactRecord],
 ) -> anyhow::Result<Vec<ContextSyncIssueInput>> {
     let Some(manifest) = existing
@@ -308,7 +309,9 @@ fn read_existing_unresolved(
         return Ok(Vec::new());
     };
     let manifest_rel = PathBuf::from(manifest_path);
-    validate_relative_path(&manifest_rel)?;
+    if validate_source_context_path(base_path, &manifest_rel).is_err() {
+        return Ok(Vec::new());
+    }
     let path = cwd.join(&manifest_rel);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -319,6 +322,9 @@ fn read_existing_unresolved(
     };
     let snapshot = serde_json::from_slice::<ContextManifestSnapshot>(&bytes)
         .with_context(|| format!("parse context manifest {}", path.display()))?;
+    if snapshot.source != source {
+        return Ok(Vec::new());
+    }
     Ok(snapshot.unresolved)
 }
 
@@ -682,6 +688,111 @@ mod tests {
         let manifest = std::fs::read_to_string(tmp.path().join("slack/manifest.json")).unwrap();
         let manifest = serde_json::from_str::<Value>(&manifest).unwrap();
 
+        assert_eq!(manifest["unresolved"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_context_sync_ignores_existing_manifest_outside_base_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("other")).unwrap();
+        std::fs::write(
+            tmp.path().join("other/manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "source": "slack",
+                "session_key": "s1",
+                "synced_at_ms": 1,
+                "artifacts": [],
+                "unresolved": [{
+                    "kind": "file",
+                    "reference": "F1",
+                    "reason": "wrong manifest"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let existing = vec![ContextArtifactRecord {
+            id: "slack:manifest".to_string(),
+            source: "slack".to_string(),
+            kind: "manifest".to_string(),
+            title: "Bad manifest".to_string(),
+            source_locator: None,
+            paths: vec!["other/manifest.json".to_string()],
+            fingerprint: "artifact:bad-manifest".to_string(),
+            updated_at_ms: 1,
+            metadata: BTreeMap::new(),
+        }];
+
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        let records = write_context_sync(tmp.path(), request, &existing).unwrap();
+        let manifest = std::fs::read_to_string(tmp.path().join("slack/manifest.json")).unwrap();
+        let manifest = serde_json::from_str::<Value>(&manifest).unwrap();
+
+        assert_eq!(manifest["unresolved"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.kind == "manifest")
+                .unwrap()
+                .paths,
+            vec!["slack/manifest.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn write_context_sync_ignores_existing_manifest_for_other_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("slack")).unwrap();
+        std::fs::write(
+            tmp.path().join("slack/manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "source": "other",
+                "session_key": "s1",
+                "synced_at_ms": 1,
+                "artifacts": [],
+                "unresolved": [{
+                    "kind": "file",
+                    "reference": "F1",
+                    "reason": "wrong source"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let existing = vec![ContextArtifactRecord {
+            id: "slack:manifest".to_string(),
+            source: "slack".to_string(),
+            kind: "manifest".to_string(),
+            title: "Wrong-source manifest".to_string(),
+            source_locator: None,
+            paths: vec!["slack/manifest.json".to_string()],
+            fingerprint: "artifact:wrong-source-manifest".to_string(),
+            updated_at_ms: 1,
+            metadata: BTreeMap::new(),
+        }];
+
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        write_context_sync(tmp.path(), request, &existing).unwrap();
+        let manifest = std::fs::read_to_string(tmp.path().join("slack/manifest.json")).unwrap();
+        let manifest = serde_json::from_str::<Value>(&manifest).unwrap();
+
+        assert_eq!(manifest["source"].as_str(), Some("slack"));
         assert_eq!(manifest["unresolved"].as_array().unwrap().len(), 0);
     }
 
