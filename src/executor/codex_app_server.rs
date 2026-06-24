@@ -37,6 +37,11 @@ type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
 
+struct CodexServerRequest {
+    message: Value,
+    pending_file_change: Option<String>,
+}
+
 struct CodexTurnScope {
     cancelled: ApprovalCancellation,
 }
@@ -397,8 +402,14 @@ impl CodexAppServerSession {
         let mut server_requests = self.client.subscribe_server_requests();
         let mut closed = self.client.subscribe_closed();
         let turn_scope = CodexTurnScope::new();
-        let mut server_request_handlers = Vec::new();
         let (server_response_tx, mut server_responses) = mpsc::channel(64);
+        let (server_request_tx, server_request_rx) = mpsc::channel(64);
+        let server_request_handler = self.spawn_server_request_worker(
+            server_request_rx,
+            user_id.clone(),
+            server_response_tx.clone(),
+            turn_scope.subscribe(),
+        );
         let mut turn_start = self
             .client
             .request_started(
@@ -449,12 +460,17 @@ impl CodexAppServerSession {
                                 }
                                 continue;
                             }
-                            server_request_handlers.push(self.spawn_server_request_handler(
-                                request,
-                                user_id.clone(),
-                                server_response_tx.clone(),
-                                turn_scope.subscribe(),
-                            ));
+                            server_request_tx
+                                .send(CodexServerRequest {
+                                    pending_file_change: self.pending_file_change_summary(
+                                        request.get("params").unwrap_or(&Value::Null),
+                                    ),
+                                    message: request,
+                                })
+                                .await
+                                .map_err(|_| {
+                                    anyhow::anyhow!("codex app-server request worker closed")
+                                })?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => {
@@ -476,6 +492,22 @@ impl CodexAppServerSession {
                                 break;
                             }
                             continue;
+                        }
+                        if !turn_start_acknowledged && turn_start_timeout.as_ref().is_elapsed() {
+                            self.client.cancel_pending(turn_start.id).await;
+                            self.client.close("codex app-server turn/start timed out").await;
+                            anyhow::bail!(
+                                "codex app-server `turn/start` timed out after {}s",
+                                self.limits.rpc_timeout.as_secs()
+                            );
+                        }
+                        if idle_timeout.as_ref().is_elapsed() {
+                            self.client.cancel_pending(turn_start.id).await;
+                            self.client.close("codex app-server idle timed out").await;
+                            anyhow::bail!(
+                                "codex app-server idle timed out after {}s without activity",
+                                self.limits.idle_timeout.as_secs()
+                            );
                         }
                         write_json(&self.client.stdin, response).await?;
                     }
@@ -529,10 +561,9 @@ impl CodexAppServerSession {
         }
         .await;
 
+        drop(server_request_tx);
         turn_scope.cancel();
-        for handler in server_request_handlers {
-            let _ = handler.await;
-        }
+        let _ = server_request_handler.await;
         result
     }
 
@@ -582,9 +613,9 @@ impl CodexAppServerSession {
         Ok(())
     }
 
-    fn spawn_server_request_handler(
+    fn spawn_server_request_worker(
         &self,
-        message: Value,
+        mut requests: mpsc::Receiver<CodexServerRequest>,
         user_id: Option<String>,
         responses: mpsc::Sender<Value>,
         turn_cancelled: ApprovalCancellation,
@@ -592,35 +623,45 @@ impl CodexAppServerSession {
         let approvals = self.approvals.clone();
         let session_key = self.session_key.clone();
         let executor = self.executor.clone();
-        let pending_file_change =
-            self.pending_file_change_summary(message.get("params").unwrap_or(&Value::Null));
-        let response_cancelled = turn_cancelled.clone();
 
         tokio::spawn(async move {
-            match Self::handle_server_request(
-                approvals,
-                session_key,
-                executor,
-                user_id,
-                message,
-                pending_file_change,
-                turn_cancelled,
-            )
-            .await
-            {
-                Ok(Some(response)) => {
-                    tokio::select! {
-                        result = responses.send(response) => {
-                            if result.is_err() {
-                                tracing::debug!("dropping Codex app-server response for closed turn");
+            loop {
+                let request = tokio::select! {
+                    biased;
+                    _ = wait_turn_cancelled(turn_cancelled.clone()) => break,
+                    request = requests.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        request
+                    }
+                };
+                match Self::handle_server_request(
+                    approvals.clone(),
+                    session_key.clone(),
+                    executor.clone(),
+                    user_id.clone(),
+                    request.message,
+                    request.pending_file_change,
+                    turn_cancelled.clone(),
+                )
+                .await
+                {
+                    Ok(Some(response)) => {
+                        tokio::select! {
+                            biased;
+                            _ = wait_turn_cancelled(turn_cancelled.clone()) => {}
+                            result = responses.send(response) => {
+                                if result.is_err() {
+                                    tracing::debug!("dropping Codex app-server response for closed turn");
+                                }
                             }
                         }
-                        _ = wait_turn_cancelled(response_cancelled) => {}
                     }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to handle Codex app-server request");
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to handle Codex app-server request");
+                    }
                 }
             }
         })

@@ -268,8 +268,9 @@ impl ApprovalBroker {
         cancel: ApprovalCancellation,
     ) -> Option<ApprovalSelection> {
         let auto_selection = tokio::select! {
-            selection = self.policy.auto_selection(&request) => selection,
+            biased;
             _ = cancel.cancelled() => return None,
+            selection = self.policy.auto_selection(&request) => selection,
         };
         if let Some(selection) = auto_selection {
             if let ApprovalSelection::Selected(option_id) = &selection {
@@ -316,13 +317,14 @@ impl ApprovalBroker {
         }
 
         let selection = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
             selection = time::timeout(self.timeout, rx) => {
                 Some(match selection {
                     Ok(Ok(selection)) => selection,
                     Ok(Err(_)) | Err(_) => ApprovalSelection::Cancelled,
                 })
             }
-            _ = cancel.cancelled() => None,
         };
         self.remove_pending(&id).await;
         selection
