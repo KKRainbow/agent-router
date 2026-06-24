@@ -8,7 +8,8 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorInterruptRequest,
         ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, PreparedExecutor,
-        TurnCancellation, acp::AcpExecutorManager, codex_app_server::CodexAppServerManager,
+        TurnCancellation, acp::AcpExecutorManager,
+        claude_stream_json::ClaudeStreamJsonManager, codex_app_server::CodexAppServerManager,
     },
 };
 
@@ -16,6 +17,7 @@ use crate::{
 pub struct ExecutorRegistry {
     executors: BTreeMap<String, ExecutorConfig>,
     acp: AcpExecutorManager,
+    claude_stream_json: ClaudeStreamJsonManager,
     codex_app_server: CodexAppServerManager,
 }
 
@@ -26,6 +28,10 @@ impl ExecutorRegistry {
     ) -> Self {
         Self {
             acp: AcpExecutorManager::with_approvals(executors.clone(), approvals.clone()),
+            claude_stream_json: ClaudeStreamJsonManager::with_approvals(
+                executors.clone(),
+                approvals.clone(),
+            ),
             codex_app_server: CodexAppServerManager::with_approvals(executors.clone(), approvals),
             executors,
         }
@@ -39,9 +45,7 @@ impl ExecutorRegistry {
         match cfg.protocol {
             ExecutorProtocol::Acp => Ok(&self.acp),
             ExecutorProtocol::AppServer => Ok(&self.codex_app_server),
-            ExecutorProtocol::ClaudeStreamJson => {
-                anyhow::bail!("executor `{executor}` protocol `claude_stream_json` is not yet implemented")
-            }
+            ExecutorProtocol::ClaudeStreamJson => Ok(&self.claude_stream_json),
         }
     }
 }
@@ -54,6 +58,7 @@ impl ExecutorBackend for ExecutorRegistry {
 
     fn list(&self) -> Vec<ExecutorDescriptor> {
         let mut executors = self.acp.list();
+        executors.extend(self.claude_stream_json.list());
         executors.extend(self.codex_app_server.list());
         executors.sort_by(|left, right| left.name.cmp(&right.name));
         executors
@@ -100,6 +105,17 @@ mod tests {
     fn mixed_executor_config() -> BTreeMap<String, ExecutorConfig> {
         BTreeMap::from([
             (
+                "claude".to_string(),
+                ExecutorConfig {
+                    name: "claude".to_string(),
+                    protocol: ExecutorProtocol::ClaudeStreamJson,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+            (
                 "codex".to_string(),
                 ExecutorConfig {
                     name: "codex".to_string(),
@@ -138,6 +154,7 @@ mod tests {
         assert_eq!(
             executors,
             [
+                ("claude".to_string(), "claude_stream_json".to_string()),
                 ("codex".to_string(), "app_server".to_string()),
                 ("kimi".to_string(), "acp".to_string()),
             ]
@@ -151,6 +168,10 @@ mod tests {
 
         assert_eq!(registry.get("kimi").unwrap().protocol, "acp");
         assert_eq!(registry.get("codex").unwrap().protocol, "app_server");
+        assert_eq!(
+            registry.get("claude").unwrap().protocol,
+            "claude_stream_json"
+        );
         assert!(registry.get("missing").is_none());
     }
 }
