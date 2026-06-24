@@ -28,10 +28,18 @@ use crate::{
 };
 
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
+type SharedAcpToolCalls = Arc<Mutex<HashMap<String, AcpToolCallState>>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 type SessionKey = (String, String);
 type SharedAcpSession = Arc<Mutex<AcpSession>>;
 type SessionMap = HashMap<SessionKey, SharedAcpSession>;
+
+#[derive(Debug, Default)]
+struct AcpToolCallState {
+    title: String,
+    text: String,
+    status: String,
+}
 
 #[derive(Debug)]
 pub struct AcpExecutorManager {
@@ -422,6 +430,7 @@ struct JsonRpcState {
 #[derive(Debug, Clone)]
 struct JsonRpcServerContext {
     state: SharedJsonRpcState,
+    tool_calls: SharedAcpToolCalls,
     stdin: SharedStdin,
     updates: broadcast::Sender<ExecutorUpdate>,
     approvals: SharedApprovalBroker,
@@ -482,11 +491,13 @@ impl JsonRpcClient {
 
         let stdin = Arc::new(Mutex::new(stdin));
         let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let tool_calls = Arc::new(Mutex::new(HashMap::new()));
         let (updates, _) = broadcast::channel(256);
         let child = Arc::new(Mutex::new(child));
         let active_user_id = Arc::new(Mutex::new(None));
         let server_context = JsonRpcServerContext {
             state: state.clone(),
+            tool_calls,
             stdin: stdin.clone(),
             updates: updates.clone(),
             approvals,
@@ -628,10 +639,14 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
         return;
     }
 
-    if message.get("method").and_then(Value::as_str) == Some("session/update")
-        && let Some(update) = project_acp_update(&message)
-    {
-        let _ = context.updates.send(update);
+    if message.get("method").and_then(Value::as_str) == Some("session/update") {
+        let update = {
+            let mut tool_calls = context.tool_calls.lock().await;
+            project_acp_update_with_state(&message, &mut tool_calls)
+        };
+        if let Some(update) = update {
+            let _ = context.updates.send(update);
+        }
     }
 }
 
@@ -785,11 +800,20 @@ async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
 }
 
 fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
+    let mut tool_calls = HashMap::new();
+    project_acp_update_with_state(message, &mut tool_calls)
+}
+
+fn project_acp_update_with_state(
+    message: &Value,
+    tool_calls: &mut HashMap<String, AcpToolCallState>,
+) -> Option<ExecutorUpdate> {
     let params = message.get("params")?;
     let update = params
         .get("update")
         .or_else(|| params.get("sessionUpdate"))
         .unwrap_or(params);
+    let tool_call_id = tool_call_id(update);
     let kind = update
         .get("sessionUpdate")
         .or_else(|| update.get("kind"))
@@ -810,8 +834,8 @@ fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
     let text = extract_text(update.get("content"))
         .or_else(|| extract_text(update.get("text")))
         .or_else(|| extract_text(tool.get("content")))
-        .or_else(|| extract_text(tool.get("rawInput")))
-        .or_else(|| extract_text(tool.get("raw_input")));
+        .or_else(|| extract_tool_raw_input(tool.get("rawInput")))
+        .or_else(|| extract_tool_raw_input(tool.get("raw_input")));
     let title = update
         .get("title")
         .or_else(|| update.get("name"))
@@ -843,6 +867,11 @@ fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
         kind.to_string()
     };
     let text = text.unwrap_or_default();
+    let (title, text, status) = if is_tool_update {
+        merge_acp_tool_update(tool_calls, tool_call_id, title, text, status)
+    } else {
+        (title, text, status)
+    };
     let mut update =
         ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
     if is_tool_update {
@@ -852,6 +881,64 @@ fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
         ));
     }
     Some(update)
+}
+
+fn tool_call_id(update: &Value) -> Option<&str> {
+    update
+        .get("toolCallId")
+        .or_else(|| update.get("tool_call_id"))
+        .or_else(|| {
+            update
+                .get("toolCall")
+                .and_then(|tool| tool.get("toolCallId"))
+        })
+        .or_else(|| {
+            update
+                .get("tool_call")
+                .and_then(|tool| tool.get("tool_call_id"))
+        })
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn merge_acp_tool_update(
+    tool_calls: &mut HashMap<String, AcpToolCallState>,
+    tool_call_id: Option<&str>,
+    title: String,
+    text: String,
+    status: String,
+) -> (String, String, String) {
+    let Some(tool_call_id) = tool_call_id else {
+        return (title, text, status);
+    };
+
+    let state = tool_calls.entry(tool_call_id.to_string()).or_default();
+    if !title.trim().is_empty() {
+        state.title = title;
+    }
+    if !text.trim().is_empty() {
+        state.text = text;
+    }
+    if !status.trim().is_empty() {
+        state.status = status;
+    }
+
+    let merged = (
+        state.title.clone(),
+        state.text.clone(),
+        state.status.clone(),
+    );
+    if is_terminal_tool_status(&merged.2) {
+        tool_calls.remove(tool_call_id);
+    }
+    merged
+}
+
+fn is_terminal_tool_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "failed" | "cancelled" | "canceled"
+    )
 }
 
 fn acp_tool_title(title: &str) -> String {
@@ -877,6 +964,33 @@ fn acp_tool_channel_summary(title: &str, text: &str, status: &str) -> String {
         lines.push(acp_tool_title(title));
     }
     truncate_text(lines.join("\n"), 1_000)
+}
+
+fn extract_tool_raw_input(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => nonempty_one_line(text),
+        Value::Object(map) => {
+            for key in ["command", "cmd", "script"] {
+                if let Some(command) = map.get(key).and_then(Value::as_str) {
+                    return nonempty_one_line(command).map(|command| format!("$ {command}"));
+                }
+            }
+            for key in ["path", "file", "query", "pattern"] {
+                if let Some(value) = map.get(key).and_then(Value::as_str)
+                    && let Some(value) = nonempty_one_line(value)
+                {
+                    return Some(value);
+                }
+            }
+            None
+        }
+        _ => extract_text(value),
+    }
+}
+
+fn nonempty_one_line(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then_some(line)
 }
 
 fn extract_text(value: Option<&Value>) -> Option<String> {
@@ -923,7 +1037,12 @@ fn resolve_cwd(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        fs,
+        sync::Arc,
+        time::Duration,
+    };
 
     use crate::approval::ApprovalBroker;
     use crate::executor::{
@@ -1002,6 +1121,49 @@ mod tests {
         assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
         assert_eq!(event.title, "read_file");
         assert_eq!(event.text, "src/main.rs\nstatus: failed");
+    }
+
+    #[test]
+    fn acp_tool_update_merges_partial_updates_by_id() {
+        let mut tool_calls = HashMap::new();
+        let started = project_acp_update_with_state(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-1",
+                        "title": "Run tests",
+                        "rawInput": {"command": "cargo test -q"},
+                        "status": "pending"
+                    }
+                }
+            }),
+            &mut tool_calls,
+        )
+        .unwrap();
+        let event = started.channel_event.unwrap();
+        assert_eq!(event.title, "Run tests");
+        assert_eq!(event.text, "$ cargo test -q\nstatus: pending");
+
+        let failed = project_acp_update_with_state(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-1",
+                        "status": "failed"
+                    }
+                }
+            }),
+            &mut tool_calls,
+        )
+        .unwrap();
+        let event = failed.channel_event.unwrap();
+        assert_eq!(event.title, "Run tests");
+        assert_eq!(event.text, "$ cargo test -q\nstatus: failed");
+        assert!(tool_calls.is_empty());
     }
 
     #[test]
