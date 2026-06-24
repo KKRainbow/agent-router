@@ -15,7 +15,8 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::time::{sleep, Instant};
 
 use crate::approval::{
-    ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection, SharedApprovalBroker,
+    ApprovalBroker, ApprovalCancellation, ApprovalOption, ApprovalRequest, ApprovalSelection,
+    SharedApprovalBroker,
 };
 use crate::config::{ExecutorConfig, ExecutorProtocol};
 use crate::executor::{
@@ -660,6 +661,7 @@ pub struct ClaudeSession {
     session_key: String,
     executor: String,
     alive: Arc<AtomicBool>,
+    pending_approvals: Arc<Mutex<HashMap<String, ApprovalCancellation>>>,
     _shutdown_tx: oneshot::Sender<()>,
 }
 
@@ -707,6 +709,7 @@ impl ClaudeSession {
         let active_user_id = Arc::new(Mutex::new(None));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));
+        let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(read_stdout(
             BufReader::new(stdout),
@@ -720,6 +723,7 @@ impl ClaudeSession {
             stdin.clone(),
             child.clone(),
             alive.clone(),
+            pending_approvals.clone(),
             shutdown_rx,
         ));
 
@@ -735,6 +739,7 @@ impl ClaudeSession {
             session_key,
             executor,
             alive,
+            pending_approvals,
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -844,6 +849,13 @@ impl ClaudeSession {
     pub async fn close(&self) {
         self.alive.store(false, Ordering::Relaxed);
 
+        let mut pending = self.pending_approvals.lock().await;
+        for cancellation in pending.values() {
+            cancellation.cancel();
+        }
+        pending.clear();
+        drop(pending);
+
         let mut stdin = self.stdin.lock().await;
         if let Err(err) = stdin.shutdown().await {
             tracing::warn!(target: "agent_router::claude", error = %err, "failed to shutdown claude stdin");
@@ -870,6 +882,7 @@ async fn read_stdout<R, E>(
     stdin: SharedStdin,
     child: Arc<Mutex<Child>>,
     alive: Arc<AtomicBool>,
+    pending_approvals: Arc<Mutex<HashMap<String, ApprovalCancellation>>>,
     mut shutdown: oneshot::Receiver<()>,
 ) where
     R: AsyncBufReadExt + Unpin,
@@ -900,6 +913,7 @@ async fn read_stdout<R, E>(
                             &executor,
                             user_id,
                             &stdin,
+                            &pending_approvals,
                         )
                         .await;
                     }
@@ -945,6 +959,7 @@ async fn handle_event_line(
     executor: &str,
     user_id: Option<String>,
     stdin: &SharedStdin,
+    pending_approvals: &Arc<Mutex<HashMap<String, ApprovalCancellation>>>,
 ) {
     let Some(event) = parse_event_line(line) else {
         return;
@@ -966,12 +981,23 @@ async fn handle_event_line(
                 request_id.clone(),
                 request.clone(),
             );
+            let cancellation = ApprovalCancellation::new();
+            pending_approvals
+                .lock()
+                .await
+                .insert(request_id.clone(), cancellation.clone());
+
             let approvals = approvals.clone();
             let stdin = stdin.clone();
+            let pending_approvals = pending_approvals.clone();
             tokio::spawn(async move {
-                let selection = approvals.request(approval_req).await;
+                let selection = approvals
+                    .request_until_cancelled(approval_req, cancellation)
+                    .await;
+                pending_approvals.lock().await.remove(&request_id);
+
                 let response = match selection {
-                    ApprovalSelection::Selected(option_id) if option_id == "allow" => {
+                    Some(ApprovalSelection::Selected(option_id)) if option_id == "allow" => {
                         ControlResponse::allow(request_id)
                     }
                     _ => ControlResponse::deny(
@@ -1010,14 +1036,9 @@ async fn handle_event_line(
             });
         }
         ClaudeEvent::ControlCancelRequest { request_id } => {
-            // MVP limitation: the approval broker does not support cancelling an
-            // in-flight request. The turn-level cancellation path will clean up
-            // the session when the user cancels the turn.
-            tracing::debug!(
-                target: "agent_router::claude",
-                request_id = %request_id,
-                "Claude control request cancelled; not propagated to approval broker"
-            );
+            if let Some(cancellation) = pending_approvals.lock().await.remove(&request_id) {
+                cancellation.cancel();
+            }
         }
         other => {
             for update in event_to_updates(other) {
@@ -1183,6 +1204,8 @@ mod session_tests {
 #[cfg(test)]
 mod approval_bridge_tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
 
     #[test]
     fn control_request_builds_approval_request() {
@@ -1207,5 +1230,55 @@ mod approval_bridge_tests {
         assert_eq!(approval_req.options[0].name, "Allow");
         assert_eq!(approval_req.options[1].id, "deny");
         assert_eq!(approval_req.options[1].name, "Deny");
+    }
+
+    #[tokio::test]
+    async fn approval_request_is_cancelled_on_close() {
+        let cfg = ExecutorConfig {
+            name: "claude-test".to_string(),
+            protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                r#"read line; printf '{"type":"control_request","request_id":"req-1"}\n'; cat"#
+                    .to_string(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let approvals = Arc::new(crate::approval::ApprovalBroker::default());
+        let mut prompts = approvals.subscribe();
+        let session = ClaudeSession::start(
+            cfg,
+            PathBuf::from("."),
+            "test-key".to_string(),
+            "claude".to_string(),
+            approvals.clone(),
+            None,
+        )
+        .await
+        .expect("start session");
+
+        session
+            .send_prompt("trigger")
+            .await
+            .expect("send trigger prompt");
+
+        let prompt = tokio::time::timeout(Duration::from_secs(2), prompts.recv())
+            .await
+            .expect("receive prompt within timeout")
+            .expect("prompt channel open");
+        assert_eq!(prompt.session_key, "test-key");
+        assert!(approvals.has_pending_for_session("test-key").await);
+
+        session.close().await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while approvals.has_pending_for_session("test-key").await
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!approvals.has_pending_for_session("test-key").await);
     }
 }
