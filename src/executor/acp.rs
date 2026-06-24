@@ -1506,6 +1506,26 @@ mod tests {
         assert_eq!(titled_output.status, "running");
         assert!(titled_output.channel_event.is_none());
 
+        let repeated_input = project_acp_update_with_state(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-1",
+                        "rawInput": {"command": "sleep 3"},
+                        "status": "running"
+                    }
+                }
+            }),
+            &mut tool_calls,
+        )
+        .unwrap();
+        assert_eq!(repeated_input.title, "Bash");
+        assert_eq!(repeated_input.text, "$ sleep 3");
+        assert_eq!(repeated_input.status, "running");
+        assert!(repeated_input.channel_event.is_none());
+
         let json_args = project_acp_update_with_state(
             &json!({
                 "method": "session/update",
