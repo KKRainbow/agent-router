@@ -5,9 +5,7 @@ use serde_json::{Map, Value};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeEvent {
     System {
-        #[serde(default)]
         session_id: Option<String>,
-        #[serde(default)]
         model: Option<String>,
     },
     Assistant {
@@ -17,18 +15,13 @@ pub enum ClaudeEvent {
         message: UserMessage,
     },
     Result {
-        #[serde(default)]
         result: Option<String>,
-        #[serde(default)]
         subtype: Option<String>,
-        #[serde(default)]
         session_id: Option<String>,
-        #[serde(default)]
         usage: Option<serde_json::Value>,
     },
     ControlRequest {
         request_id: String,
-        #[serde(default)]
         request: Option<serde_json::Value>,
     },
     ControlCancelRequest {
@@ -40,7 +33,6 @@ pub enum ClaudeEvent {
 pub struct AssistantMessage {
     #[serde(default)]
     pub content: Vec<AssistantContent>,
-    #[serde(default)]
     pub usage: Option<serde_json::Value>,
 }
 
@@ -62,7 +54,6 @@ pub struct UserMessage {
 pub enum UserContent {
     ToolResult {
         content: serde_json::Value,
-        #[serde(default)]
         is_error: Option<bool>,
     },
     Text { text: String },
@@ -318,24 +309,56 @@ mod outgoing_tests {
     #[test]
     fn user_event_serializes() {
         let ev = UserEvent::new("hi".to_string());
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"user\""));
-        assert!(json.contains("\"content\":\"hi\""));
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "hi"
+                }
+            })
+        );
     }
 
     #[test]
     fn control_response_allow_serializes() {
         let resp = ControlResponse::allow("req-1".to_string());
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"type\":\"control_response\""));
-        assert!(json.contains("\"behavior\":\"allow\""));
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "req-1",
+                    "response": {
+                        "behavior": "allow",
+                        "updatedInput": {}
+                    }
+                }
+            })
+        );
     }
 
     #[test]
     fn control_response_deny_serializes() {
         let resp = ControlResponse::deny("req-1".to_string(), "not allowed");
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"behavior\":\"deny\""));
-        assert!(json.contains("\"message\":\"not allowed\""));
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "req-1",
+                    "response": {
+                        "behavior": "deny",
+                        "message": "not allowed"
+                    }
+                }
+            })
+        );
     }
 }
