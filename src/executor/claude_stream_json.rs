@@ -4,8 +4,10 @@ use serde::Deserialize;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeEvent {
     System {
-        session_id: String,
-        model: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     Assistant {
         message: AssistantMessage,
@@ -14,16 +16,19 @@ pub enum ClaudeEvent {
         message: UserMessage,
     },
     Result {
-        result: serde_json::Value,
+        #[serde(default)]
+        result: Option<String>,
         #[serde(default)]
         subtype: Option<String>,
-        session_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
         #[serde(default)]
         usage: Option<serde_json::Value>,
     },
     ControlRequest {
         request_id: String,
-        request: serde_json::Value,
+        #[serde(default)]
+        request: Option<serde_json::Value>,
     },
     ControlCancelRequest {
         request_id: String,
@@ -32,6 +37,7 @@ pub enum ClaudeEvent {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct AssistantMessage {
+    #[serde(default)]
     pub content: Vec<AssistantContent>,
     #[serde(default)]
     pub usage: Option<serde_json::Value>,
@@ -53,7 +59,11 @@ pub struct UserMessage {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserContent {
-    ToolResult { content: String, is_error: bool },
+    ToolResult {
+        content: serde_json::Value,
+        #[serde(default)]
+        is_error: Option<bool>,
+    },
     Text { text: String },
 }
 
@@ -62,7 +72,18 @@ pub fn parse_event_line(line: &str) -> Option<ClaudeEvent> {
     if trimmed.is_empty() {
         return None;
     }
-    serde_json::from_str(trimmed).ok()
+    match serde_json::from_str(trimmed) {
+        Ok(event) => Some(event),
+        Err(err) => {
+            tracing::debug!(
+                target: "agent_router::claude",
+                line,
+                error = %err,
+                "ignoring non-event JSON line"
+            );
+            None
+        }
+    }
 }
 
 pub fn is_compaction_result(subtype: Option<&str>) -> bool {
@@ -79,8 +100,21 @@ mod event_tests {
         let event = parse_event_line(line).expect("valid system event");
         match event {
             ClaudeEvent::System { session_id, model } => {
-                assert_eq!(session_id, "sess-123");
-                assert_eq!(model, "claude-sonnet-4");
+                assert_eq!(session_id, Some("sess-123".to_string()));
+                assert_eq!(model, Some("claude-sonnet-4".to_string()));
+            }
+            _ => panic!("expected System event"),
+        }
+    }
+
+    #[test]
+    fn parses_system_event_without_optional_fields() {
+        let line = r#"{"type":"system"}"#;
+        let event = parse_event_line(line).expect("valid system event");
+        match event {
+            ClaudeEvent::System { session_id, model } => {
+                assert_eq!(session_id, None);
+                assert_eq!(model, None);
             }
             _ => panic!("expected System event"),
         }
@@ -111,8 +145,21 @@ mod event_tests {
     }
 
     #[test]
+    fn parses_assistant_message_without_content() {
+        let line = r#"{"type":"assistant","message":{}}"#;
+        let event = parse_event_line(line).expect("valid assistant event");
+        match event {
+            ClaudeEvent::Assistant { message } => {
+                assert!(message.content.is_empty());
+                assert_eq!(message.usage, None);
+            }
+            _ => panic!("expected Assistant event"),
+        }
+    }
+
+    #[test]
     fn recognizes_compaction_result() {
-        let line = r#"{"type":"result","result":{},"subtype":"compact","session_id":"sess-123","usage":null}"#;
+        let line = r#"{"type":"result","result":"compact summary","subtype":"compact","session_id":"sess-123","usage":null}"#;
         let event = parse_event_line(line).expect("valid result event");
         match &event {
             ClaudeEvent::Result { subtype, .. } => {
@@ -122,6 +169,61 @@ mod event_tests {
         }
         assert!(!is_compaction_result(Some("final")));
         assert!(!is_compaction_result(None));
+    }
+
+    #[test]
+    fn parses_result_event_with_minimal_fields() {
+        let line = r#"{"type":"result"}"#;
+        let event = parse_event_line(line).expect("valid result event");
+        match event {
+            ClaudeEvent::Result {
+                result,
+                subtype,
+                session_id,
+                usage,
+            } => {
+                assert_eq!(result, None);
+                assert_eq!(subtype, None);
+                assert_eq!(session_id, None);
+                assert_eq!(usage, None);
+            }
+            _ => panic!("expected Result event"),
+        }
+    }
+
+    #[test]
+    fn parses_user_tool_result_with_error() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok","is_error":true}]}}"#;
+        let event = parse_event_line(line).expect("valid user event");
+        match event {
+            ClaudeEvent::User { message } => {
+                assert_eq!(message.content.len(), 1);
+                assert_eq!(
+                    message.content[0],
+                    UserContent::ToolResult {
+                        content: serde_json::Value::String("ok".to_string()),
+                        is_error: Some(true),
+                    }
+                );
+            }
+            _ => panic!("expected User event"),
+        }
+    }
+
+    #[test]
+    fn parses_control_request_without_request_body() {
+        let line = r#"{"type":"control_request","request_id":"req-1"}"#;
+        let event = parse_event_line(line).expect("valid control request event");
+        match event {
+            ClaudeEvent::ControlRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(request, None);
+            }
+            _ => panic!("expected ControlRequest event"),
+        }
     }
 
     #[test]
