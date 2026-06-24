@@ -46,7 +46,6 @@ pub struct TurnReservation {
     registry: Arc<TurnRegistry>,
     session_key: String,
     generation: u64,
-    cancel: TurnCancellation,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +125,6 @@ impl TurnRegistry {
                 registry: self.clone(),
                 session_key: session_key.to_string(),
                 generation,
-                cancel,
             },
             interrupted: replaced,
         }
@@ -166,27 +164,17 @@ impl TurnRegistry {
 }
 
 impl TurnReservation {
-    pub(crate) fn generation(&self) -> u64 {
+    pub(in crate::router) fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub(crate) fn cancellation(&self) -> TurnCancellation {
-        self.cancel.clone()
-    }
-
-    pub(crate) async fn is_current(&self) -> bool {
-        self.registry
-            .is_current(&self.session_key, self.generation)
-            .await
-    }
-
-    pub(crate) async fn discard_if_current(&self) -> bool {
+    pub(in crate::router) async fn discard_if_current(&self) -> bool {
         self.registry
             .discard_if_current(&self.session_key, self.generation)
             .await
     }
 
-    pub(crate) async fn adopt(&self, executor: String) -> Option<TurnGuard> {
+    pub(in crate::router) async fn adopt(&self, executor: String) -> Option<TurnGuard> {
         let mut active = self.registry.active.lock().await;
         let turn = active.get_mut(&self.session_key)?;
         if turn.generation != self.generation {
@@ -265,7 +253,7 @@ mod tests {
 
         assert!(reserved.interrupted.is_some());
         assert!(first.cancellation().cancelled().await == InterruptReason::ReplacedByNewMessage);
-        assert!(reserved.reservation.is_current().await);
+        assert!(turns.has_current("session").await);
     }
 
     #[tokio::test]

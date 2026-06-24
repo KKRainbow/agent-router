@@ -650,7 +650,7 @@ where
 
     async fn commit_context_sync_if_current(
         &self,
-        turn: &TurnReservation,
+        turn: &TurnGuard,
         mut prepared: PreparedContextSync,
     ) -> anyhow::Result<bool> {
         let cancel = turn.cancellation();
@@ -824,66 +824,21 @@ where
         let (turn, replaced, state, executor_name, descriptor, binding, session_cwd) = {
             let lock = self.session_lock(&session_key).await;
             let _guard = lock.lock().await;
-            let reserved_turn = if let Some(reservation) = reserved_turn {
-                if reservation.is_current().await {
-                    Some(reservation)
-                } else {
-                    tracing::debug!(
-                        session_key = %session_key,
-                        generation = reservation.generation(),
-                        "discarded stale reserved router turn before context sync"
-                    );
-                    return Ok(());
-                }
-            } else {
-                None
-            };
-            if let Some(context) = context {
-                if let Some(reservation) = reserved_turn.as_ref() {
-                    let prepared = match self.prepare_context_sync_locked(context).await {
-                        Ok(prepared) => prepared,
-                        Err(err) => {
-                            let _ = reservation.discard_if_current().await;
-                            return Err(err);
-                        }
-                    };
-                    if let Some(prepared) = prepared {
-                        let committed = match self
-                            .commit_context_sync_if_current(reservation, prepared)
-                            .await
-                        {
-                            Ok(committed) => committed,
-                            Err(err) => {
-                                let _ = reservation.discard_if_current().await;
-                                return Err(err);
-                            }
-                        };
-                        if !committed {
-                            tracing::debug!(
-                                session_key = %session_key,
-                                generation = reservation.generation(),
-                                "discarded stale preempted router turn before context commit"
-                            );
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    self.sync_context_locked(context).await?;
-                }
+            let mut context = context;
+            if reserved_turn.is_none()
+                && let Some(context) = context.take()
+            {
+                self.sync_context_locked(context).await?;
             }
             let mut state = self
                 .store
-                .load_or_create(&session_key, &self.default_executor)
-                .await;
+                .load(&session_key)
+                .await
+                .unwrap_or_else(|| SessionState::new(&session_key, &self.default_executor));
             let executor_name = state.active_executor.clone();
             let descriptor = self.executor.get(&executor_name).ok_or_else(|| {
                 anyhow::anyhow!("active executor `{executor_name}` is not configured")
             })?;
-            let session_cwd = self.ensure_session_cwd(&mut state)?;
-            if session_cwd.is_some() {
-                self.store.save(state.clone()).await;
-            }
-            let binding = state.binding_for(&executor_name);
             let (turn, replaced) = if let Some(reservation) = reserved_turn {
                 match reservation.adopt(executor_name.clone()).await {
                     Some(turn) => (turn, None),
@@ -900,6 +855,42 @@ where
                 let begun = self.turns.begin(&session_key, executor_name.clone()).await;
                 (begun.guard, begun.interrupted)
             };
+            let session_cwd = self.ensure_session_cwd(&mut state)?;
+            if session_cwd.is_some() {
+                self.store.save(state.clone()).await;
+            }
+            if let Some(context) = context {
+                let prepared = match self.prepare_context_sync_locked(context).await {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        let _ = turn.finish_if_current().await;
+                        return Err(err);
+                    }
+                };
+                if let Some(prepared) = prepared {
+                    let committed = match self.commit_context_sync_if_current(&turn, prepared).await
+                    {
+                        Ok(committed) => committed,
+                        Err(err) => {
+                            let _ = turn.finish_if_current().await;
+                            return Err(err);
+                        }
+                    };
+                    if !committed {
+                        tracing::debug!(
+                            session_key = %session_key,
+                            generation = turn.generation(),
+                            "discarded stale reserved router turn before context commit"
+                        );
+                        return Ok(());
+                    }
+                    state = self
+                        .store
+                        .load_or_create(&session_key, &self.default_executor)
+                        .await;
+                }
+            }
+            let binding = state.binding_for(&executor_name);
             (
                 turn,
                 replaced,
@@ -3774,6 +3765,83 @@ mod tests {
         let prompts = executor.prompts.lock().await;
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].prompt.contains("Current user message:\nnewer"));
+    }
+
+    #[tokio::test]
+    async fn stale_reserved_context_does_not_commit_or_create_session_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_key = "slack:C1:T1";
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_workspace_root(Some(tmp.path().join("workspaces")));
+
+        let stale_reservation = router
+            .reserve_turn(session_key, TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_reservation = router
+            .reserve_turn(session_key, TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut stale_output = CollectingRouterOutputSink::default();
+        router
+            .handle_reserved(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "older delayed".to_string(),
+                    user_id: None,
+                },
+                stale_reservation,
+                Some(ContextSyncRequest {
+                    session_key: session_key.to_string(),
+                    source: "slack".to_string(),
+                    base_path: PathBuf::from("slack"),
+                    artifacts: vec![ContextArtifactInput {
+                        id: "thread".to_string(),
+                        kind: "slack_current_thread".to_string(),
+                        title: "Thread".to_string(),
+                        source_locator: None,
+                        files: vec![ContextFileInput {
+                            relative_path: PathBuf::from("slack/current-thread.md"),
+                            content: ContextFileContent::Text("stale context".to_string()),
+                        }],
+                        metadata: Default::default(),
+                    }],
+                    remove_artifacts: Vec::new(),
+                    unresolved: Vec::new(),
+                }),
+                &mut stale_output,
+            )
+            .await
+            .unwrap();
+
+        assert!(stale_output.events.is_empty());
+        assert!(store.load(session_key).await.is_none());
+        assert!(executor.prompts.lock().await.is_empty());
+
+        let mut current_output = CollectingRouterOutputSink::default();
+        router
+            .handle_reserved(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "newer".to_string(),
+                    user_id: None,
+                },
+                current_reservation,
+                None,
+                &mut current_output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(current_output.final_reply(), "fake response");
+        let saved = store.load(session_key).await.unwrap();
+        assert!(saved.context_artifacts.is_empty());
+        assert_eq!(saved.transcript[0].content, "newer");
     }
 
     #[tokio::test]
