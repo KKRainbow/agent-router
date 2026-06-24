@@ -34,6 +34,7 @@ use crate::{
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const SLACK_MARKDOWN_BLOCK_CHAR_LIMIT: usize = 12_000;
 
 #[derive(Debug, Clone)]
 pub struct SlackSocketModeChannel {
@@ -455,6 +456,46 @@ impl SlackSocketModeChannel {
         target: &SlackReplyTarget,
         text: &str,
     ) -> anyhow::Result<Option<String>> {
+        self.post_message_body_with_ts(target, slack_message_body(target, text))
+            .await
+    }
+
+    async fn post_markdown_message(
+        &self,
+        target: &SlackReplyTarget,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.post_markdown_message_with_ts(target, text)
+            .await
+            .map(|_| ())
+    }
+
+    async fn post_markdown_message_with_ts(
+        &self,
+        target: &SlackReplyTarget,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(body) = slack_markdown_message_body(target, text) else {
+            return self.post_message_with_ts(target, text).await;
+        };
+        match self.post_message_body_with_ts(target, body).await {
+            Ok(ts) => Ok(ts),
+            Err(err) if slack_error_is_invalid_blocks(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Slack markdown block was rejected; retrying final reply as plain text"
+                );
+                self.post_message_with_ts(target, text).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn post_message_body_with_ts(
+        &self,
+        target: &SlackReplyTarget,
+        body: Value,
+    ) -> anyhow::Result<Option<String>> {
         #[derive(Deserialize)]
         struct Response {
             ok: bool,
@@ -465,16 +506,13 @@ impl SlackSocketModeChannel {
         tracing::info!(
             channel = %target.channel,
             thread_ts = ?target.thread_ts,
-            text_len = text.len(),
+            text_len = body
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or_default(),
             "sending Slack message"
         );
-        let mut body = json!({
-            "channel": target.channel,
-            "text": text,
-        });
-        if let Some(thread_ts) = &target.thread_ts {
-            body["thread_ts"] = Value::String(thread_ts.clone());
-        }
         let resp = self
             .http
             .post("https://slack.com/api/chat.postMessage")
@@ -485,15 +523,20 @@ impl SlackSocketModeChannel {
             .json::<Response>()
             .await?;
         if !resp.ok {
-            anyhow::bail!(
-                "Slack chat.postMessage failed: {}",
-                resp.error.unwrap_or_else(|| "unknown_error".to_string())
-            );
+            return Err(SlackApiError::new(
+                "chat.postMessage",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
         }
         tracing::info!(
             channel = %target.channel,
             thread_ts = ?target.thread_ts,
-            text_len = text.len(),
+            text_len = body
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or_default(),
             "sent Slack message"
         );
         Ok(resp.ts)
@@ -1416,8 +1459,36 @@ impl RouterOutputSink for SlackRouterOutputSink {
 
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
         self.flush_channel_events().await;
-        self.channel.post_message(&self.target, &text).await
+        self.channel
+            .post_markdown_message(&self.target, &text)
+            .await
     }
+}
+
+fn slack_message_body(target: &SlackReplyTarget, text: &str) -> Value {
+    let mut body = json!({
+        "channel": target.channel,
+        "text": text,
+    });
+    if let Some(thread_ts) = &target.thread_ts {
+        body["thread_ts"] = Value::String(thread_ts.clone());
+    }
+    body
+}
+
+fn slack_markdown_message_body(target: &SlackReplyTarget, text: &str) -> Option<Value> {
+    if text.trim().is_empty() || text.chars().count() > SLACK_MARKDOWN_BLOCK_CHAR_LIMIT {
+        return None;
+    }
+
+    let mut body = slack_message_body(target, text);
+    body["blocks"] = json!([
+        {
+            "type": "markdown",
+            "text": text,
+        }
+    ]);
+    Some(body)
 }
 
 fn spawn_slack_verbose_activity_poster(
@@ -1600,6 +1671,12 @@ impl std::error::Error for SlackApiError {}
 fn slack_error_is_access_denied(err: &anyhow::Error) -> bool {
     err.downcast_ref::<SlackApiError>()
         .is_some_and(SlackApiError::is_access_denied)
+}
+
+fn slack_error_is_invalid_blocks(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SlackApiError>().is_some_and(|err| {
+        err.method == "chat.postMessage" && matches!(err.code.as_str(), "invalid_blocks")
+    })
 }
 
 fn slack_error_allows_cached_context(err: &anyhow::Error) -> bool {
@@ -2552,6 +2629,51 @@ mod tests {
             allowed_channels: Default::default(),
             free_response_channels: Default::default(),
         }
+    }
+
+    #[test]
+    fn slack_markdown_message_body_uses_markdown_block() {
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+        let text = "**bold**\n\n| a | b |\n| - | - |\n| 1 | 2 |";
+
+        let body = slack_markdown_message_body(&target, text).unwrap();
+
+        assert_eq!(body["channel"], "C1");
+        assert_eq!(body["thread_ts"], "111.000");
+        assert_eq!(body["text"], text);
+        assert_eq!(body["blocks"][0]["type"], "markdown");
+        assert_eq!(body["blocks"][0]["text"], text);
+    }
+
+    #[test]
+    fn slack_plain_message_body_omits_blocks() {
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: None,
+        };
+
+        let body = slack_message_body(&target, "plain");
+
+        assert_eq!(body["channel"], "C1");
+        assert_eq!(body["text"], "plain");
+        assert!(body.get("blocks").is_none());
+        assert!(body.get("thread_ts").is_none());
+    }
+
+    #[test]
+    fn slack_markdown_message_body_falls_back_for_invalid_block_text() {
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: None,
+        };
+        let long_text = "x".repeat(SLACK_MARKDOWN_BLOCK_CHAR_LIMIT + 1);
+
+        assert!(slack_markdown_message_body(&target, "").is_none());
+        assert!(slack_markdown_message_body(&target, "   ").is_none());
+        assert!(slack_markdown_message_body(&target, &long_text).is_none());
     }
 
     fn thread_reply(text: impl Into<String>) -> SlackMessageEvent {
