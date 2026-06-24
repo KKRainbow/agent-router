@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
@@ -37,13 +37,12 @@ type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 type SharedCodexEventStreams = Arc<StdMutex<CodexEventStreams>>;
 const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
-const COMPLETED_TURN_IDS_RETAINED: usize = 16;
 
 #[derive(Debug, Default)]
 struct CodexEventStreams {
     next_generation: u64,
     active: Option<CodexActiveEventStream>,
-    completed_turn_ids: VecDeque<String>,
+    completed_turn_ids: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -97,11 +96,7 @@ impl CodexEventStreams {
 
     fn finish(&mut self, generation: u64, turn_id: Option<&str>) {
         if let Some(turn_id) = turn_id.filter(|turn_id| !turn_id.is_empty()) {
-            self.completed_turn_ids.retain(|known| known != turn_id);
-            self.completed_turn_ids.push_back(turn_id.to_string());
-            while self.completed_turn_ids.len() > COMPLETED_TURN_IDS_RETAINED {
-                self.completed_turn_ids.pop_front();
-            }
+            self.completed_turn_ids.insert(turn_id.to_string());
         }
         self.close_active(generation);
     }
@@ -132,7 +127,7 @@ impl CodexEventStreams {
 }
 
 impl CodexActiveEventStream {
-    fn accepts(&self, message: &Value, completed_turn_ids: &VecDeque<String>) -> bool {
+    fn accepts(&self, message: &Value, completed_turn_ids: &HashSet<String>) -> bool {
         if let Some(thread_id) = codex_message_thread_id(message)
             && thread_id != self.thread_id
         {
@@ -2877,6 +2872,24 @@ for line in sys.stdin:
                 .unwrap()
                 .finish(generation, Some("turn-1"));
         }
+        for index in 2..=20 {
+            let (notifications, _notification_rx) = mpsc::unbounded_channel();
+            let (requests, _request_rx) = mpsc::unbounded_channel();
+            let generation =
+                event_streams
+                    .lock()
+                    .unwrap()
+                    .open("thread-1".to_string(), notifications, requests);
+            let turn_id = format!("turn-{index}");
+            event_streams
+                .lock()
+                .unwrap()
+                .set_turn_id(generation, turn_id.clone());
+            event_streams
+                .lock()
+                .unwrap()
+                .finish(generation, Some(&turn_id));
+        }
 
         let (new_notifications_tx, mut new_notifications) = mpsc::unbounded_channel();
         let (new_requests_tx, mut new_requests) = mpsc::unbounded_channel();
@@ -2889,7 +2902,7 @@ for line in sys.stdin:
             event_streams
                 .lock()
                 .unwrap()
-                .set_turn_id(generation, "turn-2".to_string());
+                .set_turn_id(generation, "turn-21".to_string());
         }
 
         dispatch_codex_message(
@@ -2960,7 +2973,7 @@ for line in sys.stdin:
                 "method": "item/completed",
                 "params": {
                     "threadId": "thread-1",
-                    "turnId": "turn-2",
+                    "turnId": "turn-21",
                     "item": {"type": "agentMessage", "text": "fresh"},
                 },
             }),
@@ -2974,7 +2987,7 @@ for line in sys.stdin:
                 .get("params")
                 .and_then(|params| params.get("turnId"))
                 .and_then(Value::as_str),
-            Some("turn-2")
+            Some("turn-21")
         );
     }
 }
