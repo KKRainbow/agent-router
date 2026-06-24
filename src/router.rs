@@ -535,14 +535,18 @@ where
         context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
+        let text = input.text.trim();
+        let command = text.split_whitespace().next().unwrap_or("");
+        if command == "/stop" {
+            return self.handle_stop_command(&input.session_key, output).await;
+        }
+
         if let Some(context) = context {
             let lock = self.session_lock(&context.session_key).await;
             let _guard = lock.lock().await;
             self.sync_context_locked(context).await?;
         }
 
-        let text = input.text.trim();
-        let command = text.split_whitespace().next().unwrap_or("");
         if command == "/agent" {
             let lock = self.session_lock(&input.session_key).await;
             let _guard = lock.lock().await;
@@ -556,9 +560,6 @@ where
             return self
                 .handle_yolo_command(&input.session_key, text, output)
                 .await;
-        }
-        if command == "/stop" {
-            return self.handle_stop_command(&input.session_key, output).await;
         }
         self.route_to_active_executor(input, output).await
     }
@@ -3199,6 +3200,49 @@ mod tests {
 
         let saved = store.load_or_create("slack:C1:T1", "kimi").await;
         assert!(saved.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_command_skips_context_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor)
+            .with_workspace_root(Some(tmp.path().join("workspaces")));
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle_with_context(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "/stop".to_string(),
+                    user_id: None,
+                },
+                Some(ContextSyncRequest {
+                    session_key: "slack:C1:T1".to_string(),
+                    source: "slack".to_string(),
+                    base_path: PathBuf::from("slack"),
+                    artifacts: vec![ContextArtifactInput {
+                        id: "thread".to_string(),
+                        kind: "slack_current_thread".to_string(),
+                        title: "Thread".to_string(),
+                        source_locator: None,
+                        files: vec![ContextFileInput {
+                            relative_path: PathBuf::from("slack/current-thread.md"),
+                            content: ContextFileContent::Text("should not sync".to_string()),
+                        }],
+                        metadata: Default::default(),
+                    }],
+                    remove_artifacts: Vec::new(),
+                    unresolved: Vec::new(),
+                }),
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "No active turn for this session.");
+        assert!(store.load("slack:C1:T1").await.is_none());
     }
 
     #[tokio::test]

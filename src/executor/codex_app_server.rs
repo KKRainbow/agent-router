@@ -14,7 +14,7 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::{Mutex, broadcast, mpsc, oneshot},
     task::JoinHandle,
-    time::{Duration, sleep, timeout},
+    time::{Duration, sleep},
 };
 
 use crate::{
@@ -25,8 +25,9 @@ use crate::{
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
         ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
-        ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorResponse,
-        ExecutorUpdate, PreparedExecutor, TurnCancellation, summarize_json_rpc_error,
+        ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
+        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        TurnCancellation, summarize_json_rpc_error,
     },
 };
 
@@ -337,7 +338,7 @@ impl ExecutorBackend for CodexAppServerManager {
             anyhow::bail!("Codex app-server prepare cancelled");
         }
         let mut session = session.lock().await;
-        let (thread_id, started_new_session) = session.ensure_thread().await?;
+        let (thread_id, started_new_session) = session.ensure_thread(cancel).await?;
         tracing::info!(
             executor = %request.executor,
             session_key = %request.session_key,
@@ -397,6 +398,22 @@ impl ExecutorBackend for CodexAppServerManager {
             ),
         }
         result
+    }
+
+    async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&(request.session_key.clone(), request.executor.clone()))
+            .cloned();
+        let Some(session) = session else {
+            return Ok(());
+        };
+        if let Ok(session) = session.try_lock() {
+            session.client.close("codex app-server interrupted").await;
+        }
+        Ok(())
     }
 }
 
@@ -466,13 +483,13 @@ impl CodexAppServerSession {
             && self.client.is_alive()
     }
 
-    async fn initialize(&mut self) -> anyhow::Result<()> {
+    async fn initialize(&mut self, cancel: TurnCancellation) -> anyhow::Result<()> {
         if self.initialized {
             return Ok(());
         }
         let initialized = self
             .client
-            .request(
+            .request_until_cancelled(
                 "initialize",
                 json!({
                     "clientInfo": {
@@ -483,6 +500,8 @@ impl CodexAppServerSession {
                     "capabilities": {},
                 }),
                 self.limits.rpc_timeout,
+                cancel,
+                "codex app-server initialize cancelled",
             )
             .await;
         if let Err(err) = initialized {
@@ -496,17 +515,19 @@ impl CodexAppServerSession {
         Ok(())
     }
 
-    async fn ensure_thread(&mut self) -> anyhow::Result<(String, bool)> {
-        self.initialize().await?;
+    async fn ensure_thread(&mut self, cancel: TurnCancellation) -> anyhow::Result<(String, bool)> {
+        self.initialize(cancel.clone()).await?;
         if let Some(thread_id) = &self.thread_id {
             return Ok((thread_id.clone(), false));
         }
         let result = self
             .client
-            .request(
+            .request_until_cancelled(
                 "thread/start",
                 json!({ "cwd": self.cwd }),
                 self.limits.rpc_timeout,
+                cancel,
+                "codex app-server thread/start cancelled",
             )
             .await;
         let result = match result {
@@ -1144,28 +1165,41 @@ impl CodexJsonRpcClient {
             .unwrap_or(true)
     }
 
-    async fn request(
+    async fn request_until_cancelled(
         &self,
         method: &str,
         params: Value,
         timeout_duration: Duration,
+        cancel: TurnCancellation,
+        close_reason: &str,
     ) -> anyhow::Result<Value> {
         let request = self.request_started(method, params).await?;
         let id = request.id;
         let method = request.method;
-        let response = match timeout(timeout_duration, request.response).await {
-            Ok(Ok(Ok(response))) => response,
-            Ok(Ok(Err(err))) => return Err(err),
-            Ok(Err(_)) => anyhow::bail!("codex app-server response channel closed"),
-            Err(_) => {
+        let timeout_fut = sleep(timeout_duration);
+        tokio::pin!(timeout_fut);
+        tokio::select! {
+            response = request.response => {
+                let response = match response {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => anyhow::bail!("codex app-server response channel closed"),
+                };
+                json_rpc_result(&method, response)
+            }
+            _ = &mut timeout_fut => {
                 self.cancel_pending(id).await;
                 anyhow::bail!(
                     "codex app-server `{method}` timed out after {}s",
                     timeout_duration.as_secs()
                 );
             }
-        };
-        json_rpc_result(&method, response)
+            _ = cancel.cancelled() => {
+                self.cancel_pending(id).await;
+                self.close(close_reason).await;
+                anyhow::bail!("{close_reason}")
+            }
+        }
     }
 
     async fn request_started(
@@ -1753,6 +1787,7 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use tokio::time::timeout;
 
     use crate::approval::ApprovalBroker;
     use crate::executor::{
