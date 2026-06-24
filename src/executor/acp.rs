@@ -466,7 +466,11 @@ impl AcpSession {
                     self.client.close("ACP turn cancelled").await;
                     self.session_id = None;
                     if let Err(err) = notify_result {
-                        return ExecutorPromptOutcome::Failed(err);
+                        tracing::debug!(
+                            target: "agent_router::acp",
+                            error = %err,
+                            "ignored failed ACP session/cancel notification after local cancellation"
+                        );
                     }
                     return ExecutorPromptOutcome::Cancelled;
                 }
@@ -880,14 +884,16 @@ async fn request_permission_until_turn_cancelled(
     };
     let approval_cancel = ApprovalCancellation::new();
     let approval_cancel_for_turn = approval_cancel.clone();
-    tokio::spawn(async move {
+    let watcher = tokio::spawn(async move {
         let _ = turn_cancel.cancelled().await;
         approval_cancel_for_turn.cancel();
     });
-    approvals
+    let selection = approvals
         .request_until_cancelled(request, approval_cancel)
         .await
-        .unwrap_or(ApprovalSelection::Cancelled)
+        .unwrap_or(ApprovalSelection::Cancelled);
+    watcher.abort();
+    selection
 }
 
 fn approval_request_from_permission_message(
