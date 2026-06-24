@@ -554,19 +554,21 @@ impl SlackSocketModeChannel {
         let mut skipped_cached_files = 0usize;
         let mut failed_files = 0usize;
         let file_refs = if self.cfg.context_sync.files {
-            collect_context_file_refs(&messages, &linked_threads)
+            collect_context_file_refs(&event.files, &messages, &linked_threads)
         } else {
             Vec::new()
         };
-        for file in file_refs
-            .into_iter()
-            .take(self.cfg.context_sync.max_files_per_turn)
-        {
+        let mut attempted_file_count = 0usize;
+        for file in file_refs {
             let file_cache_key = format!("{session_key}:{}", file.id);
             if self.is_file_cached(&file_cache_key).await {
                 skipped_cached_files += 1;
                 continue;
             }
+            if attempted_file_count >= self.cfg.context_sync.max_files_per_turn {
+                break;
+            }
+            attempted_file_count += 1;
             match self.download_slack_file(file.clone()).await {
                 Ok(downloaded) => {
                     downloaded_file_cache_keys.push(file_cache_key);
@@ -884,6 +886,7 @@ struct SlackMessageEvent {
     text: String,
     ts: String,
     thread_ts: Option<String>,
+    files: Vec<SlackFileRef>,
 }
 
 impl SlackMessageEvent {
@@ -1014,7 +1017,12 @@ fn parse_message_event(payload: &Value, bot_user_id: &str) -> Option<SlackMessag
     if !matches!(event_type, "message" | "app_mention") {
         return None;
     }
-    if event_type == "message" && event.get("subtype").is_some() {
+    if event_type == "message"
+        && event
+            .get("subtype")
+            .and_then(Value::as_str)
+            .is_some_and(|subtype| subtype != "file_share")
+    {
         return None;
     }
     if event.get("bot_id").is_some() {
@@ -1041,6 +1049,7 @@ fn parse_message_event(payload: &Value, bot_user_id: &str) -> Option<SlackMessag
             .get("thread_ts")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        files: parse_slack_file_refs(event),
     })
 }
 
@@ -1124,19 +1133,25 @@ fn parse_slack_file_refs(message: &Value) -> Vec<SlackFileRef> {
 }
 
 fn collect_context_file_refs(
+    event_files: &[SlackFileRef],
     current_messages: &[SlackThreadMessage],
     linked_threads: &[LinkedSlackThread],
 ) -> Vec<SlackFileRef> {
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
-    for file in current_messages
+    for file in event_files
         .iter()
+        .chain(
+            current_messages
+                .iter()
+                .flat_map(|message| message.files.iter()),
+        )
         .chain(
             linked_threads
                 .iter()
-                .flat_map(|thread| thread.messages.iter()),
+                .flat_map(|thread| thread.messages.iter())
+                .flat_map(|message| message.files.iter()),
         )
-        .flat_map(|message| message.files.iter())
     {
         if seen.insert(file.id.clone()) {
             files.push(file.clone());
@@ -1558,6 +1573,7 @@ mod tests {
             text: text.into(),
             ts: "222.000".to_string(),
             thread_ts: Some("111.000".to_string()),
+            files: Vec::new(),
         }
     }
 
@@ -1694,7 +1710,7 @@ mod tests {
         }))
         .unwrap();
 
-        let files = collect_context_file_refs(&[first, second], &[]);
+        let files = collect_context_file_refs(&[], &[first, second], &[]);
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, "F1");
@@ -1757,6 +1773,32 @@ mod tests {
         let filtered = filter_context_messages(messages, "BOT");
 
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn parses_file_share_message_events() {
+        let payload = json!({
+            "event": {
+                "type": "message",
+                "subtype": "file_share",
+                "user": "U1",
+                "channel": "C1",
+                "ts": "123.456",
+                "text": "<@BOT> see file",
+                "files": [{
+                    "id": "F1",
+                    "name": "note.txt",
+                    "mimetype": "text/plain",
+                    "size": 4,
+                    "url_private_download": "https://files.example/F1"
+                }]
+            }
+        });
+
+        let event = parse_message_event(&payload, "BOT").unwrap();
+
+        assert_eq!(event.files.len(), 1);
+        assert_eq!(event.files[0].id, "F1");
     }
 
     #[test]
@@ -1854,6 +1896,7 @@ mod tests {
             text: "top level".to_string(),
             ts: "111.000".to_string(),
             thread_ts: None,
+            files: Vec::new(),
         };
 
         channel
@@ -1950,6 +1993,7 @@ mod tests {
             text: "first".to_string(),
             ts: "111.000".to_string(),
             thread_ts: None,
+            files: Vec::new(),
         };
         let second = SlackMessageEvent {
             event_key: "Ev2".to_string(),
@@ -1958,6 +2002,7 @@ mod tests {
             text: "second".to_string(),
             ts: "222.000".to_string(),
             thread_ts: None,
+            files: Vec::new(),
         };
 
         assert_eq!(first.session_key(), "slack:dm:D1:111.000");
@@ -1973,6 +2018,7 @@ mod tests {
             text: "reply".to_string(),
             ts: "222.000".to_string(),
             thread_ts: Some("111.000".to_string()),
+            files: Vec::new(),
         };
 
         assert_eq!(reply.session_key(), "slack:dm:D1:111.000");
