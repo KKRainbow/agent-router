@@ -517,11 +517,15 @@ where
         let session_key = request.session_key.clone();
         let source = request.source.clone();
         let unresolved_count = request.unresolved.len();
-        let recovered_context =
+        let (recovered_context, recovery_failed) =
             recover_context_artifacts_from_manifest(&session_cwd, &session_key, &source);
         let recovered_context_count = recovered_context.len();
-        let (existing_context, used_recovered_context) =
+        let (mut existing_context, used_recovered_context) =
             merge_recovered_context_artifacts(&state.context_artifacts, &source, recovered_context);
+        if recovery_failed {
+            existing_context
+                .retain(|record| !(record.source == source && record.kind == "manifest"));
+        }
         if used_recovered_context {
             tracing::info!(
                 session_key = %session_key,
@@ -916,9 +920,9 @@ fn recover_context_artifacts_from_manifest(
     cwd: &Path,
     session_key: &str,
     source: &str,
-) -> Vec<ContextArtifactRecord> {
+) -> (Vec<ContextArtifactRecord>, bool) {
     match read_context_artifacts_from_manifest(cwd, source, Path::new(source)) {
-        Ok(records) => records,
+        Ok(records) => (records, false),
         Err(err) => {
             tracing::warn!(
                 session_key,
@@ -927,7 +931,7 @@ fn recover_context_artifacts_from_manifest(
                 error = %err,
                 "ignored invalid recovered session context manifest"
             );
-            Vec::new()
+            (Vec::new(), true)
         }
     }
 }
@@ -957,7 +961,7 @@ where
                 .map(|root| root.join(session_workspace_dir_name(session_key)))
         });
         let records = if let Some(cwd) = recovery_cwd {
-            let recovered = recover_context_artifacts_from_manifest(&cwd, session_key, source);
+            let (recovered, _) = recover_context_artifacts_from_manifest(&cwd, session_key, source);
             merge_recovered_context_artifacts(&state_context, source, recovered).0
         } else {
             state_context
@@ -1954,29 +1958,22 @@ mod tests {
         let session_key = "slack:channel:C1:111.000";
         let cwd = workspace_root.join(session_workspace_dir_name(session_key));
         std::fs::create_dir_all(cwd.join("slack")).unwrap();
-        std::fs::write(
-            cwd.join("slack/manifest.json"),
-            serde_json::to_vec_pretty(&json!({
-                "version": 1,
-                "source": "slack",
-                "session_key": session_key,
-                "synced_at_ms": 1,
-                "artifacts": [{
-                    "id": "slack:file:F1",
-                    "source": "slack",
-                    "kind": "slack_file",
-                    "title": "Slack file F1",
-                    "paths": ["../secret.txt"],
-                    "fingerprint": "artifact:file",
-                    "updated_at_ms": 1
-                }],
-                "unresolved": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        std::fs::write(cwd.join("slack/manifest.json"), "{not-json").unwrap();
 
         let store = Arc::new(InMemorySessionStore::default());
+        let mut state = SessionState::new(session_key, "kimi");
+        state.context_artifacts.push(ContextArtifactRecord {
+            id: "slack:manifest".to_string(),
+            source: "slack".to_string(),
+            kind: "manifest".to_string(),
+            title: "Stale manifest".to_string(),
+            source_locator: None,
+            paths: vec!["slack/manifest.json".to_string()],
+            fingerprint: "artifact:stale-manifest".to_string(),
+            updated_at_ms: 1,
+            metadata: BTreeMap::new(),
+        });
+        store.save(state).await;
         let executor = Arc::new(FakeExecutorBackend::default());
         let router = AgentRouter::new("kimi", store.clone(), executor)
             .with_workspace_root(Some(workspace_root));
@@ -2009,7 +2006,8 @@ mod tests {
                 .any(|record| record.kind == "slack_current_thread")
         );
         let manifest = std::fs::read_to_string(cwd.join("slack/manifest.json")).unwrap();
-        assert!(!manifest.contains("../secret.txt"));
+        assert!(serde_json::from_str::<serde_json::Value>(&manifest).is_ok());
+        assert!(!manifest.contains("{not-json"));
     }
 
     #[tokio::test]
