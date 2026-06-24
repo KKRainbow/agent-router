@@ -20,8 +20,9 @@ use crate::{
         render_live_compact_channel_events,
     },
     session::context::{
-        ContextArtifactInput, ContextArtifactRecord, ContextFileContent, ContextFileInput,
-        ContextSyncIssueInput, ContextSyncRequest, sanitize_path_segment,
+        ContextArtifactInput, ContextArtifactRecord, ContextArtifactRemovalInput,
+        ContextFileContent, ContextFileInput, ContextSyncIssueInput, ContextSyncRequest,
+        sanitize_path_segment,
     },
 };
 
@@ -516,6 +517,7 @@ impl SlackSocketModeChannel {
     ) -> SlackContextSyncBuild {
         let thread_ts = event.thread_root_ts();
         let mut unresolved = Vec::new();
+        let mut remove_artifacts = Vec::new();
         let mut current_thread_fresh = false;
         let messages = if self.cfg.context_sync.current_thread {
             tracing::info!(
@@ -555,6 +557,10 @@ impl SlackSocketModeChannel {
                     messages
                 }
                 Err(err) => {
+                    if slack_error_is_access_denied(&err) {
+                        remove_artifacts
+                            .push(slack_current_thread_removal(&event.channel, &thread_ts));
+                    }
                     tracing::info!(
                         channel = %event.channel,
                         thread_ts = %thread_ts,
@@ -654,6 +660,10 @@ impl SlackSocketModeChannel {
                         }
                     }
                     Err(err) => {
+                        if slack_error_is_access_denied(&err) {
+                            remove_artifacts
+                                .push(slack_linked_thread_removal(&link.channel, &link.thread_ts));
+                        }
                         tracing::info!(
                             linked_channel = %link.channel,
                             linked_thread_ts = %link.thread_ts,
@@ -772,6 +782,7 @@ impl SlackSocketModeChannel {
                 },
                 &linked_threads,
                 &downloaded_files,
+                remove_artifacts,
                 unresolved,
             ),
             succeeded_file_sync_keys,
@@ -801,10 +812,12 @@ impl SlackSocketModeChannel {
                     stale_reason: None,
                 })
             }
-            Err(err) if !cached.is_empty() => Ok(SlackThreadFetch {
-                messages: cached,
-                stale_reason: Some(context_error_reason(&err)),
-            }),
+            Err(err) if !cached.is_empty() && slack_error_allows_cached_context(&err) => {
+                Ok(SlackThreadFetch {
+                    messages: cached,
+                    stale_reason: Some(context_error_reason(&err)),
+                })
+            }
             Err(err) => Err(err),
         }
     }
@@ -833,16 +846,17 @@ impl SlackSocketModeChannel {
                 .send()
                 .await?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                anyhow::bail!("rate_limited");
+                return Err(SlackApiError::new("conversations.replies", "rate_limited").into());
             }
             let response = response.json::<SlackThreadResponse>().await?;
             if !response.ok {
-                anyhow::bail!(
-                    "Slack conversations.replies failed: {}",
+                return Err(SlackApiError::new(
+                    "conversations.replies",
                     response
                         .error
-                        .unwrap_or_else(|| "unknown_error".to_string())
-                );
+                        .unwrap_or_else(|| "unknown_error".to_string()),
+                )
+                .into());
             }
             for raw in response.messages.unwrap_or_default() {
                 if let Some(message) = parse_slack_thread_message(raw) {
@@ -861,6 +875,19 @@ impl SlackSocketModeChannel {
     }
 
     async fn download_slack_file(&self, file: SlackFileRef) -> anyhow::Result<DownloadedSlackFile> {
+        tracing::info!(
+            file_id = %file.id,
+            file_name = %file.name,
+            "fetching Slack file metadata"
+        );
+        let file = self.fetch_slack_file_info(file).await?;
+        tracing::info!(
+            file_id = %file.id,
+            file_name = %file.name,
+            size_bytes = file.size_bytes,
+            has_private_download_url = file.url_private_download.is_some(),
+            "fetched Slack file metadata"
+        );
         if file.size_bytes > self.cfg.context_sync.max_file_bytes {
             anyhow::bail!(
                 "file exceeds max_file_bytes ({} > {})",
@@ -917,6 +944,36 @@ impl SlackSocketModeChannel {
             bytes,
             extracted_text,
         })
+    }
+
+    async fn fetch_slack_file_info(&self, file: SlackFileRef) -> anyhow::Result<SlackFileRef> {
+        let response = self
+            .http
+            .get("https://slack.com/api/files.info")
+            .bearer_auth(&self.cfg.bot_token)
+            .query(&[("file", file.id.as_str())])
+            .send()
+            .await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(SlackApiError::new("files.info", "rate_limited").into());
+        }
+        let response = response.json::<SlackFileInfoResponse>().await?;
+        if !response.ok {
+            return Err(SlackApiError::new(
+                "files.info",
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        let Some(file_info) = response.file else {
+            anyhow::bail!("Slack files.info response omitted file");
+        };
+        let Some(info) = parse_slack_file_ref(&file_info) else {
+            anyhow::bail!("Slack files.info response file is invalid");
+        };
+        Ok(merge_slack_file_info(file, info))
     }
 
     async fn file_sync_state(
@@ -1162,8 +1219,60 @@ struct SlackThreadResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct SlackFileInfoResponse {
+    ok: bool,
+    file: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SlackResponseMetadata {
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SlackApiError {
+    method: &'static str,
+    code: String,
+}
+
+impl SlackApiError {
+    fn new(method: &'static str, code: impl Into<String>) -> Self {
+        Self {
+            method,
+            code: code.into(),
+        }
+    }
+
+    fn is_access_denied(&self) -> bool {
+        matches!(
+            self.code.as_str(),
+            "not_in_channel"
+                | "channel_not_found"
+                | "missing_scope"
+                | "not_authed"
+                | "invalid_auth"
+                | "account_inactive"
+                | "token_revoked"
+        )
+    }
+}
+
+impl std::fmt::Display for SlackApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Slack {} failed: {}", self.method, self.code)
+    }
+}
+
+impl std::error::Error for SlackApiError {}
+
+fn slack_error_is_access_denied(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SlackApiError>()
+        .is_some_and(SlackApiError::is_access_denied)
+}
+
+fn slack_error_allows_cached_context(err: &anyhow::Error) -> bool {
+    !slack_error_is_access_denied(err)
 }
 
 #[derive(Debug, Clone)]
@@ -1339,38 +1448,68 @@ fn parse_slack_file_refs(message: &Value) -> Vec<SlackFileRef> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|file| {
-            let id = file.get("id").and_then(Value::as_str)?.to_string();
-            let name = file
-                .get("name")
-                .or_else(|| file.get("title"))
-                .and_then(Value::as_str)
-                .unwrap_or(&id)
-                .to_string();
-            let size_bytes = file
-                .get("size")
-                .and_then(Value::as_u64)
-                .and_then(|size| usize::try_from(size).ok())
-                .unwrap_or(0);
-            Some(SlackFileRef {
-                id,
-                name,
-                mimetype: file
-                    .get("mimetype")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                size_bytes,
-                url_private: file
-                    .get("url_private")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                url_private_download: file
-                    .get("url_private_download")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-            })
-        })
+        .filter_map(parse_slack_file_ref)
         .collect()
+}
+
+fn parse_slack_file_ref(file: &Value) -> Option<SlackFileRef> {
+    let id = file.get("id").and_then(Value::as_str)?.to_string();
+    let name = file
+        .get("name")
+        .or_else(|| file.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let size_bytes = file
+        .get("size")
+        .and_then(Value::as_u64)
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(0);
+    Some(SlackFileRef {
+        id,
+        name,
+        mimetype: file
+            .get("mimetype")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        size_bytes,
+        url_private: file
+            .get("url_private")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        url_private_download: file
+            .get("url_private_download")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn merge_slack_file_info(original: SlackFileRef, info: SlackFileRef) -> SlackFileRef {
+    let SlackFileRef {
+        id,
+        name,
+        mimetype,
+        size_bytes,
+        url_private,
+        url_private_download,
+    } = original;
+    let info_name_is_fallback = info.name == info.id;
+    SlackFileRef {
+        id: id.clone(),
+        name: if info_name_is_fallback && name != id {
+            name
+        } else {
+            info.name
+        },
+        mimetype: info.mimetype.or(mimetype),
+        size_bytes: if info.size_bytes == 0 {
+            size_bytes
+        } else {
+            info.size_bytes
+        },
+        url_private: info.url_private.or(url_private),
+        url_private_download: info.url_private_download.or(url_private_download),
+    }
 }
 
 fn collect_context_file_refs(
@@ -1614,6 +1753,20 @@ fn slack_thread_reference(channel: &str, thread_ts: &str) -> String {
     format!("{channel}:{thread_ts}")
 }
 
+fn slack_current_thread_removal(channel: &str, thread_ts: &str) -> ContextArtifactRemovalInput {
+    ContextArtifactRemovalInput {
+        id: format!("slack:thread:{channel}:{thread_ts}"),
+        kind: "slack_current_thread".to_string(),
+    }
+}
+
+fn slack_linked_thread_removal(channel: &str, thread_ts: &str) -> ContextArtifactRemovalInput {
+    ContextArtifactRemovalInput {
+        id: format!("slack:linked-thread:{channel}:{thread_ts}"),
+        kind: "slack_linked_thread".to_string(),
+    }
+}
+
 fn context_error_reason(err: &anyhow::Error) -> String {
     let raw = err.to_string();
     if raw.contains("url_private") || raw.contains("slack-files.com") || raw.contains("http") {
@@ -1635,6 +1788,7 @@ fn build_slack_context_request(
     current_thread: CurrentSlackThreadContext<'_>,
     linked_threads: &[LinkedSlackThread],
     downloaded_files: &[DownloadedSlackFile],
+    remove_artifacts: Vec<ContextArtifactRemovalInput>,
     unresolved: Vec<ContextSyncIssueInput>,
 ) -> ContextSyncRequest {
     let mut artifacts = Vec::new();
@@ -1700,6 +1854,7 @@ fn build_slack_context_request(
         source: "slack".to_string(),
         base_path: PathBuf::from("slack"),
         artifacts,
+        remove_artifacts,
         unresolved,
     }
 }
@@ -2083,6 +2238,7 @@ mod tests {
             &[],
             &[downloaded],
             Vec::new(),
+            Vec::new(),
         );
 
         assert_eq!(request.source, "slack");
@@ -2318,6 +2474,60 @@ mod tests {
         assert!(parse_slack_file_url("https://example.com/files/F1").is_err());
     }
 
+    #[test]
+    fn access_denied_thread_errors_do_not_reuse_cached_context() {
+        let denied = anyhow::Error::new(SlackApiError::new(
+            "conversations.replies",
+            "not_in_channel",
+        ));
+        let rate_limited =
+            anyhow::Error::new(SlackApiError::new("conversations.replies", "rate_limited"));
+
+        assert!(!slack_error_allows_cached_context(&denied));
+        assert!(slack_error_allows_cached_context(&rate_limited));
+    }
+
+    #[test]
+    fn access_denied_thread_removals_target_prior_artifacts() {
+        let current = slack_current_thread_removal("C1", "111.000");
+        let linked = slack_linked_thread_removal("C2", "222.000");
+
+        assert_eq!(current.id, "slack:thread:C1:111.000");
+        assert_eq!(current.kind, "slack_current_thread");
+        assert_eq!(linked.id, "slack:linked-thread:C2:222.000");
+        assert_eq!(linked.kind, "slack_linked_thread");
+    }
+
+    #[test]
+    fn files_info_metadata_fills_missing_private_download_url() {
+        let original = SlackFileRef {
+            id: "F1".to_string(),
+            name: "fallback.txt".to_string(),
+            mimetype: None,
+            size_bytes: 0,
+            url_private: None,
+            url_private_download: None,
+        };
+        let info = parse_slack_file_ref(&json!({
+            "id": "F1",
+            "name": "actual.txt",
+            "mimetype": "text/plain",
+            "size": 4,
+            "url_private_download": "https://files.slack.com/files-pri/T1/F1/actual.txt"
+        }))
+        .unwrap();
+
+        let merged = merge_slack_file_info(original, info);
+
+        assert_eq!(merged.name, "actual.txt");
+        assert_eq!(merged.mimetype.as_deref(), Some("text/plain"));
+        assert_eq!(merged.size_bytes, 4);
+        assert_eq!(
+            merged.url_private_download.as_deref(),
+            Some("https://files.slack.com/files-pri/T1/F1/actual.txt")
+        );
+    }
+
     #[tokio::test]
     async fn slack_session_locks_are_scoped_by_session_key() {
         let channel = SlackSocketModeChannel::new(
@@ -2453,6 +2663,7 @@ mod tests {
             &[linked],
             &[],
             Vec::new(),
+            Vec::new(),
         );
 
         assert!(
@@ -2514,6 +2725,7 @@ mod tests {
             },
             &[linked],
             &[],
+            Vec::new(),
             Vec::new(),
         );
 

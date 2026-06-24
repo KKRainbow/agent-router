@@ -523,8 +523,7 @@ where
         let (mut existing_context, used_recovered_context) =
             merge_recovered_context_artifacts(&state.context_artifacts, &source, recovered_context);
         if recovery_failed {
-            existing_context
-                .retain(|record| !(record.source == source && record.kind == "manifest"));
+            existing_context.retain(|record| record.source != source);
         }
         if used_recovered_context {
             tracing::info!(
@@ -929,7 +928,7 @@ fn recover_context_artifacts_from_manifest(
     session_key: &str,
     source: &str,
 ) -> (Vec<ContextArtifactRecord>, bool) {
-    match read_context_artifacts_from_manifest(cwd, source, Path::new(source)) {
+    match read_context_artifacts_from_manifest(cwd, source, session_key, Path::new(source)) {
         Ok(records) => (records, false),
         Err(err) => {
             tracing::warn!(
@@ -969,8 +968,14 @@ where
                 .map(|root| root.join(session_workspace_dir_name(session_key)))
         });
         let records = if let Some(cwd) = recovery_cwd {
-            let (recovered, _) = recover_context_artifacts_from_manifest(&cwd, session_key, source);
-            merge_recovered_context_artifacts(&state_context, source, recovered).0
+            let (recovered, recovery_failed) =
+                recover_context_artifacts_from_manifest(&cwd, session_key, source);
+            let (mut records, _) =
+                merge_recovered_context_artifacts(&state_context, source, recovered);
+            if recovery_failed {
+                records.retain(|record| record.source != source);
+            }
+            records
         } else {
             state_context
         };
@@ -1718,6 +1723,7 @@ mod tests {
                         }],
                         metadata: Default::default(),
                     }],
+                    remove_artifacts: Vec::new(),
                     unresolved: Vec::new(),
                 }),
                 &mut output,
@@ -1782,6 +1788,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::from([("file_id".to_string(), json!("F1"))]),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: vec![ContextSyncIssueInput {
                     kind: "file".to_string(),
                     reference: "F2".to_string(),
@@ -1825,6 +1832,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::new(),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: Vec::new(),
             })
             .await
@@ -1876,6 +1884,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::from([("file_id".to_string(), json!("F1"))]),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: vec![ContextSyncIssueInput {
                     kind: "file".to_string(),
                     reference: "F2".to_string(),
@@ -1931,6 +1940,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::new(),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: Vec::new(),
             })
             .await
@@ -1985,6 +1995,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::from([("file_id".to_string(), json!("F1"))]),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: vec![ContextSyncIssueInput {
                     kind: "file".to_string(),
                     reference: "F2".to_string(),
@@ -2040,6 +2051,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::new(),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: Vec::new(),
             })
             .await
@@ -2111,6 +2123,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::new(),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: Vec::new(),
             })
             .await
@@ -2150,6 +2163,7 @@ mod tests {
                     }],
                     metadata: BTreeMap::from([("file_id".to_string(), json!("F1"))]),
                 }],
+                remove_artifacts: Vec::new(),
                 unresolved: Vec::new(),
             },
             &[],
