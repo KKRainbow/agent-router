@@ -901,9 +901,17 @@ fn merge_recovered_context_artifacts(
 }
 
 fn source_manifest_updated_at(records: &[ContextArtifactRecord], source: &str) -> Option<u64> {
+    let canonical_manifest = Path::new(source).join("manifest.json");
     records
         .iter()
-        .find(|record| record.source == source && record.kind == "manifest")
+        .find(|record| {
+            record.source == source
+                && record.kind == "manifest"
+                && record
+                    .paths
+                    .first()
+                    .is_some_and(|path| Path::new(path) == canonical_manifest.as_path())
+        })
         .map(|record| record.updated_at_ms)
 }
 
@@ -1900,6 +1908,115 @@ mod tests {
                 paths: vec!["slack/files/F0/metadata.json".to_string()],
                 fingerprint: "artifact:stale-file".to_string(),
                 updated_at_ms: 0,
+                metadata: BTreeMap::from([("file_id".to_string(), json!("F0"))]),
+            },
+        ];
+        restarted_store.save(stale_state).await;
+
+        let restarted_router = AgentRouter::new("kimi", restarted_store.clone(), executor)
+            .with_workspace_root(Some(workspace_root));
+        restarted_router
+            .sync_context(ContextSyncRequest {
+                session_key: session_key.to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:thread:C1:111.000".to_string(),
+                    kind: "slack_current_thread".to_string(),
+                    title: "Current Slack thread".to_string(),
+                    source_locator: Some("slack://C1/111.000".to_string()),
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/current-thread.md"),
+                        content: ContextFileContent::Text("thread".to_string()),
+                    }],
+                    metadata: BTreeMap::new(),
+                }],
+                unresolved: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let artifacts = restarted_store
+            .load(session_key)
+            .await
+            .unwrap()
+            .context_artifacts;
+        assert!(artifacts.iter().any(|record| record.id == "slack:file:F1"));
+        assert!(!artifacts.iter().any(|record| record.id == "slack:file:F0"));
+        assert!(
+            artifacts
+                .iter()
+                .any(|record| record.kind == "slack_current_thread")
+        );
+        let manifest = artifacts
+            .iter()
+            .find(|record| record.kind == "manifest")
+            .unwrap();
+        assert_eq!(manifest.metadata["unresolved_count"].as_u64(), Some(1));
+        assert_eq!(
+            manifest.metadata["unresolved"][0]["reference"].as_str(),
+            Some("F2")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_restart_context_sync_prefers_recovered_manifest_over_invalid_state_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:channel:C1:111.000";
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let first_store = Arc::new(InMemorySessionStore::default());
+        let first_router = AgentRouter::new("kimi", first_store, executor.clone())
+            .with_workspace_root(Some(workspace_root.clone()));
+
+        first_router
+            .sync_context(ContextSyncRequest {
+                session_key: session_key.to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:file:F1".to_string(),
+                    kind: "slack_file".to_string(),
+                    title: "Slack file F1".to_string(),
+                    source_locator: None,
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/files/F1/metadata.json"),
+                        content: ContextFileContent::Text("{}".to_string()),
+                    }],
+                    metadata: BTreeMap::from([("file_id".to_string(), json!("F1"))]),
+                }],
+                unresolved: vec![ContextSyncIssueInput {
+                    kind: "file".to_string(),
+                    reference: "F2".to_string(),
+                    reason: "transient".to_string(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let restarted_store = Arc::new(InMemorySessionStore::default());
+        let mut stale_state = SessionState::new(session_key, "kimi");
+        stale_state.context_artifacts = vec![
+            ContextArtifactRecord {
+                id: "slack:manifest".to_string(),
+                source: "slack".to_string(),
+                kind: "manifest".to_string(),
+                title: "Invalid manifest pointer".to_string(),
+                source_locator: None,
+                paths: vec!["other/manifest.json".to_string()],
+                fingerprint: "artifact:invalid-manifest".to_string(),
+                updated_at_ms: u64::MAX,
+                metadata: BTreeMap::new(),
+            },
+            ContextArtifactRecord {
+                id: "slack:file:F0".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Stale Slack file".to_string(),
+                source_locator: None,
+                paths: vec!["slack/files/F0/metadata.json".to_string()],
+                fingerprint: "artifact:stale-file".to_string(),
+                updated_at_ms: u64::MAX,
                 metadata: BTreeMap::from([("file_id".to_string(), json!("F0"))]),
             },
         ];
