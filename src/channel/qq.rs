@@ -225,17 +225,26 @@ impl QqBotChannel {
         if is_approval_command(&message.text) {
             let channel = self.clone();
             tokio::spawn(async move {
-                if let Err(err) = channel.route_message(message, router).await {
+                if let Err(err) = channel.route_message(message, None, router).await {
                     tracing::warn!(error = %err, "failed to handle QQ approval command");
                 }
             });
             return Ok(());
         }
 
+        let command = message.text.split_whitespace().next().unwrap_or("");
+        let preempt_generation = if matches!(command, "/stop" | "/agent" | "/yolo") {
+            None
+        } else {
+            Some(router.preempt(&message.session_key).await?)
+        };
         let channel = self.clone();
         tokio::spawn(async move {
             let session_key = message.session_key.clone();
-            if let Err(err) = channel.route_message(message, router).await {
+            if let Err(err) = channel
+                .route_message(message, preempt_generation, router)
+                .await
+            {
                 tracing::warn!(
                     error = %err,
                     session_key = %session_key,
@@ -249,6 +258,7 @@ impl QqBotChannel {
     async fn route_message(
         &self,
         message: QqInboundMessage,
+        preempt_generation: Option<u64>,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
         self.remember_reply_context(&message).await;
@@ -267,16 +277,18 @@ impl QqBotChannel {
             channel_events: self.cfg.channel_events,
             pending_events: Vec::new(),
         };
-        router
-            .handle(
-                RouterInput {
-                    session_key: message.session_key,
-                    text: message.text,
-                    user_id: Some(message.user_id),
-                },
-                &mut output,
-            )
-            .await
+        let input = RouterInput {
+            session_key: message.session_key,
+            text: message.text,
+            user_id: Some(message.user_id),
+        };
+        if let Some(preempt_generation) = preempt_generation {
+            router
+                .handle_preempted_with_context(input, preempt_generation, None, &mut output)
+                .await
+        } else {
+            router.handle(input, &mut output).await
+        }
     }
 
     fn spawn_approval_notifier(self: Arc<Self>) {

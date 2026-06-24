@@ -303,6 +303,10 @@ pub trait RouterOutputSink: Send {
 
 #[async_trait]
 pub trait RouterService: Send + Sync + 'static {
+    async fn preempt(&self, _session_key: &str) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
     async fn context_artifacts(
         &self,
         _session_key: &str,
@@ -325,6 +329,17 @@ pub trait RouterService: Send + Sync + 'static {
             self.sync_context(context).await?;
         }
         self.handle(input, output).await
+    }
+
+    async fn handle_preempted_with_context(
+        &self,
+        input: RouterInput,
+        preempt_generation: u64,
+        context: Option<ContextSyncRequest>,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        let _ = preempt_generation;
+        self.handle_with_context(input, context, output).await
     }
 
     async fn handle(
@@ -406,7 +421,7 @@ where
 #[derive(Debug, Clone)]
 struct ActiveRouterTurn {
     generation: u64,
-    executor: String,
+    executor: Option<String>,
     cancel: TurnCancellation,
 }
 
@@ -484,11 +499,29 @@ where
             session_key.to_string(),
             ActiveRouterTurn {
                 generation,
-                executor,
+                executor: Some(executor),
                 cancel,
             },
         );
         (generation, replaced)
+    }
+
+    async fn preempt_active_turn(&self, session_key: &str) -> u64 {
+        let generation = self.next_turn_generation.fetch_add(1, Ordering::Relaxed);
+        let cancel = TurnCancellation::new();
+        let replaced = self.active_turns.lock().await.insert(
+            session_key.to_string(),
+            ActiveRouterTurn {
+                generation,
+                executor: None,
+                cancel,
+            },
+        );
+        if let Some(replaced) = replaced {
+            self.interrupt_turn(session_key, replaced, InterruptReason::ReplacedByNewMessage)
+                .await;
+        }
+        generation
     }
 
     async fn interrupt_turn(
@@ -498,11 +531,14 @@ where
         reason: InterruptReason,
     ) {
         let _ = turn.cancel.cancel(reason).await;
+        let Some(executor) = turn.executor else {
+            return;
+        };
         if let Err(err) = self
             .executor
             .interrupt(ExecutorInterruptRequest {
                 session_key: session_key.to_string(),
-                executor: turn.executor,
+                executor,
                 generation: turn.generation,
                 reason,
             })
@@ -529,9 +565,33 @@ where
         false
     }
 
+    async fn active_turn_is_current(&self, session_key: &str, generation: u64) -> bool {
+        self.active_turns
+            .lock()
+            .await
+            .get(session_key)
+            .is_some_and(|turn| turn.generation == generation)
+    }
+
+    async fn adopt_preempted_turn(
+        &self,
+        session_key: &str,
+        generation: u64,
+        executor: String,
+    ) -> Option<TurnCancellation> {
+        let mut active_turns = self.active_turns.lock().await;
+        let turn = active_turns.get_mut(session_key)?;
+        if turn.generation != generation {
+            return None;
+        }
+        turn.executor = Some(executor);
+        Some(turn.cancel.clone())
+    }
+
     async fn handle_input(
         &self,
         input: RouterInput,
+        preempt_generation: Option<u64>,
         context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
@@ -539,12 +599,6 @@ where
         let command = text.split_whitespace().next().unwrap_or("");
         if command == "/stop" {
             return self.handle_stop_command(&input.session_key, output).await;
-        }
-
-        if let Some(context) = context {
-            let lock = self.session_lock(&context.session_key).await;
-            let _guard = lock.lock().await;
-            self.sync_context_locked(context).await?;
         }
 
         if command == "/agent" {
@@ -561,7 +615,8 @@ where
                 .handle_yolo_command(&input.session_key, text, output)
                 .await;
         }
-        self.route_to_active_executor(input, output).await
+        self.route_to_active_executor(input, preempt_generation, context, output)
+            .await
     }
 
     async fn observe_locked(&self, input: RouterInput) -> anyhow::Result<()> {
@@ -763,13 +818,37 @@ where
     async fn route_to_active_executor(
         &self,
         input: RouterInput,
+        preempt_generation: Option<u64>,
+        context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
         let session_key = input.session_key.clone();
-        let cancel = TurnCancellation::new();
-        let (generation, replaced, state, executor_name, descriptor, binding, session_cwd) = {
+        let (generation, cancel, replaced, state, executor_name, descriptor, binding, session_cwd) = {
             let lock = self.session_lock(&session_key).await;
             let _guard = lock.lock().await;
+            if let Some(generation) = preempt_generation
+                && !self.active_turn_is_current(&session_key, generation).await
+            {
+                tracing::debug!(
+                    session_key = %session_key,
+                    generation,
+                    "discarded stale preempted router turn before context sync"
+                );
+                return Ok(());
+            }
+            if let Some(context) = context {
+                self.sync_context_locked(context).await?;
+                if let Some(generation) = preempt_generation
+                    && !self.active_turn_is_current(&session_key, generation).await
+                {
+                    tracing::debug!(
+                        session_key = %session_key,
+                        generation,
+                        "discarded stale preempted router turn after context sync"
+                    );
+                    return Ok(());
+                }
+            }
             let mut state = self
                 .store
                 .load_or_create(&session_key, &self.default_executor)
@@ -783,11 +862,33 @@ where
                 self.store.save(state.clone()).await;
             }
             let binding = state.binding_for(&executor_name);
-            let (generation, replaced) = self
-                .install_active_turn(&session_key, executor_name.clone(), cancel.clone())
-                .await;
+            let (generation, cancel, replaced) = if let Some(preempt_generation) =
+                preempt_generation
+            {
+                match self
+                    .adopt_preempted_turn(&session_key, preempt_generation, executor_name.clone())
+                    .await
+                {
+                    Some(cancel) => (preempt_generation, cancel, None),
+                    None => {
+                        tracing::debug!(
+                            session_key = %session_key,
+                            generation = preempt_generation,
+                            "discarded stale preempted router turn before prompt"
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                let cancel = TurnCancellation::new();
+                let (generation, replaced) = self
+                    .install_active_turn(&session_key, executor_name.clone(), cancel.clone())
+                    .await;
+                (generation, cancel, replaced)
+            };
             (
                 generation,
+                cancel,
                 replaced,
                 state,
                 executor_name,
@@ -1208,6 +1309,10 @@ where
     S: SessionStore,
     E: ExecutorBackend,
 {
+    async fn preempt(&self, session_key: &str) -> anyhow::Result<u64> {
+        Ok(self.preempt_active_turn(session_key).await)
+    }
+
     async fn context_artifacts(
         &self,
         session_key: &str,
@@ -1263,7 +1368,25 @@ where
         {
             return output.send_final_reply(reply.text).await;
         }
-        self.handle_input(input, context, output).await
+        self.handle_input(input, None, context, output).await
+    }
+
+    async fn handle_preempted_with_context(
+        &self,
+        input: RouterInput,
+        preempt_generation: u64,
+        context: Option<ContextSyncRequest>,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        if let Some(reply) = self
+            .approvals
+            .resolve_command(&input.session_key, &input.text, input.user_id.as_deref())
+            .await
+        {
+            return output.send_final_reply(reply.text).await;
+        }
+        self.handle_input(input, Some(preempt_generation), context, output)
+            .await
     }
 
     async fn handle(
@@ -1278,7 +1401,7 @@ where
         {
             return output.send_final_reply(reply.text).await;
         }
-        self.handle_input(input, None, output).await
+        self.handle_input(input, None, None, output).await
     }
 
     async fn observe(&self, input: RouterInput) -> anyhow::Result<()> {
@@ -3243,6 +3366,131 @@ mod tests {
 
         assert_eq!(output.final_reply(), "No active turn for this session.");
         assert!(store.load("slack:C1:T1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn preempted_context_turn_prevents_interrupted_turn_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(InterruptibleExecutorBackend::new(started_tx, cancelled_tx));
+        let router = Arc::new(
+            AgentRouter::new("kimi", store.clone(), executor)
+                .with_workspace_root(Some(tmp.path().join("workspaces"))),
+        );
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let generation = router.preempt("slack:C1:T1").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut second_output = CollectingRouterOutputSink::default();
+        router
+            .handle_preempted_with_context(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                generation,
+                Some(ContextSyncRequest {
+                    session_key: "slack:C1:T1".to_string(),
+                    source: "slack".to_string(),
+                    base_path: PathBuf::from("slack"),
+                    artifacts: vec![ContextArtifactInput {
+                        id: "thread".to_string(),
+                        kind: "slack_current_thread".to_string(),
+                        title: "Thread".to_string(),
+                        source_locator: None,
+                        files: vec![ContextFileInput {
+                            relative_path: PathBuf::from("slack/current-thread.md"),
+                            content: ContextFileContent::Text("thread context".to_string()),
+                        }],
+                        metadata: Default::default(),
+                    }],
+                    remove_artifacts: Vec::new(),
+                    unresolved: Vec::new(),
+                }),
+                &mut second_output,
+            )
+            .await
+            .unwrap();
+
+        assert!(first.await.unwrap().events.is_empty());
+        assert_eq!(second_output.final_reply(), "response 2");
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[0].content, "second");
+    }
+
+    #[tokio::test]
+    async fn stale_preempted_message_does_not_interrupt_newer_generation() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone());
+
+        let stale_generation = router.preempt("slack:C1:T1").await.unwrap();
+        let current_generation = router.preempt("slack:C1:T1").await.unwrap();
+
+        let mut stale_output = CollectingRouterOutputSink::default();
+        router
+            .handle_preempted_with_context(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "older delayed".to_string(),
+                    user_id: None,
+                },
+                stale_generation,
+                None,
+                &mut stale_output,
+            )
+            .await
+            .unwrap();
+        assert!(stale_output.events.is_empty());
+        assert!(executor.prompts.lock().await.is_empty());
+
+        let mut current_output = CollectingRouterOutputSink::default();
+        router
+            .handle_preempted_with_context(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "newer".to_string(),
+                    user_id: None,
+                },
+                current_generation,
+                None,
+                &mut current_output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(current_output.final_reply(), "fake response");
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].prompt.contains("Current user message:\nnewer"));
     }
 
     #[tokio::test]

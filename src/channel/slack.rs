@@ -261,6 +261,12 @@ impl SlackSocketModeChannel {
                 .await?;
             return Ok(());
         }
+        let command = text.split_whitespace().next().unwrap_or("");
+        let preempt_generation = if matches!(command, "/stop" | "/agent" | "/yolo") {
+            None
+        } else {
+            Some(router.preempt(&session_key).await?)
+        };
         tracing::info!(
             channel = %event.channel,
             user_id = %event.user,
@@ -293,17 +299,32 @@ impl SlackSocketModeChannel {
         let reply_target = event.reply_target();
         let mut output =
             SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
-        router
-            .handle_with_context(
-                RouterInput {
-                    session_key,
-                    text,
-                    user_id: Some(event.user),
-                },
-                context.map(|context| context.request),
-                &mut output,
-            )
-            .await?;
+        if let Some(preempt_generation) = preempt_generation {
+            router
+                .handle_preempted_with_context(
+                    RouterInput {
+                        session_key,
+                        text,
+                        user_id: Some(event.user),
+                    },
+                    preempt_generation,
+                    context.map(|context| context.request),
+                    &mut output,
+                )
+                .await?;
+        } else {
+            router
+                .handle_with_context(
+                    RouterInput {
+                        session_key,
+                        text,
+                        user_id: Some(event.user),
+                    },
+                    context.map(|context| context.request),
+                    &mut output,
+                )
+                .await?;
+        }
         for cache_key in succeeded_file_sync_keys {
             self.mark_file_sync_succeeded(cache_key).await;
         }
@@ -532,12 +553,14 @@ impl SlackSocketModeChannel {
     }
 
     fn should_sync_context(&self, text: &str) -> bool {
+        let command = text.split_whitespace().next().unwrap_or("");
         self.cfg.context_sync.enabled
             && !self.cfg.bot_token.is_empty()
             && (self.cfg.context_sync.current_thread
                 || self.cfg.context_sync.linked_threads
                 || self.cfg.context_sync.files)
             && !is_approval_command(text)
+            && !matches!(command, "/stop" | "/agent" | "/yolo")
     }
 
     async fn current_thread_context_request(

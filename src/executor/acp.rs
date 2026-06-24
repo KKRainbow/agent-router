@@ -492,6 +492,11 @@ impl AcpSession {
                 return ExecutorPromptOutcome::Failed(err);
             }
         }
+        if acp_result_cancelled(&result) {
+            self.client.close("ACP turn returned cancelled").await;
+            self.session_id = None;
+            return ExecutorPromptOutcome::Cancelled;
+        }
         let final_text = if text_parts.is_empty() {
             extract_text_result(&result)
         } else {
@@ -1244,6 +1249,16 @@ fn extract_text_result(result: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn acp_result_cancelled(result: &Value) -> bool {
+    ["stopReason", "stop_reason", "reason"]
+        .iter()
+        .filter_map(|key| result.get(*key).and_then(Value::as_str))
+        .any(|reason| {
+            let reason = reason.to_ascii_lowercase();
+            reason == "cancelled" || reason == "canceled"
+        })
+}
+
 fn resolve_cwd(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
     let path = match cwd {
         Some(cwd) => cwd.to_path_buf(),
@@ -1668,6 +1683,78 @@ for line in sys.stdin:
         ));
         let session = manager.existing_session("session-1", "kimi").await.unwrap();
         assert!(!session.lock().await.client.is_alive());
+    }
+
+    #[tokio::test]
+    async fn acp_cancelled_stop_reason_returns_cancelled_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("cancelled_result_acp.py");
+        fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "fake-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})
+"#,
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let manager = AcpExecutorManager::new(executors);
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "kimi".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut events = CollectingExecutorEventSink::default();
+        let outcome = manager
+            .prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "kimi".to_string(),
+                    prompt: "cancel".to_string(),
+                    user_id: None,
+                },
+                &mut events,
+                TurnCancellation::new(),
+            )
+            .await;
+        assert!(matches!(outcome, ExecutorPromptOutcome::Cancelled));
     }
 
     #[tokio::test]
