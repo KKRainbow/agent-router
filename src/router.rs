@@ -62,6 +62,17 @@ impl RouterChannelEvent {
 }
 
 pub(crate) fn render_compact_channel_events(events: &[RouterChannelEvent]) -> Option<String> {
+    render_compact_channel_events_inner(events, true)
+}
+
+pub(crate) fn render_live_compact_channel_events(events: &[RouterChannelEvent]) -> Option<String> {
+    render_compact_channel_events_inner(events, false)
+}
+
+fn render_compact_channel_events_inner(
+    events: &[RouterChannelEvent],
+    suppress_single_successful_tool: bool,
+) -> Option<String> {
     let first = events.first()?;
     let mut latest_reasoning = None;
     let mut tool_total = 0usize;
@@ -91,7 +102,11 @@ pub(crate) fn render_compact_channel_events(events: &[RouterChannelEvent]) -> Op
         }
     }
 
-    if latest_reasoning.is_none() && attention.is_empty() && tool_total <= 1 {
+    if suppress_single_successful_tool
+        && latest_reasoning.is_none()
+        && attention.is_empty()
+        && tool_total <= 1
+    {
         return None;
     }
 
@@ -1406,6 +1421,21 @@ mod tests {
         }];
 
         assert_eq!(render_compact_channel_events(&events), None);
+    }
+
+    #[test]
+    fn live_compact_channel_events_show_single_successful_tool() {
+        let events = vec![RouterChannelEvent {
+            kind: RouterChannelEventKind::ToolCall,
+            executor: "codex".to_string(),
+            title: "Bash".to_string(),
+            text: "exit: 0\nstatus: completed".to_string(),
+        }];
+
+        assert_eq!(
+            render_live_compact_channel_events(&events).as_deref(),
+            Some("[codex] Activity\nTools: 1 step: Bash")
+        );
     }
 
     #[test]

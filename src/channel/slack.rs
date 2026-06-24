@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
     config::{ChannelEventMode, SlackConfig},
     router::{
         RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
-        render_compact_channel_events,
+        render_live_compact_channel_events,
     },
 };
 
@@ -209,7 +209,7 @@ impl SlackSocketModeChannel {
             channel: self.clone(),
             target: reply_target,
             channel_events: self.cfg.channel_events,
-            pending_events: Vec::new(),
+            compact_activity: SlackCompactActivity::default(),
         };
         router
             .handle(
@@ -251,7 +251,7 @@ impl SlackSocketModeChannel {
             channel: self.clone(),
             target: reply_target,
             channel_events: self.cfg.channel_events,
-            pending_events: Vec::new(),
+            compact_activity: SlackCompactActivity::default(),
         };
         router
             .handle(
@@ -319,10 +319,19 @@ impl SlackSocketModeChannel {
     }
 
     async fn post_message(&self, target: &SlackReplyTarget, text: &str) -> anyhow::Result<()> {
+        self.post_message_with_ts(target, text).await.map(|_| ())
+    }
+
+    async fn post_message_with_ts(
+        &self,
+        target: &SlackReplyTarget,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
         #[derive(Deserialize)]
         struct Response {
             ok: bool,
             error: Option<String>,
+            ts: Option<String>,
         }
 
         tracing::info!(
@@ -359,6 +368,53 @@ impl SlackSocketModeChannel {
             text_len = text.len(),
             "sent Slack message"
         );
+        Ok(resp.ts)
+    }
+
+    async fn update_message(
+        &self,
+        target: &SlackReplyTarget,
+        ts: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            error: Option<String>,
+        }
+
+        tracing::info!(
+            channel = %target.channel,
+            ts = %ts,
+            text_len = text.len(),
+            "updating Slack message"
+        );
+        let body = json!({
+            "channel": target.channel,
+            "ts": ts,
+            "text": text,
+        });
+        let resp = self
+            .http
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&body)
+            .send()
+            .await?
+            .json::<Response>()
+            .await?;
+        if !resp.ok {
+            anyhow::bail!(
+                "Slack chat.update failed: {}",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string())
+            );
+        }
+        tracing::info!(
+            channel = %target.channel,
+            ts = %ts,
+            text_len = text.len(),
+            "updated Slack message"
+        );
         Ok(())
     }
 
@@ -383,7 +439,13 @@ struct SlackRouterOutputSink {
     channel: SlackSocketModeChannel,
     target: SlackReplyTarget,
     channel_events: ChannelEventMode,
-    pending_events: Vec<RouterChannelEvent>,
+    compact_activity: SlackCompactActivity,
+}
+
+#[derive(Default)]
+struct SlackCompactActivity {
+    events: Vec<RouterChannelEvent>,
+    updates: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[async_trait::async_trait]
@@ -391,7 +453,27 @@ impl RouterOutputSink for SlackRouterOutputSink {
     fn send_channel_event(&mut self, event: RouterChannelEvent) {
         match self.channel_events {
             ChannelEventMode::Off => {}
-            ChannelEventMode::Compact => self.pending_events.push(event),
+            ChannelEventMode::Compact => {
+                self.compact_activity.events.push(event);
+                let Some(summary) =
+                    render_live_compact_channel_events(&self.compact_activity.events)
+                else {
+                    return;
+                };
+                if self.compact_activity.updates.is_none() {
+                    self.compact_activity.updates = Some(spawn_slack_compact_activity_updater(
+                        self.channel.clone(),
+                        self.target.clone(),
+                    ));
+                }
+                if let Some(updates) = &self.compact_activity.updates
+                    && updates.send(summary).is_err()
+                {
+                    tracing::warn!(
+                        "compact Slack activity updater stopped before receiving update"
+                    );
+                }
+            }
             ChannelEventMode::Verbose => {
                 let channel = self.channel.clone();
                 let target = self.target.clone();
@@ -405,13 +487,39 @@ impl RouterOutputSink for SlackRouterOutputSink {
     }
 
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
-        if let Some(summary) = render_compact_channel_events(&self.pending_events)
-            && let Err(err) = self.channel.post_message(&self.target, &summary).await
-        {
-            tracing::warn!(error = %err, "failed to post compact Slack channel event summary");
-        }
         self.channel.post_message(&self.target, &text).await
     }
+}
+
+fn spawn_slack_compact_activity_updater(
+    channel: SlackSocketModeChannel,
+    target: SlackReplyTarget,
+) -> mpsc::UnboundedSender<String> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut message_ts = None;
+        while let Some(mut summary) = rx.recv().await {
+            while let Ok(next) = rx.try_recv() {
+                summary = next;
+            }
+            if let Some(ts) = message_ts.as_deref() {
+                if let Err(err) = channel.update_message(&target, ts, &summary).await {
+                    tracing::warn!(error = %err, "failed to update compact Slack activity message");
+                }
+            } else {
+                match channel.post_message_with_ts(&target, &summary).await {
+                    Ok(Some(ts)) => message_ts = Some(ts),
+                    Ok(None) => {
+                        tracing::warn!("compact Slack activity message response omitted ts");
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to post compact Slack activity message");
+                    }
+                }
+            }
+        }
+    });
+    tx
 }
 
 #[derive(Debug, Deserialize)]
