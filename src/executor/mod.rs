@@ -15,10 +15,16 @@ pub struct ExecutorDescriptor {
     pub protocol: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct ExecutorPrepareRequest {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorTurnRef {
     pub session_key: String,
     pub executor: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutorPrepareRequest {
+    pub turn: ExecutorTurnRef,
     pub cwd: Option<PathBuf>,
     pub previous_session_id: Option<String>,
 }
@@ -31,8 +37,7 @@ pub struct PreparedExecutor {
 
 #[derive(Debug, Clone)]
 pub struct ExecutorPromptRequest {
-    pub session_key: String,
-    pub executor: String,
+    pub turn: ExecutorTurnRef,
     pub prompt: String,
     pub user_id: Option<String>,
 }
@@ -46,9 +51,7 @@ pub enum InterruptReason {
 
 #[derive(Debug, Clone)]
 pub struct ExecutorInterruptRequest {
-    pub session_key: String,
-    pub executor: String,
-    pub generation: u64,
+    pub turn: ExecutorTurnRef,
     pub reason: InterruptReason,
 }
 
@@ -315,6 +318,7 @@ pub mod test_support {
     pub struct ExecutorRequest {
         pub session_key: String,
         pub executor: String,
+        pub generation: u64,
         pub prompt: String,
     }
 
@@ -378,8 +382,9 @@ pub mod test_support {
                 return ExecutorPromptOutcome::Cancelled;
             }
             self.prompts.lock().await.push(ExecutorRequest {
-                session_key: request.session_key,
-                executor: request.executor,
+                session_key: request.turn.session_key,
+                executor: request.turn.executor,
+                generation: request.turn.generation,
                 prompt: request.prompt,
             });
             if let Err(err) = events

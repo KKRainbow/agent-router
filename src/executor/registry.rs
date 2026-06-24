@@ -61,7 +61,7 @@ impl ExecutorBackend for ExecutorRegistry {
         request: ExecutorPrepareRequest,
         cancel: TurnCancellation,
     ) -> anyhow::Result<PreparedExecutor> {
-        self.backend_for(&request.executor)?
+        self.backend_for(&request.turn.executor)?
             .prepare(request, cancel)
             .await
     }
@@ -72,7 +72,7 @@ impl ExecutorBackend for ExecutorRegistry {
         events: &mut dyn ExecutorEventSink,
         cancel: TurnCancellation,
     ) -> ExecutorPromptOutcome {
-        let backend = match self.backend_for(&request.executor) {
+        let backend = match self.backend_for(&request.turn.executor) {
             Ok(backend) => backend,
             Err(err) => return ExecutorPromptOutcome::Failed(err),
         };
@@ -80,7 +80,7 @@ impl ExecutorBackend for ExecutorRegistry {
     }
 
     async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
-        self.backend_for(&request.executor)?
+        self.backend_for(&request.turn.executor)?
             .interrupt(request)
             .await
     }

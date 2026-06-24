@@ -586,15 +586,13 @@ where
     }
 
     async fn interrupt_turn(&self, turn: InterruptedTurn) {
-        let Some(executor) = turn.executor else {
+        let Some(turn_ref) = turn.executor_turn_ref() else {
             return;
         };
         if let Err(err) = self
             .executor
             .interrupt(ExecutorInterruptRequest {
-                session_key: turn.session_key.clone(),
-                executor,
-                generation: turn.generation,
+                turn: turn_ref,
                 reason: turn.reason,
             })
             .await
@@ -938,6 +936,7 @@ where
         debug_assert_eq!(turn.executor(), executor_name);
         let generation = turn.generation();
         let cancel = turn.cancellation();
+        let executor_turn = turn.executor_turn_ref();
         tracing::info!(
             session_key = %session_key,
             executor = %executor_name,
@@ -954,8 +953,7 @@ where
             .executor
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: session_key.clone(),
-                    executor: executor_name.clone(),
+                    turn: executor_turn.clone(),
                     cwd: session_cwd.clone(),
                     previous_session_id: binding.external_session_id.clone(),
                 },
@@ -1039,8 +1037,7 @@ where
                 .executor
                 .prompt(
                     ExecutorPromptRequest {
-                        session_key: session_key.clone(),
-                        executor: executor_name.clone(),
+                        turn: executor_turn,
                         prompt: projection.prompt,
                         user_id: input.user_id.clone(),
                     },
@@ -1870,6 +1867,36 @@ mod tests {
                 .prompt
                 .contains("Current user message:\n/yoloon")
         );
+    }
+
+    #[tokio::test]
+    async fn executor_prepare_and_prompt_share_turn_identity() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store, executor.clone());
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "hello".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        let prepared = executor.prepared.lock().await;
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prepared[0].turn.session_key, "slack:dm:D1:111.000");
+        assert_eq!(prepared[0].turn.executor, "kimi");
+        assert_eq!(prepared[0].turn.generation, prompts[0].generation);
+        assert_eq!(prompts[0].session_key, "slack:dm:D1:111.000");
+        assert_eq!(prompts[0].executor, "kimi");
     }
 
     #[tokio::test]
@@ -3474,7 +3501,7 @@ mod tests {
                 anyhow::bail!("prepare cancelled");
             }
             Ok(crate::executor::PreparedExecutor {
-                external_session_id: Some(format!("{}-session", request.executor)),
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
                 started_new_session: request.previous_session_id.is_none(),
             })
         }
@@ -3562,6 +3589,9 @@ mod tests {
         assert_eq!(second_output.final_reply(), "response 2");
         let interrupts = executor.interrupts.lock().await;
         assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].turn.session_key, "slack:C1:T1");
+        assert_eq!(interrupts[0].turn.executor, "kimi");
+        assert_eq!(interrupts[0].turn.generation, 1);
         assert_eq!(interrupts[0].reason, InterruptReason::ReplacedByNewMessage);
         drop(interrupts);
 
@@ -3615,7 +3645,7 @@ mod tests {
             _cancel: TurnCancellation,
         ) -> anyhow::Result<crate::executor::PreparedExecutor> {
             Ok(crate::executor::PreparedExecutor {
-                external_session_id: Some(format!("{}-session", request.executor)),
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
                 started_new_session: request.previous_session_id.is_none(),
             })
         }

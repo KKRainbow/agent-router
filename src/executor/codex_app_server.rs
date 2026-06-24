@@ -333,27 +333,31 @@ impl ExecutorBackend for CodexAppServerManager {
         if cancel.is_cancelled().await {
             anyhow::bail!("Codex app-server prepare cancelled");
         }
-        let cfg = self
-            .executors
-            .get(&request.executor)
-            .ok_or_else(|| anyhow::anyhow!("executor `{}` is not configured", request.executor))?;
+        let cfg = self.executors.get(&request.turn.executor).ok_or_else(|| {
+            anyhow::anyhow!("executor `{}` is not configured", request.turn.executor)
+        })?;
         tracing::info!(
-            executor = %request.executor,
-            session_key = %request.session_key,
+            executor = %request.turn.executor,
+            session_key = %request.turn.session_key,
+            generation = request.turn.generation,
             "preparing Codex app-server executor session"
         );
         let (session, created_session) = self
             .get_or_create_session(
-                &request.session_key,
-                &request.executor,
+                &request.turn.session_key,
+                &request.turn.executor,
                 cfg,
                 request.cwd.as_deref(),
             )
             .await?;
         if cancel.is_cancelled().await {
             if created_session {
-                self.discard_session_if_same(&request.session_key, &request.executor, &session)
-                    .await;
+                self.discard_session_if_same(
+                    &request.turn.session_key,
+                    &request.turn.executor,
+                    &session,
+                )
+                .await;
                 let session = session.lock().await;
                 session
                     .client
@@ -365,8 +369,9 @@ impl ExecutorBackend for CodexAppServerManager {
         let mut session = session.lock().await;
         let (thread_id, started_new_session) = session.ensure_thread(cancel).await?;
         tracing::info!(
-            executor = %request.executor,
-            session_key = %request.session_key,
+            executor = %request.turn.executor,
+            session_key = %request.turn.session_key,
+            generation = request.turn.generation,
             thread_id = %thread_id,
             started_new_session,
             "prepared Codex app-server executor session"
@@ -384,19 +389,21 @@ impl ExecutorBackend for CodexAppServerManager {
         cancel: TurnCancellation,
     ) -> ExecutorPromptOutcome {
         let session = match self
-            .existing_session(&request.session_key, &request.executor)
+            .existing_session(&request.turn.session_key, &request.turn.executor)
             .await
         {
             Ok(session) => session,
             Err(err) => return ExecutorPromptOutcome::Failed(err),
         };
         let mut session = session.lock().await;
-        let session_key = request.session_key.clone();
-        let executor = request.executor.clone();
+        let session_key = request.turn.session_key.clone();
+        let executor = request.turn.executor.clone();
+        let generation = request.turn.generation;
         let prompt_len = request.prompt.len();
         tracing::info!(
             executor = %executor,
             session_key = %session_key,
+            generation,
             prompt_len,
             "starting Codex app-server turn"
         );
@@ -407,18 +414,21 @@ impl ExecutorBackend for CodexAppServerManager {
             ExecutorPromptOutcome::Completed(response) => tracing::info!(
                 executor = %executor,
                 session_key = %session_key,
+                generation,
                 final_text_len = response.final_text.len(),
                 "completed Codex app-server turn"
             ),
             ExecutorPromptOutcome::Cancelled => tracing::info!(
                 executor = %executor,
                 session_key = %session_key,
+                generation,
                 "cancelled Codex app-server turn"
             ),
             ExecutorPromptOutcome::Failed(err) => tracing::warn!(
                 error = %err,
                 executor = %executor,
                 session_key = %session_key,
+                generation,
                 "failed Codex app-server turn"
             ),
         }
@@ -430,7 +440,10 @@ impl ExecutorBackend for CodexAppServerManager {
             .sessions
             .lock()
             .await
-            .get(&(request.session_key.clone(), request.executor.clone()))
+            .get(&(
+                request.turn.session_key.clone(),
+                request.turn.executor.clone(),
+            ))
             .cloned();
         let Some(session) = session else {
             return Ok(());
@@ -1827,10 +1840,18 @@ mod tests {
     use crate::approval::ApprovalBroker;
     use crate::executor::{
         ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
-        InterruptReason, test_support::CollectingExecutorEventSink,
+        ExecutorTurnRef, InterruptReason, test_support::CollectingExecutorEventSink,
     };
 
     use super::*;
+
+    fn turn_ref(session_key: &str, executor: &str, generation: u64) -> ExecutorTurnRef {
+        ExecutorTurnRef {
+            session_key: session_key.to_string(),
+            executor: executor.to_string(),
+            generation,
+        }
+    }
 
     fn executor_config(script: &Path, cwd: &Path) -> BTreeMap<String, ExecutorConfig> {
         let mut executors = BTreeMap::new();
@@ -2073,8 +2094,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: Some(session_cwd.clone()),
                     previous_session_id: None,
                 },
@@ -2118,8 +2138,7 @@ for line in sys.stdin:
         let prepared = manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2131,8 +2150,7 @@ for line in sys.stdin:
         let response = manager
             .prompt(
                 ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     prompt: "hello".to_string(),
                     user_id: Some("U1".to_string()),
                 },
@@ -2172,8 +2190,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2190,8 +2207,7 @@ for line in sys.stdin:
             prompt_manager
                 .prompt(
                     ExecutorPromptRequest {
-                        session_key: "session-1".to_string(),
-                        executor: "codex".to_string(),
+                        turn: turn_ref("session-1", "codex", 1),
                         prompt: "wait".to_string(),
                         user_id: None,
                     },
@@ -2261,8 +2277,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2277,8 +2292,7 @@ for line in sys.stdin:
             prompt_manager
                 .prompt(
                     ExecutorPromptRequest {
-                        session_key: "session-1".to_string(),
-                        executor: "codex".to_string(),
+                        turn: turn_ref("session-1", "codex", 1),
                         prompt: "run pwd".to_string(),
                         user_id: Some("U1".to_string()),
                     },
@@ -2346,8 +2360,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2362,8 +2375,7 @@ for line in sys.stdin:
             prompt_manager
                 .prompt(
                     ExecutorPromptRequest {
-                        session_key: "session-1".to_string(),
-                        executor: "codex".to_string(),
+                        turn: turn_ref("session-1", "codex", 1),
                         prompt: "finish with pending approval".to_string(),
                         user_id: Some("U1".to_string()),
                     },
@@ -2427,8 +2439,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2441,8 +2452,7 @@ for line in sys.stdin:
         let err = manager
             .prompt(
                 ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     prompt: "fail".to_string(),
                     user_id: Some("U1".to_string()),
                 },
@@ -2516,8 +2526,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2532,8 +2541,7 @@ for line in sys.stdin:
             prompt_manager
                 .prompt(
                     ExecutorPromptRequest {
-                        session_key: "session-1".to_string(),
-                        executor: "codex".to_string(),
+                        turn: turn_ref("session-1", "codex", 1),
                         prompt: "patch".to_string(),
                         user_id: Some("U1".to_string()),
                     },
@@ -2596,8 +2604,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2610,8 +2617,7 @@ for line in sys.stdin:
         let response = manager
             .prompt(
                 ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     prompt: "elicit".to_string(),
                     user_id: Some("U1".to_string()),
                 },
@@ -2644,8 +2650,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2658,8 +2663,7 @@ for line in sys.stdin:
         let err = manager
             .prompt(
                 ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     prompt: "hang".to_string(),
                     user_id: Some("U1".to_string()),
                 },
@@ -2698,8 +2702,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2713,8 +2716,7 @@ for line in sys.stdin:
             Duration::from_millis(500),
             manager.prompt(
                 ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     prompt: "hang".to_string(),
                     user_id: Some("U1".to_string()),
                 },
@@ -2756,8 +2758,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2771,8 +2772,7 @@ for line in sys.stdin:
             Duration::from_millis(500),
             manager.prompt(
                 ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     prompt: "hang".to_string(),
                     user_id: Some("U1".to_string()),
                 },
@@ -2835,8 +2835,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2851,8 +2850,7 @@ for line in sys.stdin:
             prompt_manager
                 .prompt(
                     ExecutorPromptRequest {
-                        session_key: "session-1".to_string(),
-                        executor: "codex".to_string(),
+                        turn: turn_ref("session-1", "codex", 1),
                         prompt: "many approvals".to_string(),
                         user_id: Some("U1".to_string()),
                     },
@@ -2913,8 +2911,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },
@@ -2927,8 +2924,7 @@ for line in sys.stdin:
         let response = manager
             .prompt(
                 ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     prompt: "work silently".to_string(),
                     user_id: Some("U1".to_string()),
                 },
@@ -2956,8 +2952,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
+                    turn: turn_ref("session-1", "codex", 1),
                     cwd: None,
                     previous_session_id: None,
                 },

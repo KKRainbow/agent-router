@@ -8,7 +8,7 @@ use std::{
 
 use tokio::sync::Mutex;
 
-use crate::executor::{InterruptReason, TurnCancellation};
+use crate::executor::{ExecutorTurnRef, InterruptReason, TurnCancellation};
 
 #[derive(Debug)]
 pub(crate) struct TurnRegistry {
@@ -208,6 +208,14 @@ impl TurnGuard {
         self.cancel.clone()
     }
 
+    pub(crate) fn executor_turn_ref(&self) -> ExecutorTurnRef {
+        ExecutorTurnRef {
+            session_key: self.session_key.clone(),
+            executor: self.executor.clone(),
+            generation: self.generation,
+        }
+    }
+
     pub(crate) async fn is_current(&self) -> bool {
         self.registry
             .is_current(&self.session_key, self.generation)
@@ -218,6 +226,16 @@ impl TurnGuard {
         self.registry
             .discard_if_current(&self.session_key, self.generation)
             .await
+    }
+}
+
+impl InterruptedTurn {
+    pub(crate) fn executor_turn_ref(&self) -> Option<ExecutorTurnRef> {
+        self.executor.as_ref().map(|executor| ExecutorTurnRef {
+            session_key: self.session_key.clone(),
+            executor: executor.clone(),
+            generation: self.generation,
+        })
     }
 }
 
