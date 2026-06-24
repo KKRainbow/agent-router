@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -88,6 +89,83 @@ pub fn parse_event_line(line: &str) -> Option<ClaudeEvent> {
 
 pub fn is_compaction_result(subtype: Option<&str>) -> bool {
     matches!(subtype, Some("compact") | Some("compaction"))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserEvent {
+    r#type: &'static str,
+    message: UserEventMessage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserEventMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlResponse {
+    r#type: &'static str,
+    response: ControlResponseInner,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlResponseInner {
+    subtype: &'static str,
+    request_id: String,
+    response: PermissionDecision,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "behavior", rename_all = "lowercase")]
+pub enum PermissionDecision {
+    Allow {
+        #[serde(rename = "updatedInput")]
+        updated_input: Map<String, Value>,
+    },
+    Deny {
+        message: String,
+    },
+}
+
+impl UserEvent {
+    pub fn new(prompt: String) -> Self {
+        Self {
+            r#type: "user",
+            message: UserEventMessage {
+                role: "user",
+                content: prompt,
+            },
+        }
+    }
+}
+
+impl ControlResponse {
+    pub fn allow(request_id: String) -> Self {
+        Self {
+            r#type: "control_response",
+            response: ControlResponseInner {
+                subtype: "success",
+                request_id,
+                response: PermissionDecision::Allow {
+                    updated_input: Map::new(),
+                },
+            },
+        }
+    }
+
+    pub fn deny(request_id: String, message: impl Into<String>) -> Self {
+        Self {
+            r#type: "control_response",
+            response: ControlResponseInner {
+                subtype: "success",
+                request_id,
+                response: PermissionDecision::Deny {
+                    message: message.into(),
+                },
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +308,34 @@ mod event_tests {
     fn ignores_non_json_line() {
         assert!(parse_event_line("not a json line").is_none());
         assert!(parse_event_line("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod outgoing_tests {
+    use super::*;
+
+    #[test]
+    fn user_event_serializes() {
+        let ev = UserEvent::new("hi".to_string());
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"user\""));
+        assert!(json.contains("\"content\":\"hi\""));
+    }
+
+    #[test]
+    fn control_response_allow_serializes() {
+        let resp = ControlResponse::allow("req-1".to_string());
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"control_response\""));
+        assert!(json.contains("\"behavior\":\"allow\""));
+    }
+
+    #[test]
+    fn control_response_deny_serializes() {
+        let resp = ControlResponse::deny("req-1".to_string(), "not allowed");
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"behavior\":\"deny\""));
+        assert!(json.contains("\"message\":\"not allowed\""));
     }
 }
