@@ -1,20 +1,26 @@
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::time::{sleep, Instant};
 
-use crate::approval::SharedApprovalBroker;
-use crate::config::ExecutorConfig;
+use crate::approval::{ApprovalBroker, SharedApprovalBroker};
+use crate::config::{ExecutorConfig, ExecutorProtocol};
 use crate::executor::{
-    ExecutorChannelEvent, ExecutorEventSink, ExecutorPromptOutcome, ExecutorResponse,
-    ExecutorUpdate, TurnCancellation,
+    ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
+    ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
+    ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+    TurnCancellation,
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -379,9 +385,229 @@ mod outgoing_tests {
     }
 }
 
+type SessionKey = (String, String);
+type SharedClaudeSession = Arc<Mutex<ClaudeSession>>;
+
+#[derive(Debug)]
+pub struct ClaudeStreamJsonManager {
+    executors: BTreeMap<String, ExecutorConfig>,
+    approvals: SharedApprovalBroker,
+    sessions: Mutex<HashMap<SessionKey, SharedClaudeSession>>,
+}
+
+impl ClaudeStreamJsonManager {
+    pub fn new(executors: BTreeMap<String, ExecutorConfig>) -> Self {
+        Self::with_approvals(executors, Arc::new(ApprovalBroker::default()))
+    }
+
+    pub fn with_approvals(
+        executors: BTreeMap<String, ExecutorConfig>,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
+        let executors = executors
+            .into_iter()
+            .filter(|(_, cfg)| cfg.protocol == ExecutorProtocol::ClaudeStreamJson)
+            .collect();
+        Self {
+            executors,
+            approvals,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn get_or_create_session(
+        &self,
+        session_key: &str,
+        executor: &str,
+        cfg: &ExecutorConfig,
+        cwd: PathBuf,
+        previous_session_id: Option<String>,
+    ) -> anyhow::Result<(SharedClaudeSession, bool)> {
+        let key = (session_key.to_string(), executor.to_string());
+        let existing = self.sessions.lock().await.get(&key).cloned();
+        if let Some(existing) = existing && existing.lock().await.is_alive() {
+            return Ok((existing, false));
+        }
+        let session = Arc::new(Mutex::new(
+            ClaudeSession::start(
+                cfg.clone(),
+                cwd,
+                session_key.to_string(),
+                executor.to_string(),
+                self.approvals.clone(),
+                previous_session_id,
+            )
+            .await?,
+        ));
+        self.sessions.lock().await.insert(key, session.clone());
+        Ok((session, true))
+    }
+
+    async fn discard_session_if_same(
+        &self,
+        session_key: &str,
+        executor: &str,
+        session: &SharedClaudeSession,
+    ) {
+        let key = (session_key.to_string(), executor.to_string());
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, session))
+        {
+            sessions.remove(&key);
+        }
+    }
+
+    async fn existing_session(
+        &self,
+        session_key: &str,
+        executor: &str,
+    ) -> anyhow::Result<SharedClaudeSession> {
+        self.sessions
+            .lock()
+            .await
+            .get(&(session_key.to_string(), executor.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "executor `{executor}` has not prepared Claude stream-json session for `{session_key}`"
+                )
+            })
+    }
+}
+
+#[async_trait]
+impl ExecutorBackend for ClaudeStreamJsonManager {
+    fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+        self.executors.get(name).map(|cfg| ExecutorDescriptor {
+            name: cfg.name.clone(),
+            protocol: "claude_stream_json".to_string(),
+        })
+    }
+
+    fn list(&self) -> Vec<ExecutorDescriptor> {
+        self.executors
+            .values()
+            .map(|cfg| ExecutorDescriptor {
+                name: cfg.name.clone(),
+                protocol: "claude_stream_json".to_string(),
+            })
+            .collect()
+    }
+
+    async fn prepare(
+        &self,
+        request: ExecutorPrepareRequest,
+        cancel: TurnCancellation,
+    ) -> anyhow::Result<PreparedExecutor> {
+        if cancel.is_cancelled().await {
+            anyhow::bail!("Claude stream-json prepare cancelled");
+        }
+        let cfg = self.executors.get(&request.turn.executor).ok_or_else(|| {
+            anyhow::anyhow!("executor `{}` is not configured", request.turn.executor)
+        })?;
+        tracing::info!(
+            executor = %request.turn.executor,
+            session_key = %request.turn.session_key,
+            generation = request.turn.generation,
+            previous_session_id = ?request.previous_session_id,
+            "preparing Claude stream-json executor session"
+        );
+        let cwd = request
+            .cwd
+            .clone()
+            .or_else(|| cfg.cwd.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let previous_session_id = request.previous_session_id.clone();
+        let (session, created_session) = self
+            .get_or_create_session(
+                &request.turn.session_key,
+                &request.turn.executor,
+                cfg,
+                cwd,
+                previous_session_id.clone(),
+            )
+            .await?;
+        if cancel.is_cancelled().await {
+            if created_session {
+                self.discard_session_if_same(
+                    &request.turn.session_key,
+                    &request.turn.executor,
+                    &session,
+                )
+                .await;
+                let session = session.lock().await;
+                session.close().await;
+            }
+            anyhow::bail!("Claude stream-json prepare cancelled");
+        }
+        let external_session_id = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let id = session.lock().await.session_id().await;
+                if id.is_some() || Instant::now() >= deadline {
+                    break id;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let started_new_session = previous_session_id.is_none()
+            || external_session_id.as_ref() != previous_session_id.as_ref();
+        tracing::info!(
+            executor = %request.turn.executor,
+            session_key = %request.turn.session_key,
+            generation = request.turn.generation,
+            external_session_id = ?external_session_id,
+            started_new_session,
+            "prepared Claude stream-json executor session"
+        );
+        Ok(PreparedExecutor {
+            external_session_id,
+            started_new_session,
+        })
+    }
+
+    async fn prompt(
+        &self,
+        request: ExecutorPromptRequest,
+        events: &mut dyn ExecutorEventSink,
+        cancel: TurnCancellation,
+    ) -> ExecutorPromptOutcome {
+        let session = match self
+            .existing_session(&request.turn.session_key, &request.turn.executor)
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => return ExecutorPromptOutcome::Failed(err),
+        };
+        let session = session.lock().await;
+        session
+            .run_turn(&request.prompt, request.user_id, events, cancel)
+            .await
+    }
+
+    async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&(
+                request.turn.session_key.clone(),
+                request.turn.executor.clone(),
+            ))
+            .cloned();
+        if let Some(session) = session {
+            session.lock().await.close().await;
+        }
+        Ok(())
+    }
+}
+
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct ClaudeSession {
     cfg: ExecutorConfig,
     cwd: PathBuf,
