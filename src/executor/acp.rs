@@ -41,6 +41,7 @@ struct AcpToolCallState {
     title: String,
     text: String,
     status: String,
+    activity_emitted: bool,
 }
 
 #[derive(Debug)]
@@ -1162,17 +1163,24 @@ fn project_acp_update_with_state(
     } else {
         kind.to_string()
     };
+    let tool_activity_input =
+        is_tool_update && text.as_ref().is_some_and(|text| !text.trim().is_empty());
     let text = text.unwrap_or_default();
-    let tool_activity_changed = is_tool_update
-        && (!title.trim().is_empty() || !text.trim().is_empty() || !status.trim().is_empty());
-    let (title, text, status) = if is_tool_update {
-        merge_acp_tool_update(tool_calls, tool_call_id, title, text, status)
+    let (title, text, status, emit_tool_activity) = if is_tool_update {
+        merge_acp_tool_update(
+            tool_calls,
+            tool_call_id,
+            title,
+            text,
+            status,
+            tool_activity_input,
+        )
     } else {
-        (title, text, status)
+        (title, text, status, false)
     };
     let mut update =
         ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
-    if tool_activity_changed {
+    if emit_tool_activity {
         update = update.with_channel_event(ExecutorChannelEvent::tool_call(
             acp_tool_title(&title),
             acp_tool_channel_summary(&title, &text, &status),
@@ -1205,12 +1213,15 @@ fn merge_acp_tool_update(
     title: String,
     text: String,
     status: String,
-) -> (String, String, String) {
+    tool_activity_input: bool,
+) -> (String, String, String, bool) {
+    let emit_without_state = tool_activity_input && !text.trim().is_empty();
     let Some(tool_call_id) = tool_call_id else {
-        return (title, text, status);
+        return (title, text, status, emit_without_state);
     };
 
     let state = tool_calls.entry(tool_call_id.to_string()).or_default();
+    let emit_tool_activity = emit_without_state && !state.activity_emitted;
     if !title.trim().is_empty() {
         state.title = title;
     }
@@ -1219,6 +1230,9 @@ fn merge_acp_tool_update(
     }
     if !status.trim().is_empty() {
         state.status = status;
+    }
+    if emit_tool_activity {
+        state.activity_emitted = true;
     }
 
     let merged = (
@@ -1229,7 +1243,7 @@ fn merge_acp_tool_update(
     if is_terminal_tool_status(&merged.2) {
         tool_calls.remove(tool_call_id);
     }
-    merged
+    (merged.0, merged.1, merged.2, emit_tool_activity)
 }
 
 fn is_terminal_tool_status(status: &str) -> bool {
@@ -1471,6 +1485,27 @@ mod tests {
         assert_eq!(output.status, "pending");
         assert!(output.channel_event.is_none());
 
+        let titled_output = project_acp_update_with_state(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-1",
+                        "title": "Bash",
+                        "status": "running",
+                        "content": {"text": "still sleeping"}
+                    }
+                }
+            }),
+            &mut tool_calls,
+        )
+        .unwrap();
+        assert_eq!(titled_output.title, "Bash");
+        assert_eq!(titled_output.text, "$ sleep 3");
+        assert_eq!(titled_output.status, "running");
+        assert!(titled_output.channel_event.is_none());
+
         let json_args = project_acp_update_with_state(
             &json!({
                 "method": "session/update",
@@ -1527,9 +1562,10 @@ mod tests {
             &mut tool_calls,
         )
         .unwrap();
-        let event = failed.channel_event.unwrap();
-        assert_eq!(event.title, "Run tests");
-        assert_eq!(event.text, "$ cargo test -q\nstatus: failed");
+        assert_eq!(failed.title, "Run tests");
+        assert_eq!(failed.text, "$ cargo test -q");
+        assert_eq!(failed.status, "failed");
+        assert!(failed.channel_event.is_none());
         assert!(tool_calls.is_empty());
     }
 
