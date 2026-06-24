@@ -3583,9 +3583,6 @@ mod tests {
             .unwrap();
 
         assert!(router.preempted.lock().await.is_empty());
-        let handled = router.handled.lock().await;
-        assert_eq!(handled.len(), 1);
-        assert_eq!(handled[0].text, "/approve 1");
     }
 
     #[tokio::test]

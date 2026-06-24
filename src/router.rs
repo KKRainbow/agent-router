@@ -3268,6 +3268,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unresolved_approval_command_does_not_interrupt_active_turn() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, mut cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(InterruptibleExecutorBackend::new(started_tx, cancelled_tx));
+        let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor.clone()));
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut approval_output = CollectingRouterOutputSink::default();
+        router
+            .handle_with_context(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "/approve 1".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                None,
+                &mut approval_output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(approval_output.final_reply(), "Approval 1 is not pending.");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut cancelled_rx)
+                .await
+                .is_err()
+        );
+        assert!(executor.interrupts.lock().await.is_empty());
+        assert!(router.active_turns.lock().await.contains_key("slack:C1:T1"));
+
+        let mut stop_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "/stop".to_string(),
+                    user_id: None,
+                },
+                &mut stop_output,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = first.await.unwrap();
+
+        assert_eq!(stop_output.final_reply(), "Stopped the active turn.");
+        assert!(first_output.events.is_empty());
+    }
+
+    #[tokio::test]
     async fn stop_cancels_active_turn_without_committing_transcript() {
         let store = Arc::new(InMemorySessionStore::default());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
