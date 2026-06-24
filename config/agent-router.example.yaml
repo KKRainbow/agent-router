@@ -1,14 +1,14 @@
 router:
-  default_executor: codex
+  default_executor: kimi
 
 approval:
   # normal: ask for approval prompts.
   # yolo: auto-approve one-shot allow options unless a session overrides it.
-  default_mode: yolo
+  default_mode: normal
 
 workspace:
   # Optional. When set, each router session runs under a stable child directory.
-  root: /data/project/agent-router-workspaces
+  # root: /path/to/workspaces
 
 executors:
   kimi:
