@@ -130,7 +130,7 @@ pub fn write_context_sync(
         request.unresolved,
         &resolved_issue_keys,
     );
-    let mut source_records = existing
+    let source_records = existing
         .iter()
         .filter(|record| record.source == request.source && record.kind != "manifest")
         .cloned()
@@ -151,17 +151,20 @@ pub fn write_context_sync(
             }
         }
     }
-    source_records.retain(|record| {
-        if removed_kinds.contains(&record.kind)
-            || removed_artifacts.contains(&(record.kind.clone(), record.id.clone()))
-        {
-            return false;
-        }
-        if let Some(retain_ids) = retained_artifacts_by_kind.get(&record.kind) {
-            return retain_ids.contains(&record.id);
-        }
-        true
-    });
+    let (removed_source_records, retained_source_records): (Vec<_>, Vec<_>) =
+        source_records.into_iter().partition(|record| {
+            if removed_kinds.contains(&record.kind)
+                || removed_artifacts.contains(&(record.kind.clone(), record.id.clone()))
+            {
+                return true;
+            }
+            if let Some(retain_ids) = retained_artifacts_by_kind.get(&record.kind) {
+                return !retain_ids.contains(&record.id);
+            }
+            false
+        });
+    remove_context_artifact_files(cwd, &request.base_path, &removed_source_records)?;
+    let mut source_records = retained_source_records;
     for record in &source_records {
         for path in &record.paths {
             validate_source_context_path(&request.base_path, Path::new(path))?;
@@ -362,6 +365,28 @@ pub fn merge_context_artifacts(
             existing.push(update);
         }
     }
+}
+
+fn remove_context_artifact_files(
+    cwd: &Path,
+    base_path: &Path,
+    records: &[ContextArtifactRecord],
+) -> anyhow::Result<()> {
+    for record in records {
+        for path in &record.paths {
+            validate_source_context_path(base_path, Path::new(path))?;
+            let path = cwd.join(path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("remove context artifact {}", path.display()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_existing_unresolved(
@@ -751,6 +776,7 @@ mod tests {
                 .iter()
                 .any(|record| record.kind == "slack_current_thread")
         );
+        assert!(!tmp.path().join("slack/current-thread.md").exists());
         let manifest = std::fs::read_to_string(tmp.path().join("slack/manifest.json")).unwrap();
         let manifest = serde_json::from_str::<Value>(&manifest).unwrap();
         assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 0);
@@ -807,6 +833,17 @@ mod tests {
     #[test]
     fn write_context_sync_removes_requested_kind_except_retained_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("slack/linked-threads")).unwrap();
+        std::fs::write(
+            tmp.path().join("slack/linked-threads/C2-222.000.md"),
+            "retained",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("slack/linked-threads/C3-333.000.md"),
+            "stale",
+        )
+        .unwrap();
         let existing = vec![
             ContextArtifactRecord {
                 id: "slack:linked-thread:C2:222.000".to_string(),
@@ -870,6 +907,16 @@ mod tests {
                 .any(|record| record.id == "slack:linked-thread:C3:333.000")
         );
         assert!(records.iter().any(|record| record.id == "slack:file:F1"));
+        assert!(
+            tmp.path()
+                .join("slack/linked-threads/C2-222.000.md")
+                .exists()
+        );
+        assert!(
+            !tmp.path()
+                .join("slack/linked-threads/C3-333.000.md")
+                .exists()
+        );
     }
 
     #[test]

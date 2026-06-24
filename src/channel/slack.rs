@@ -1090,7 +1090,7 @@ fn file_sync_state_from_context_artifacts(
     cache: &SlackContextCache,
 ) -> SlackFileSyncState {
     let mut state = SlackFileSyncState {
-        synced_files: cache.synced_files.clone(),
+        synced_files: BTreeSet::new(),
         failed_files: cache.failed_files.clone(),
     };
     for record in records {
@@ -1446,7 +1446,11 @@ fn slack_error_is_access_denied(err: &anyhow::Error) -> bool {
 }
 
 fn slack_error_allows_cached_context(err: &anyhow::Error) -> bool {
-    !slack_error_is_access_denied(err)
+    if let Some(err) = err.downcast_ref::<SlackApiError>() {
+        return err.is_transient();
+    }
+    err.downcast_ref::<reqwest::Error>()
+        .is_some_and(|err| err.is_timeout() || err.is_connect())
 }
 
 fn slack_error_clears_thread_cache(err: &anyhow::Error) -> bool {
@@ -2774,6 +2778,19 @@ mod tests {
     }
 
     #[test]
+    fn file_sync_state_does_not_trust_cache_without_artifact_record() {
+        let mut cache = SlackContextCache::default();
+        cache.synced_files.insert("session:F1".to_string());
+
+        let state = file_sync_state_from_context_artifacts("session", &[], &cache);
+        let selection = select_file_sync_attempts("session", vec![file_ref("F1")], &state, 1);
+
+        assert!(selection.skipped_synced_files.is_empty());
+        assert_eq!(selection.attempts.len(), 1);
+        assert_eq!(selection.attempts[0].1.id, "F1");
+    }
+
+    #[test]
     fn parses_slack_thread_permalinks_from_mrkdwn() {
         let message = SlackThreadMessage {
             ts: "111.000".to_string(),
@@ -2853,6 +2870,13 @@ mod tests {
         assert!(slack_error_clears_thread_cache(&denied));
         assert!(slack_error_allows_cached_context(&rate_limited));
         assert!(!slack_error_clears_thread_cache(&rate_limited));
+
+        let invalid_arguments = anyhow::Error::new(SlackApiError::new(
+            "conversations.replies",
+            "invalid_arguments",
+        ));
+        assert!(!slack_error_allows_cached_context(&invalid_arguments));
+        assert!(!slack_error_clears_thread_cache(&invalid_arguments));
     }
 
     #[test]
@@ -2891,6 +2915,20 @@ mod tests {
             .is_none()
         );
         assert!(!denied_cache_read);
+
+        let invalid_arguments = anyhow::Error::new(SlackApiError::new(
+            "conversations.replies",
+            "invalid_arguments",
+        ));
+        let mut invalid_cache_read = false;
+        assert!(
+            cached_thread_fetch_after_error(&invalid_arguments, || {
+                invalid_cache_read = true;
+                Vec::new()
+            })
+            .is_none()
+        );
+        assert!(!invalid_cache_read);
     }
 
     #[tokio::test]
