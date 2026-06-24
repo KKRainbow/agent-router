@@ -53,12 +53,14 @@ impl SlackSocketModeChannel {
 
     pub async fn run(self, router: Arc<dyn RouterService>) -> anyhow::Result<()> {
         self.validate_tokens()?;
+        let bot_user_id = self.auth_test().await?;
         let channel = Arc::new(self);
         channel.clone().spawn_approval_notifier();
 
         loop {
-            match channel.clone().run_once(router.clone()).await {
+            match channel.clone().run_once(router.clone(), &bot_user_id).await {
                 Ok(()) => tracing::warn!("Slack Socket Mode ended; reconnecting"),
+                Err(err) if slack_socket_error_is_fatal(&err) => return Err(err),
                 Err(err) => {
                     tracing::warn!(error = %err, "Slack Socket Mode disconnected; reconnecting");
                 }
@@ -67,8 +69,11 @@ impl SlackSocketModeChannel {
         }
     }
 
-    async fn run_once(self: Arc<Self>, router: Arc<dyn RouterService>) -> anyhow::Result<()> {
-        let bot_user_id = self.auth_test().await?;
+    async fn run_once(
+        self: Arc<Self>,
+        router: Arc<dyn RouterService>,
+        bot_user_id: &str,
+    ) -> anyhow::Result<()> {
         let url = self.open_socket_url().await?;
         tracing::info!("connecting Slack Socket Mode");
         let (stream, _) = connect_async(url).await?;
@@ -91,7 +96,7 @@ impl SlackSocketModeChannel {
                     }
                     let channel_ref = self.clone();
                     let router_ref = router.clone();
-                    let bot_user_id = bot_user_id.clone();
+                    let bot_user_id = bot_user_id.to_string();
                     tokio::spawn(async move {
                         if let Err(err) = channel_ref
                             .handle_envelope(envelope, router_ref, &bot_user_id)
@@ -364,10 +369,11 @@ impl SlackSocketModeChannel {
             .json::<Response>()
             .await?;
         if !resp.ok {
-            anyhow::bail!(
-                "Slack apps.connections.open failed: {}",
-                resp.error.unwrap_or_else(|| "unknown_error".to_string())
-            );
+            return Err(SlackApiError::new(
+                "apps.connections.open",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
         }
         resp.url
             .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open response omitted url"))
@@ -390,10 +396,11 @@ impl SlackSocketModeChannel {
             .json::<Response>()
             .await?;
         if !resp.ok {
-            anyhow::bail!(
-                "Slack auth.test failed: {}",
-                resp.error.unwrap_or_else(|| "unknown_error".to_string())
-            );
+            return Err(SlackApiError::new(
+                "auth.test",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
         }
         resp.user_id
             .ok_or_else(|| anyhow::anyhow!("Slack auth.test response omitted user_id"))
@@ -1322,6 +1329,10 @@ fn slack_error_clears_thread_cache(err: &anyhow::Error) -> bool {
     slack_error_is_access_denied(err)
 }
 
+fn slack_socket_error_is_fatal(err: &anyhow::Error) -> bool {
+    slack_error_is_access_denied(err)
+}
+
 fn cached_thread_fetch_after_error(
     err: &anyhow::Error,
     current_cache: impl FnOnce() -> Vec<SlackThreadMessage>,
@@ -2231,6 +2242,20 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn slack_socket_lifecycle_treats_auth_errors_as_fatal() {
+        let invalid_auth =
+            anyhow::Error::new(SlackApiError::new("apps.connections.open", "invalid_auth"));
+        let rate_limited =
+            anyhow::Error::new(SlackApiError::new("apps.connections.open", "rate_limited"));
+        let socket_reset =
+            anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
+
+        assert!(slack_socket_error_is_fatal(&invalid_auth));
+        assert!(!slack_socket_error_is_fatal(&rate_limited));
+        assert!(!slack_socket_error_is_fatal(&socket_reset));
     }
 
     #[test]
