@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
@@ -37,14 +37,26 @@ type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 type SharedCodexEventStreams = Arc<StdMutex<CodexEventStreams>>;
 const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
+const COMPLETED_TURN_IDS_RETAINED: usize = 16;
 
 #[derive(Debug, Default)]
 struct CodexEventStreams {
-    notifications: Option<mpsc::UnboundedSender<Value>>,
-    server_requests: Option<mpsc::UnboundedSender<Value>>,
+    next_generation: u64,
+    active: Option<CodexActiveEventStream>,
+    completed_turn_ids: VecDeque<String>,
+}
+
+#[derive(Debug)]
+struct CodexActiveEventStream {
+    generation: u64,
+    thread_id: String,
+    turn_id: Option<String>,
+    notifications: mpsc::UnboundedSender<Value>,
+    server_requests: mpsc::UnboundedSender<Value>,
 }
 
 struct CodexTurnStreams {
+    generation: u64,
     notifications: mpsc::UnboundedReceiver<Value>,
     server_requests: mpsc::UnboundedReceiver<Value>,
     _guard: CodexTurnStreamGuard,
@@ -52,13 +64,100 @@ struct CodexTurnStreams {
 
 struct CodexTurnStreamGuard {
     streams: SharedCodexEventStreams,
+    generation: u64,
+}
+
+impl CodexEventStreams {
+    fn open(
+        &mut self,
+        thread_id: String,
+        notifications: mpsc::UnboundedSender<Value>,
+        server_requests: mpsc::UnboundedSender<Value>,
+    ) -> u64 {
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        self.active = Some(CodexActiveEventStream {
+            generation,
+            thread_id,
+            turn_id: None,
+            notifications,
+            server_requests,
+        });
+        generation
+    }
+
+    fn set_turn_id(&mut self, generation: u64, turn_id: String) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.generation == generation {
+            active.turn_id = Some(turn_id);
+        }
+    }
+
+    fn finish(&mut self, generation: u64, turn_id: Option<&str>) {
+        if let Some(turn_id) = turn_id.filter(|turn_id| !turn_id.is_empty()) {
+            self.completed_turn_ids.retain(|known| known != turn_id);
+            self.completed_turn_ids.push_back(turn_id.to_string());
+            while self.completed_turn_ids.len() > COMPLETED_TURN_IDS_RETAINED {
+                self.completed_turn_ids.pop_front();
+            }
+        }
+        self.close_active(generation);
+    }
+
+    fn close_active(&mut self, generation: u64) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            self.active = None;
+        }
+    }
+
+    fn notification_sender_for(&self, message: &Value) -> Option<mpsc::UnboundedSender<Value>> {
+        self.active
+            .as_ref()
+            .filter(|active| active.accepts(message, &self.completed_turn_ids))
+            .map(|active| active.notifications.clone())
+    }
+
+    fn server_request_sender_for(&self, message: &Value) -> Option<mpsc::UnboundedSender<Value>> {
+        self.active
+            .as_ref()
+            .filter(|active| active.accepts(message, &self.completed_turn_ids))
+            .map(|active| active.server_requests.clone())
+    }
+}
+
+impl CodexActiveEventStream {
+    fn accepts(&self, message: &Value, completed_turn_ids: &VecDeque<String>) -> bool {
+        if let Some(thread_id) = codex_message_thread_id(message)
+            && thread_id != self.thread_id
+        {
+            return false;
+        }
+        let Some(message_turn_id) = codex_message_turn_id(message) else {
+            return true;
+        };
+        if completed_turn_ids
+            .iter()
+            .any(|completed| completed == message_turn_id)
+        {
+            return false;
+        }
+        match self.turn_id.as_deref() {
+            Some(active_turn_id) => message_turn_id == active_turn_id,
+            None => true,
+        }
+    }
 }
 
 impl Drop for CodexTurnStreamGuard {
     fn drop(&mut self) {
         let mut streams = self.streams.lock().unwrap();
-        streams.notifications = None;
-        streams.server_requests = None;
+        streams.close_active(self.generation);
     }
 }
 
@@ -424,10 +523,11 @@ impl CodexAppServerSession {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("codex app-server thread has not been created"))?;
         let CodexTurnStreams {
+            generation: turn_generation,
             mut notifications,
             mut server_requests,
             _guard: _turn_stream_guard,
-        } = self.client.open_turn_streams();
+        } = self.client.open_turn_streams(thread_id.clone());
         let mut closed = self.client.subscribe_closed();
         let turn_scope = CodexTurnScope::new();
         let (server_response_tx, mut server_responses) = mpsc::channel(64);
@@ -449,6 +549,7 @@ impl CodexAppServerSession {
             )
             .await?;
 
+        let mut active_turn_id = None;
         let result: anyhow::Result<ExecutorResponse> = async {
             let mut final_text = String::new();
             let mut turn_start_acknowledged = false;
@@ -464,7 +565,12 @@ impl CodexAppServerSession {
                         .as_mut()
                         .reset(Instant::now() + self.limits.idle_timeout);
                     turn_start_acknowledged = true;
-                    json_rpc_result(&turn_start.method, response??)?;
+                    let result = json_rpc_result(&turn_start.method, response??)?;
+                    if let Some(turn_id) = turn_id_from_turn_start_result(&result) {
+                        self.client
+                            .set_turn_stream_turn_id(turn_generation, turn_id.clone());
+                        active_turn_id = Some(turn_id);
+                    }
                     if turn_completed {
                         break;
                     }
@@ -582,10 +688,16 @@ impl CodexAppServerSession {
                 }
             }
 
+            self.client
+                .finish_turn_streams(turn_generation, active_turn_id.as_deref());
             Ok(ExecutorResponse { final_text })
         }
         .await;
 
+        if result.is_err() {
+            self.client
+                .finish_turn_streams(turn_generation, active_turn_id.as_deref());
+        }
         drop(server_request_tx);
         turn_scope.cancel();
         let _ = server_request_handler.await;
@@ -966,21 +1078,36 @@ impl CodexJsonRpcClient {
         })
     }
 
-    fn open_turn_streams(&self) -> CodexTurnStreams {
+    fn open_turn_streams(&self, thread_id: String) -> CodexTurnStreams {
         let (notifications_tx, notifications) = mpsc::unbounded_channel();
         let (server_requests_tx, server_requests) = mpsc::unbounded_channel();
-        {
+        let generation = {
             let mut streams = self.event_streams.lock().unwrap();
-            streams.notifications = Some(notifications_tx);
-            streams.server_requests = Some(server_requests_tx);
-        }
+            streams.open(thread_id, notifications_tx, server_requests_tx)
+        };
         CodexTurnStreams {
+            generation,
             notifications,
             server_requests,
             _guard: CodexTurnStreamGuard {
                 streams: self.event_streams.clone(),
+                generation,
             },
         }
+    }
+
+    fn set_turn_stream_turn_id(&self, generation: u64, turn_id: String) {
+        self.event_streams
+            .lock()
+            .unwrap()
+            .set_turn_id(generation, turn_id);
+    }
+
+    fn finish_turn_streams(&self, generation: u64, turn_id: Option<&str>) {
+        self.event_streams
+            .lock()
+            .unwrap()
+            .finish(generation, turn_id);
     }
 
     fn subscribe_closed(&self) -> broadcast::Receiver<String> {
@@ -1190,9 +1317,7 @@ async fn dispatch_codex_message(
             event_streams
                 .lock()
                 .unwrap()
-                .server_requests
-                .as_ref()
-                .cloned()
+                .server_request_sender_for(&message)
         };
         if let Some(sender) = sender {
             let _ = sender.send(message);
@@ -1204,9 +1329,7 @@ async fn dispatch_codex_message(
             event_streams
                 .lock()
                 .unwrap()
-                .notifications
-                .as_ref()
-                .cloned()
+                .notification_sender_for(&message)
         };
         if let Some(sender) = sender {
             let _ = sender.send(message);
@@ -1381,6 +1504,49 @@ fn validate_turn_completed(notification: &Value) -> anyhow::Result<()> {
         .map(summarize_json_rpc_error)
         .unwrap_or_else(|| "no error details".to_string());
     anyhow::bail!("codex app-server turn ended with status `{status}`: {error}")
+}
+
+fn turn_id_from_turn_start_result(result: &Value) -> Option<String> {
+    result
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| result.get("turnId").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn codex_message_thread_id(message: &Value) -> Option<&str> {
+    let params = message.get("params")?;
+    params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("thread_id").and_then(Value::as_str))
+        .or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("threadId"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn codex_message_turn_id(message: &Value) -> Option<&str> {
+    let params = message.get("params")?;
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("turn_id").and_then(Value::as_str))
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("turnId"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn command_execution_summary(item: &Value) -> String {
@@ -2645,5 +2811,95 @@ for line in sys.stdin:
 
         assert!(!turn_completed);
         assert!(idle_timeout.deadline() > Instant::now() + Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn codex_turn_streams_drop_completed_turn_events_after_next_turn_opens() {
+        let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let event_streams = Arc::new(StdMutex::new(CodexEventStreams::default()));
+
+        {
+            let (old_notifications, _old_notification_rx) = mpsc::unbounded_channel();
+            let (old_requests, _old_request_rx) = mpsc::unbounded_channel();
+            let generation = event_streams.lock().unwrap().open(
+                "thread-1".to_string(),
+                old_notifications,
+                old_requests,
+            );
+            event_streams
+                .lock()
+                .unwrap()
+                .set_turn_id(generation, "turn-1".to_string());
+            event_streams
+                .lock()
+                .unwrap()
+                .finish(generation, Some("turn-1"));
+        }
+
+        let (new_notifications_tx, mut new_notifications) = mpsc::unbounded_channel();
+        let (new_requests_tx, _new_requests) = mpsc::unbounded_channel();
+        {
+            let generation = event_streams.lock().unwrap().open(
+                "thread-1".to_string(),
+                new_notifications_tx,
+                new_requests_tx,
+            );
+            event_streams
+                .lock()
+                .unwrap()
+                .set_turn_id(generation, "turn-2".to_string());
+        }
+
+        dispatch_codex_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"type": "agentMessage", "text": "stale"},
+                },
+            }),
+            &state,
+            &event_streams,
+        )
+        .await;
+        dispatch_codex_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            }),
+            &state,
+            &event_streams,
+        )
+        .await;
+        assert!(new_notifications.try_recv().is_err());
+
+        dispatch_codex_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-2",
+                    "item": {"type": "agentMessage", "text": "fresh"},
+                },
+            }),
+            &state,
+            &event_streams,
+        )
+        .await;
+        let notification = new_notifications.recv().await.unwrap();
+        assert_eq!(
+            notification
+                .get("params")
+                .and_then(|params| params.get("turnId"))
+                .and_then(Value::as_str),
+            Some("turn-2")
+        );
     }
 }

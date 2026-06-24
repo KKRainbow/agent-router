@@ -328,6 +328,9 @@ impl QqBotChannel {
                 if !prompt.session_key.starts_with("qq:") {
                     continue;
                 }
+                if !prompt_channel.approvals.has_pending(&prompt.id).await {
+                    continue;
+                }
                 if let Err(err) = prompt_channel
                     .send_session_message(&prompt.session_key, &prompt.render_text())
                     .await

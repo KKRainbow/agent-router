@@ -256,6 +256,10 @@ impl ApprovalBroker {
             .is_some_and(|ids| ids.iter().any(|id| state.pending.contains_key(id)))
     }
 
+    pub async fn has_pending(&self, id: &str) -> bool {
+        self.state.lock().await.pending.contains_key(id)
+    }
+
     pub async fn request(&self, request: ApprovalRequest) -> ApprovalSelection {
         self.request_until_cancelled(request, ApprovalCancellation::new())
             .await
@@ -540,6 +544,7 @@ mod tests {
 
         let prompt = prompts.recv().await.unwrap();
         assert!(broker.has_pending_for_session("s1").await);
+        assert!(broker.has_pending(&prompt.id).await);
         assert!(!broker.has_pending_for_session("s2").await);
 
         let reply = broker
@@ -553,6 +558,7 @@ mod tests {
             ApprovalSelection::Selected("deny".to_string())
         );
         assert!(!broker.has_pending_for_session("s1").await);
+        assert!(!broker.has_pending(&prompt.id).await);
     }
 
     #[tokio::test]
@@ -570,11 +576,13 @@ mod tests {
 
         let prompt = prompts.recv().await.unwrap();
         assert!(broker.has_pending_for_session("s1").await);
+        assert!(broker.has_pending(&prompt.id).await);
 
         cancellation.cancel();
 
         assert_eq!(pending.await.unwrap(), None);
         assert!(!broker.has_pending_for_session("s1").await);
+        assert!(!broker.has_pending(&prompt.id).await);
         let reply = broker
             .resolve_command("s1", &format!("/approve {}", prompt.id), Some("U1"))
             .await

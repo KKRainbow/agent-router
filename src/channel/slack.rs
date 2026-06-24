@@ -130,6 +130,9 @@ impl SlackSocketModeChannel {
                 let Some(target) = SlackReplyTarget::from_session_key(&prompt.session_key) else {
                     continue;
                 };
+                if !prompt_channel.approvals.has_pending(&prompt.id).await {
+                    continue;
+                }
                 if let Err(err) = prompt_channel
                     .post_message(&target, &prompt.render_text())
                     .await
