@@ -403,7 +403,7 @@ impl CodexAppServerSession {
         let mut closed = self.client.subscribe_closed();
         let turn_scope = CodexTurnScope::new();
         let (server_response_tx, mut server_responses) = mpsc::channel(64);
-        let (server_request_tx, server_request_rx) = mpsc::channel(64);
+        let (server_request_tx, server_request_rx) = mpsc::unbounded_channel();
         let server_request_handler = self.spawn_server_request_worker(
             server_request_rx,
             user_id.clone(),
@@ -467,7 +467,6 @@ impl CodexAppServerSession {
                                     ),
                                     message: request,
                                 })
-                                .await
                                 .map_err(|_| {
                                     anyhow::anyhow!("codex app-server request worker closed")
                                 })?;
@@ -615,7 +614,7 @@ impl CodexAppServerSession {
 
     fn spawn_server_request_worker(
         &self,
-        mut requests: mpsc::Receiver<CodexServerRequest>,
+        mut requests: mpsc::UnboundedReceiver<CodexServerRequest>,
         user_id: Option<String>,
         responses: mpsc::Sender<Value>,
         turn_cancelled: ApprovalCancellation,
@@ -2284,6 +2283,61 @@ for line in sys.stdin:
         )
         .await
         .expect("turn/start timeout waited behind approval")
+        .unwrap_err();
+
+        assert!(err.to_string().contains("turn/start"));
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn codex_turn_start_timeout_survives_many_early_server_requests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("many_early_requests_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
+        for index in range(80):
+            send({
+                "jsonrpc": "2.0",
+                "id": 1000 + index,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "sleep 10", "cwd": "/tmp", "reason": "test"},
+            })
+"#,
+        );
+        let manager = CodexAppServerManager::with_limits(
+            executor_config(&script, tmp.path()),
+            Arc::new(ApprovalBroker::new(Duration::from_secs(5))),
+            CodexRuntimeLimits {
+                rpc_timeout: Duration::from_millis(100),
+                idle_timeout: Duration::from_secs(1),
+            },
+        );
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                cwd: None,
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let mut events = CollectingExecutorEventSink::default();
+        let err = timeout(
+            Duration::from_millis(500),
+            manager.prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    prompt: "hang".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            ),
+        )
+        .await
+        .expect("turn/start timeout waited behind saturated request queue")
         .unwrap_err();
 
         assert!(err.to_string().contains("turn/start"));
