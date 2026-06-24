@@ -1186,12 +1186,19 @@ fn command_execution_summary(item: &Value) -> String {
 }
 
 fn command_execution_channel_summary(item: &Value) -> String {
+    let command = item
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let exit_code = item.get("exitCode").and_then(Value::as_i64);
     let status = item
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut lines = Vec::new();
+    if !command.trim().is_empty() {
+        lines.push(format!("$ {}", truncate_text(one_line(command), 500)));
+    }
     if let Some(exit_code) = exit_code {
         lines.push(format!("exit: {exit_code}"));
     }
@@ -1318,6 +1325,10 @@ fn truncate_text(text: String, max_chars: usize) -> String {
     truncated
 }
 
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn resolve_cwd(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
     let path = match cwd {
         Some(cwd) => cwd.to_path_buf(),
@@ -1402,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_command_channel_event_omits_aggregated_output() {
+    fn codex_command_channel_event_includes_command_without_aggregated_output() {
         let mut final_text = String::new();
 
         let collected = collect_codex_notification(
@@ -1424,12 +1435,12 @@ mod tests {
 
         let event = collected.updates[0].channel_event.as_ref().unwrap();
         assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
+        assert!(event.text.contains("$ printenv SECRET_TOKEN"));
         assert!(event.text.contains("exit: 0"));
-        assert!(!event.text.contains("printenv"));
         assert!(!event.text.contains("super-secret"));
         let summary = collected.updates[0].summary(700).unwrap();
+        assert!(summary.contains("$ printenv SECRET_TOKEN"));
         assert!(summary.contains("exit: 0"));
-        assert!(!summary.contains("printenv"));
         assert!(!summary.contains("super-secret"));
     }
 

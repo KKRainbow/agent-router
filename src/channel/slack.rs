@@ -117,22 +117,8 @@ impl SlackSocketModeChannel {
             }
         });
 
-        let mut auto_selections = self.approvals.subscribe_auto_selections();
-        tokio::spawn(async move {
-            loop {
-                let notice = match auto_selections.recv().await {
-                    Ok(notice) => notice,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                };
-                let Some(target) = SlackReplyTarget::from_session_key(&notice.session_key) else {
-                    continue;
-                };
-                if let Err(err) = self.post_message(&target, &notice.render_text()).await {
-                    tracing::warn!(error = %err, "failed to post Slack auto-approval notice");
-                }
-            }
-        });
+        // YOLO auto-approvals are high-frequency bookkeeping. Keep them out of
+        // chat and let the tool activity message carry the useful progress.
     }
 
     async fn handle_envelope(

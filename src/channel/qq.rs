@@ -337,25 +337,8 @@ impl QqBotChannel {
             }
         });
 
-        let mut auto_selections = self.approvals.subscribe_auto_selections();
-        tokio::spawn(async move {
-            loop {
-                let notice = match auto_selections.recv().await {
-                    Ok(notice) => notice,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                };
-                if !notice.session_key.starts_with("qq:") {
-                    continue;
-                }
-                if let Err(err) = self
-                    .send_session_message(&notice.session_key, &notice.render_text())
-                    .await
-                {
-                    tracing::warn!(error = %err, "failed to post QQ auto-approval notice");
-                }
-            }
-        });
+        // YOLO auto-approvals are high-frequency bookkeeping. Keep them out of
+        // chat and let tool activity summaries carry the useful progress.
     }
 
     async fn remember_reply_context(&self, message: &QqInboundMessage) {

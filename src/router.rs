@@ -78,6 +78,7 @@ fn render_compact_channel_events_inner(
     let first = events.first()?;
     let mut latest_reasoning = None;
     let mut tool_total = 0usize;
+    let mut command_counts: Vec<(String, usize)> = Vec::new();
     let mut tool_counts: Vec<(String, usize)> = Vec::new();
     let mut attention = Vec::new();
 
@@ -88,17 +89,17 @@ fn render_compact_channel_events_inner(
             }
             RouterChannelEventKind::ToolCall => {
                 tool_total += 1;
-                let label = compact_tool_label(event);
-                if let Some((_, count)) = tool_counts
-                    .iter_mut()
-                    .find(|(existing, _)| existing == &label)
-                {
-                    *count += 1;
-                } else {
-                    tool_counts.push((label.clone(), 1));
+                let item = compact_tool_item(event);
+                match &item {
+                    CompactToolItem::Command(command) => {
+                        push_compact_count(&mut command_counts, command.clone());
+                    }
+                    CompactToolItem::Tool(label) => {
+                        push_compact_count(&mut tool_counts, label.clone());
+                    }
                 }
                 if let Some(status) = compact_attention_status(event) {
-                    attention.push(format!("{label}: {status}"));
+                    attention.push(format!("{}: {status}", item.attention_label()));
                 }
             }
         }
@@ -118,52 +119,130 @@ fn render_compact_channel_events_inner(
     {
         lines.push(format!("Reasoning: {reasoning}"));
     }
-    if tool_total > 0 {
-        lines.push(format!(
-            "Tools: {}",
-            compact_tool_counts(tool_total, &tool_counts)
-        ));
-    }
+    append_compact_count_lines(&mut lines, "Commands", &command_counts, true);
+    append_compact_count_lines(&mut lines, "Tools", &tool_counts, false);
     if !attention.is_empty() {
-        lines.push(format!("Attention: {}", attention.join("; ")));
+        lines.push("Attention:".to_string());
+        for item in attention.iter().take(6) {
+            lines.push(format!("- {item}"));
+        }
+        let remaining = attention.len().saturating_sub(6);
+        if remaining > 0 {
+            lines.push(format!("- {remaining} more"));
+        }
     }
     Some(lines.join("\n"))
 }
 
-fn compact_tool_counts(total: usize, counts: &[(String, usize)]) -> String {
-    let mut shown_steps = 0usize;
-    let mut labels = Vec::new();
-    for (label, count) in counts.iter().take(4) {
-        shown_steps += *count;
-        if *count > 1 {
-            labels.push(format!("{label} x{count}"));
-        } else {
-            labels.push(label.clone());
-        }
-    }
-    if total > shown_steps {
-        labels.push(format!("{} more", total - shown_steps));
-    }
-    let noun = if total == 1 { "step" } else { "steps" };
-    format!("{total} {noun}: {}", labels.join(", "))
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompactToolItem {
+    Command(String),
+    Tool(String),
 }
 
-fn compact_tool_label(event: &RouterChannelEvent) -> String {
-    let title = event.title.trim();
-    if !title.is_empty() && title != "mcpToolCall" && title != "dynamicToolCall" {
-        return title.to_string();
+impl CompactToolItem {
+    fn attention_label(&self) -> String {
+        match self {
+            CompactToolItem::Command(command) => inline_code(command),
+            CompactToolItem::Tool(label) => label.clone(),
+        }
     }
+}
+
+fn push_compact_count(counts: &mut Vec<(String, usize)>, label: String) {
+    if let Some((_, count)) = counts.iter_mut().find(|(existing, _)| existing == &label) {
+        *count += 1;
+    } else {
+        counts.push((label, 1));
+    }
+}
+
+fn append_compact_count_lines(
+    lines: &mut Vec<String>,
+    heading: &str,
+    counts: &[(String, usize)],
+    format_as_code: bool,
+) {
+    if counts.is_empty() {
+        return;
+    }
+
+    lines.push(format!("{heading}:"));
+    for (label, count) in counts.iter().take(6) {
+        let label = if format_as_code {
+            inline_code(label)
+        } else {
+            label.clone()
+        };
+        let suffix = if *count > 1 {
+            format!(" x{count}")
+        } else {
+            String::new()
+        };
+        lines.push(format!("- {label}{suffix}"));
+    }
+    let remaining = counts
+        .iter()
+        .skip(6)
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+    if remaining > 0 {
+        lines.push(format!("- {remaining} more"));
+    }
+}
+
+fn compact_tool_item(event: &RouterChannelEvent) -> CompactToolItem {
+    if let Some(command) = compact_command_preview(event) {
+        return CompactToolItem::Command(command);
+    }
+    if let Some(label) = compact_text_label(event) {
+        return CompactToolItem::Tool(label);
+    }
+    let title = event.title.trim();
+    if !title.is_empty() && !is_unhelpful_tool_title(title) {
+        return CompactToolItem::Tool(title.to_string());
+    }
+    CompactToolItem::Tool("tool".to_string())
+}
+
+fn compact_command_preview(event: &RouterChannelEvent) -> Option<String> {
+    event
+        .text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("$ "))
+        .map(one_line)
+        .filter(|command| !command.is_empty())
+        .map(|command| truncate_chars(command.as_str(), 160))
+}
+
+fn compact_text_label(event: &RouterChannelEvent) -> Option<String> {
     event
         .text
         .lines()
         .map(str::trim)
         .find(|line| {
+            let lower = line.to_ascii_lowercase();
             !line.is_empty()
-                && !line.to_ascii_lowercase().starts_with("status:")
-                && !line.to_ascii_lowercase().starts_with("exit:")
+                && !line.starts_with("$ ")
+                && !lower.starts_with("status:")
+                && !lower.starts_with("exit:")
+                && !is_unhelpful_tool_title(line)
         })
-        .unwrap_or("tool")
-        .to_string()
+        .map(one_line)
+        .filter(|label| !label.is_empty())
+        .map(|label| truncate_chars(label.as_str(), 120))
+}
+
+fn is_unhelpful_tool_title(title: &str) -> bool {
+    matches!(
+        title.to_ascii_lowercase().as_str(),
+        "base" | "mcptoolcall" | "dynamictoolcall" | "tool_call" | "tool call"
+    )
+}
+
+fn inline_code(text: &str) -> String {
+    format!("`{}`", text.replace('`', "'"))
 }
 
 fn compact_attention_status(event: &RouterChannelEvent) -> Option<String> {
@@ -1579,12 +1658,12 @@ mod tests {
             kind: RouterChannelEventKind::ToolCall,
             executor: "codex".to_string(),
             title: "Bash".to_string(),
-            text: "exit: 0\nstatus: completed".to_string(),
+            text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
         }];
 
         assert_eq!(
             render_live_compact_channel_events(&events).as_deref(),
-            Some("[codex] Activity\nTools: 1 step: Bash")
+            Some("[codex] Activity\nCommands:\n- `sleep 3`")
         );
     }
 
@@ -1600,8 +1679,26 @@ mod tests {
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
                 executor: "codex".to_string(),
+                title: "Base".to_string(),
+                text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "Base".to_string(),
+                text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "Base".to_string(),
+                text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
                 title: "Bash".to_string(),
-                text: "exit: 0\nstatus: completed".to_string(),
+                text: "$ cargo test -q\nexit: 0\nstatus: completed".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
@@ -1614,7 +1711,7 @@ mod tests {
         assert_eq!(
             render_compact_channel_events(&events).as_deref(),
             Some(
-                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nTools: 2 steps: Bash, read_file"
+                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `sleep 3` x3\n- `cargo test -q`\nTools:\n- read_file"
             )
         );
     }
@@ -1625,12 +1722,12 @@ mod tests {
             kind: RouterChannelEventKind::ToolCall,
             executor: "codex".to_string(),
             title: "Bash".to_string(),
-            text: "exit: 2\nstatus: failed".to_string(),
+            text: "$ sleep 3\nexit: 2\nstatus: failed".to_string(),
         }];
 
         assert_eq!(
             render_compact_channel_events(&events).as_deref(),
-            Some("[codex] Activity\nTools: 1 step: Bash\nAttention: Bash: exit: 2")
+            Some("[codex] Activity\nCommands:\n- `sleep 3`\nAttention:\n- `sleep 3`: exit: 2")
         );
     }
 
