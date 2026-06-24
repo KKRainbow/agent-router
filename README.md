@@ -161,6 +161,7 @@ Each chat session has one active agent. New sessions start with
 - [Architecture](docs/architecture.md)
 - [Session Executor Routing Workflow](docs/workflows/session-executor-routing.md)
 - [Remote Machines, Workspaces, and Skill Collection](docs/workflows/remote-machines.md)
+- [Slack User Token Proxy Workflow](docs/workflows/slack-user-token-proxy.md)
 - [ADR 0001: Split Channel Router From Agent Runtime](docs/adr/0001-router-runtime-boundary.md)
 - [ADR 0002: Use ACP as the First Backend Protocol](docs/adr/0002-acp-first-backend-protocol.md)
 - [ADR 0003: Default Executor, Active Executor, and Shared Context](docs/adr/0003-default-active-executor-context.md)
