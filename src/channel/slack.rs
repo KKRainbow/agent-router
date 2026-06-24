@@ -700,6 +700,20 @@ impl SlackSocketModeChannel {
                 "skipping already synced Slack file context"
             );
         }
+        let omitted_file_count = file_selection.omitted_files.len();
+        for file in &file_selection.omitted_files {
+            tracing::info!(
+                file_id = %file.id,
+                file_name = %file.name,
+                max_files_per_turn = self.cfg.context_sync.max_files_per_turn,
+                "skipping Slack file context due sync limit"
+            );
+            unresolved.push(ContextSyncIssueInput {
+                kind: "file".to_string(),
+                reference: file.id.clone(),
+                reason: "file sync limit reached".to_string(),
+            });
+        }
         for (file_cache_key, file) in file_selection.attempts {
             tracing::info!(
                 file_id = %file.id,
@@ -742,6 +756,7 @@ impl SlackSocketModeChannel {
             thread_ts = %thread_ts,
             downloaded_file_count = downloaded_files.len(),
             skipped_cached_file_count = skipped_cached_files,
+            omitted_file_count,
             failed_file_count = failed_files,
             "synced Slack file context"
         );
@@ -1424,20 +1439,26 @@ fn select_file_sync_attempts(
             fresh_attempts.push((file_cache_key, file));
         }
     }
-    let attempts = fresh_attempts
-        .into_iter()
-        .chain(retry_attempts)
-        .take(max_files_per_turn)
-        .collect();
+    let mut attempts = Vec::new();
+    let mut omitted_files = Vec::new();
+    for (file_cache_key, file) in fresh_attempts.into_iter().chain(retry_attempts) {
+        if attempts.len() < max_files_per_turn {
+            attempts.push((file_cache_key, file));
+        } else {
+            omitted_files.push(file);
+        }
+    }
     SlackFileSyncSelection {
         attempts,
         skipped_synced_files,
+        omitted_files,
     }
 }
 
 struct SlackFileSyncSelection {
     attempts: Vec<(String, SlackFileRef)>,
     skipped_synced_files: Vec<SlackFileRef>,
+    omitted_files: Vec<SlackFileRef>,
 }
 
 fn collect_slack_thread_links(
@@ -2113,6 +2134,21 @@ mod tests {
     }
 
     #[test]
+    fn unsynced_files_over_turn_limit_are_omitted_for_retry() {
+        let selection = select_file_sync_attempts(
+            "session",
+            vec![file_ref("F1"), file_ref("F2")],
+            &SlackFileSyncState::default(),
+            1,
+        );
+
+        assert_eq!(selection.attempts.len(), 1);
+        assert_eq!(selection.attempts[0].1.id, "F1");
+        assert_eq!(selection.omitted_files.len(), 1);
+        assert_eq!(selection.omitted_files[0].id, "F2");
+    }
+
+    #[test]
     fn failed_file_syncs_are_retried_after_new_files() {
         let mut state = SlackFileSyncState::default();
         state.failed_files.insert("session:F1".to_string());
@@ -2124,6 +2160,39 @@ mod tests {
         assert_eq!(selection.attempts.len(), 2);
         assert_eq!(selection.attempts[0].1.id, "F2");
         assert_eq!(selection.attempts[1].1.id, "F1");
+    }
+
+    #[tokio::test]
+    async fn file_sync_limit_records_omitted_files_as_unresolved() {
+        let mut cfg = test_slack_config(true);
+        cfg.context_sync.current_thread = false;
+        cfg.context_sync.linked_threads = false;
+        cfg.context_sync.max_files_per_turn = 0;
+        let channel = SlackSocketModeChannel::new(cfg, Arc::new(ApprovalBroker::default()));
+        let event = SlackMessageEvent {
+            event_key: "Ev1".to_string(),
+            channel: "C1".to_string(),
+            user: "U1".to_string(),
+            text: "<@BOT> see files".to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+            files: vec![file_ref("F1"), file_ref("F2")],
+        };
+
+        let build = channel
+            .current_thread_context_request(&event, "session", "BOT", &[])
+            .await;
+
+        assert!(build.succeeded_file_sync_keys.is_empty());
+        assert!(build.failed_file_sync_keys.is_empty());
+        assert_eq!(build.request.unresolved.len(), 2);
+        assert_eq!(build.request.unresolved[0].kind, "file");
+        assert_eq!(build.request.unresolved[0].reference, "F1");
+        assert_eq!(
+            build.request.unresolved[0].reason,
+            "file sync limit reached"
+        );
+        assert_eq!(build.request.unresolved[1].reference, "F2");
     }
 
     #[test]

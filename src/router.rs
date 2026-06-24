@@ -517,21 +517,20 @@ where
         let session_key = request.session_key.clone();
         let source = request.source.clone();
         let unresolved_count = request.unresolved.len();
-        let existing_context = if state
-            .context_artifacts
-            .iter()
-            .any(|record| record.source == source)
-        {
-            state.context_artifacts.clone()
-        } else {
-            let mut records = state.context_artifacts.clone();
-            records.extend(read_context_artifacts_from_manifest(
-                &session_cwd,
-                &source,
-                Path::new(&source),
-            )?);
-            records
-        };
+        let recovered_context =
+            read_context_artifacts_from_manifest(&session_cwd, &source, Path::new(&source))?;
+        let recovered_context_count = recovered_context.len();
+        let (existing_context, used_recovered_context) =
+            merge_recovered_context_artifacts(&state.context_artifacts, &source, recovered_context);
+        if used_recovered_context {
+            tracing::info!(
+                session_key = %session_key,
+                source = %source,
+                recovered_context_records = recovered_context_count,
+                cwd = %session_cwd.display(),
+                "using recovered session context artifacts from manifest"
+            );
+        }
         let records = write_context_sync(&session_cwd, request, &existing_context)?;
         let record_count = records.len();
         state.context_artifacts = records;
@@ -863,6 +862,56 @@ where
     }
 }
 
+fn merge_recovered_context_artifacts(
+    state_context: &[ContextArtifactRecord],
+    source: &str,
+    recovered_context: Vec<ContextArtifactRecord>,
+) -> (Vec<ContextArtifactRecord>, bool) {
+    if recovered_context.is_empty() {
+        return (state_context.to_vec(), false);
+    }
+    let has_state_source = state_context.iter().any(|record| record.source == source);
+    let use_recovered = !has_state_source
+        || match (
+            source_manifest_updated_at(state_context, source),
+            source_manifest_updated_at(&recovered_context, source),
+        ) {
+            (Some(state_updated_at), Some(recovered_updated_at)) => {
+                recovered_updated_at > state_updated_at
+            }
+            (None, Some(_)) => true,
+            _ => false,
+        };
+    if !use_recovered {
+        return (state_context.to_vec(), false);
+    }
+
+    let mut records = state_context
+        .iter()
+        .filter(|record| record.source != source)
+        .cloned()
+        .collect::<Vec<_>>();
+    records.extend(recovered_context);
+    sort_context_artifact_records(&mut records);
+    (records, true)
+}
+
+fn source_manifest_updated_at(records: &[ContextArtifactRecord], source: &str) -> Option<u64> {
+    records
+        .iter()
+        .find(|record| record.source == source && record.kind == "manifest")
+        .map(|record| record.updated_at_ms)
+}
+
+fn sort_context_artifact_records(records: &mut [ContextArtifactRecord]) {
+    records.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
 #[async_trait]
 impl<S, E> RouterService for AgentRouter<S, E>
 where
@@ -876,26 +925,23 @@ where
     ) -> anyhow::Result<Vec<ContextArtifactRecord>> {
         let lock = self.session_lock(session_key).await;
         let _guard = lock.lock().await;
-        let records: Vec<ContextArtifactRecord> = self
+        let state_context = self
             .store
             .load(session_key)
             .await
-            .map(|state| {
-                state
-                    .context_artifacts
-                    .into_iter()
-                    .filter(|record| record.source == source)
-                    .collect()
-            })
+            .map(|state| state.context_artifacts)
             .unwrap_or_default();
-        if !records.is_empty() {
-            return Ok(records);
-        }
-        let Some(root) = &self.workspace_root else {
-            return Ok(Vec::new());
+        let records = if let Some(root) = &self.workspace_root {
+            let cwd = root.join(session_workspace_dir_name(session_key));
+            let recovered = read_context_artifacts_from_manifest(&cwd, source, Path::new(source))?;
+            merge_recovered_context_artifacts(&state_context, source, recovered).0
+        } else {
+            state_context
         };
-        let cwd = root.join(session_workspace_dir_name(session_key));
-        read_context_artifacts_from_manifest(&cwd, source, Path::new(source))
+        Ok(records
+            .into_iter()
+            .filter(|record| record.source == source)
+            .collect())
     }
 
     async fn sync_context(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
@@ -1757,6 +1803,115 @@ mod tests {
                 .any(|record| record.kind == "slack_current_thread")
         );
         assert!(artifacts.iter().any(|record| record.source == "other"));
+        let manifest = artifacts
+            .iter()
+            .find(|record| record.kind == "manifest")
+            .unwrap();
+        assert_eq!(manifest.metadata["unresolved_count"].as_u64(), Some(1));
+        assert_eq!(
+            manifest.metadata["unresolved"][0]["reference"].as_str(),
+            Some("F2")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_restart_context_sync_prefers_newer_manifest_over_stale_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:channel:C1:111.000";
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let first_store = Arc::new(InMemorySessionStore::default());
+        let first_router = AgentRouter::new("kimi", first_store, executor.clone())
+            .with_workspace_root(Some(workspace_root.clone()));
+
+        first_router
+            .sync_context(ContextSyncRequest {
+                session_key: session_key.to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:file:F1".to_string(),
+                    kind: "slack_file".to_string(),
+                    title: "Slack file F1".to_string(),
+                    source_locator: None,
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/files/F1/metadata.json"),
+                        content: ContextFileContent::Text("{}".to_string()),
+                    }],
+                    metadata: BTreeMap::from([("file_id".to_string(), json!("F1"))]),
+                }],
+                unresolved: vec![ContextSyncIssueInput {
+                    kind: "file".to_string(),
+                    reference: "F2".to_string(),
+                    reason: "transient".to_string(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let restarted_store = Arc::new(InMemorySessionStore::default());
+        let mut stale_state = SessionState::new(session_key, "kimi");
+        stale_state.context_artifacts = vec![
+            ContextArtifactRecord {
+                id: "slack:manifest".to_string(),
+                source: "slack".to_string(),
+                kind: "manifest".to_string(),
+                title: "Stale manifest".to_string(),
+                source_locator: None,
+                paths: vec!["slack/manifest.json".to_string()],
+                fingerprint: "artifact:stale-manifest".to_string(),
+                updated_at_ms: 0,
+                metadata: BTreeMap::new(),
+            },
+            ContextArtifactRecord {
+                id: "slack:file:F0".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Stale Slack file".to_string(),
+                source_locator: None,
+                paths: vec!["slack/files/F0/metadata.json".to_string()],
+                fingerprint: "artifact:stale-file".to_string(),
+                updated_at_ms: 0,
+                metadata: BTreeMap::from([("file_id".to_string(), json!("F0"))]),
+            },
+        ];
+        restarted_store.save(stale_state).await;
+
+        let restarted_router = AgentRouter::new("kimi", restarted_store.clone(), executor)
+            .with_workspace_root(Some(workspace_root));
+        restarted_router
+            .sync_context(ContextSyncRequest {
+                session_key: session_key.to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:thread:C1:111.000".to_string(),
+                    kind: "slack_current_thread".to_string(),
+                    title: "Current Slack thread".to_string(),
+                    source_locator: Some("slack://C1/111.000".to_string()),
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/current-thread.md"),
+                        content: ContextFileContent::Text("thread".to_string()),
+                    }],
+                    metadata: BTreeMap::new(),
+                }],
+                unresolved: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let artifacts = restarted_store
+            .load(session_key)
+            .await
+            .unwrap()
+            .context_artifacts;
+        assert!(artifacts.iter().any(|record| record.id == "slack:file:F1"));
+        assert!(!artifacts.iter().any(|record| record.id == "slack:file:F0"));
+        assert!(
+            artifacts
+                .iter()
+                .any(|record| record.kind == "slack_current_thread")
+        );
         let manifest = artifacts
             .iter()
             .find(|record| record.kind == "manifest")

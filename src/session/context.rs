@@ -234,6 +234,17 @@ pub fn read_context_artifacts_from_manifest(
     if snapshot.source != source {
         return Ok(Vec::new());
     }
+    for artifact in &snapshot.artifacts {
+        anyhow::ensure!(
+            artifact.source == snapshot.source,
+            "context manifest artifact source mismatch: expected {}, got {}",
+            snapshot.source,
+            artifact.source
+        );
+        for path in &artifact.paths {
+            validate_relative_path(Path::new(path))?;
+        }
+    }
     let mut records = Vec::with_capacity(snapshot.artifacts.len() + 1);
     let manifest_fingerprint = context_manifest_fingerprint(
         &snapshot.source,
@@ -607,5 +618,36 @@ mod tests {
         let manifest = serde_json::from_str::<Value>(&manifest).unwrap();
 
         assert_eq!(manifest["unresolved"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn read_context_artifacts_from_manifest_rejects_invalid_artifact_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("slack")).unwrap();
+        std::fs::write(
+            tmp.path().join("slack/manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "source": "slack",
+                "session_key": "s1",
+                "synced_at_ms": 1,
+                "artifacts": [{
+                    "id": "slack:file:F1",
+                    "source": "slack",
+                    "kind": "slack_file",
+                    "title": "Slack file F1",
+                    "paths": ["../secret.txt"],
+                    "fingerprint": "artifact:file",
+                    "updated_at_ms": 1
+                }],
+                "unresolved": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            read_context_artifacts_from_manifest(tmp.path(), "slack", Path::new("slack")).is_err()
+        );
     }
 }
