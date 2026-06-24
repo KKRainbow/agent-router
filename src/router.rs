@@ -31,7 +31,8 @@ use crate::{
     text::truncate_chars,
 };
 
-use self::turns::{InterruptedTurn, TurnGuard, TurnRegistry, TurnReservation};
+use self::turns::{InterruptedTurn, TurnGuard, TurnRegistry};
+pub use self::turns::{TurnBeginMode, TurnReservation};
 
 #[cfg(test)]
 use crate::executor::{InterruptReason, TurnCancellation};
@@ -308,8 +309,12 @@ pub trait RouterOutputSink: Send {
 
 #[async_trait]
 pub trait RouterService: Send + Sync + 'static {
-    async fn preempt(&self, _session_key: &str) -> anyhow::Result<u64> {
-        Ok(0)
+    async fn reserve_turn(
+        &self,
+        _session_key: &str,
+        _mode: TurnBeginMode,
+    ) -> anyhow::Result<Option<TurnReservation>> {
+        Ok(None)
     }
 
     async fn context_artifacts(
@@ -336,14 +341,14 @@ pub trait RouterService: Send + Sync + 'static {
         self.handle(input, output).await
     }
 
-    async fn handle_preempted_with_context(
+    async fn handle_reserved(
         &self,
         input: RouterInput,
-        preempt_generation: u64,
+        reservation: TurnReservation,
         context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
-        let _ = preempt_generation;
+        let _ = reservation;
         self.handle_with_context(input, context, output).await
     }
 
@@ -493,12 +498,12 @@ where
             .clone()
     }
 
-    async fn preempt_active_turn(&self, session_key: &str) -> u64 {
+    async fn reserve_replacement_turn(&self, session_key: &str) -> TurnReservation {
         let reserved = self.turns.reserve_replacement(session_key).await;
         if let Some(interrupted) = reserved.interrupted {
             self.interrupt_turn(interrupted).await;
         }
-        reserved.reservation.generation()
+        reserved.reservation
     }
 
     async fn interrupt_turn(&self, turn: InterruptedTurn) {
@@ -527,7 +532,7 @@ where
     async fn handle_input(
         &self,
         input: RouterInput,
-        preempt_generation: Option<u64>,
+        reserved_turn: Option<TurnReservation>,
         context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
@@ -551,7 +556,7 @@ where
                 .handle_yolo_command(&input.session_key, text, output)
                 .await;
         }
-        self.route_to_active_executor(input, preempt_generation, context, output)
+        self.route_to_active_executor(input, reserved_turn, context, output)
             .await
     }
 
@@ -811,7 +816,7 @@ where
     async fn route_to_active_executor(
         &self,
         input: RouterInput,
-        preempt_generation: Option<u64>,
+        reserved_turn: Option<TurnReservation>,
         context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
@@ -819,23 +824,22 @@ where
         let (turn, replaced, state, executor_name, descriptor, binding, session_cwd) = {
             let lock = self.session_lock(&session_key).await;
             let _guard = lock.lock().await;
-            let preempt_reservation = if let Some(generation) = preempt_generation {
-                match self.turns.reservation_for(&session_key, generation).await {
-                    Some(reservation) => Some(reservation),
-                    None => {
-                        tracing::debug!(
-                            session_key = %session_key,
-                            generation,
-                            "discarded stale preempted router turn before context sync"
-                        );
-                        return Ok(());
-                    }
+            let reserved_turn = if let Some(reservation) = reserved_turn {
+                if reservation.is_current().await {
+                    Some(reservation)
+                } else {
+                    tracing::debug!(
+                        session_key = %session_key,
+                        generation = reservation.generation(),
+                        "discarded stale reserved router turn before context sync"
+                    );
+                    return Ok(());
                 }
             } else {
                 None
             };
             if let Some(context) = context {
-                if let Some(reservation) = preempt_reservation.as_ref() {
+                if let Some(reservation) = reserved_turn.as_ref() {
                     let prepared = match self.prepare_context_sync_locked(context).await {
                         Ok(prepared) => prepared,
                         Err(err) => {
@@ -880,7 +884,7 @@ where
                 self.store.save(state.clone()).await;
             }
             let binding = state.binding_for(&executor_name);
-            let (turn, replaced) = if let Some(reservation) = preempt_reservation {
+            let (turn, replaced) = if let Some(reservation) = reserved_turn {
                 match reservation.adopt(executor_name.clone()).await {
                     Some(turn) => (turn, None),
                     None => {
@@ -1303,8 +1307,17 @@ where
     S: SessionStore,
     E: ExecutorBackend,
 {
-    async fn preempt(&self, session_key: &str) -> anyhow::Result<u64> {
-        Ok(self.preempt_active_turn(session_key).await)
+    async fn reserve_turn(
+        &self,
+        session_key: &str,
+        mode: TurnBeginMode,
+    ) -> anyhow::Result<Option<TurnReservation>> {
+        match mode {
+            TurnBeginMode::ReplaceActive => {
+                Ok(Some(self.reserve_replacement_turn(session_key).await))
+            }
+            TurnBeginMode::NoPreempt => Ok(None),
+        }
     }
 
     async fn context_artifacts(
@@ -1365,10 +1378,10 @@ where
         self.handle_input(input, None, context, output).await
     }
 
-    async fn handle_preempted_with_context(
+    async fn handle_reserved(
         &self,
         input: RouterInput,
-        preempt_generation: u64,
+        reservation: TurnReservation,
         context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
@@ -1377,9 +1390,10 @@ where
             .resolve_command(&input.session_key, &input.text, input.user_id.as_deref())
             .await
         {
+            let _ = reservation.discard_if_current().await;
             return output.send_final_reply(reply.text).await;
         }
-        self.handle_input(input, Some(preempt_generation), context, output)
+        self.handle_input(input, Some(reservation), context, output)
             .await
     }
 
@@ -3583,17 +3597,21 @@ mod tests {
         let executor = Arc::new(FakeExecutorBackend::default());
         let router =
             AgentRouter::new("kimi", store, executor).with_workspace_root(Some(workspace_root));
-        let generation = router.preempt(session_key).await.unwrap();
+        let reservation = router
+            .reserve_turn(session_key, TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
         let mut output = CollectingRouterOutputSink::default();
 
         let err = router
-            .handle_preempted_with_context(
+            .handle_reserved(
                 RouterInput {
                     session_key: session_key.to_string(),
                     text: "second".to_string(),
                     user_id: None,
                 },
-                generation,
+                reservation,
                 Some(ContextSyncRequest {
                     session_key: session_key.to_string(),
                     source: "slack".to_string(),
@@ -3654,7 +3672,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let generation = router.preempt("slack:C1:T1").await.unwrap();
+        let reservation = router
+            .reserve_turn("slack:C1:T1", TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
             .await
             .unwrap()
@@ -3662,13 +3684,13 @@ mod tests {
 
         let mut second_output = CollectingRouterOutputSink::default();
         router
-            .handle_preempted_with_context(
+            .handle_reserved(
                 RouterInput {
                     session_key: "slack:C1:T1".to_string(),
                     text: "second".to_string(),
                     user_id: None,
                 },
-                generation,
+                reservation,
                 Some(ContextSyncRequest {
                     session_key: "slack:C1:T1".to_string(),
                     source: "slack".to_string(),
@@ -3705,18 +3727,26 @@ mod tests {
         let executor = Arc::new(FakeExecutorBackend::default());
         let router = AgentRouter::new("kimi", store.clone(), executor.clone());
 
-        let stale_generation = router.preempt("slack:C1:T1").await.unwrap();
-        let current_generation = router.preempt("slack:C1:T1").await.unwrap();
+        let stale_reservation = router
+            .reserve_turn("slack:C1:T1", TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_reservation = router
+            .reserve_turn("slack:C1:T1", TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut stale_output = CollectingRouterOutputSink::default();
         router
-            .handle_preempted_with_context(
+            .handle_reserved(
                 RouterInput {
                     session_key: "slack:C1:T1".to_string(),
                     text: "older delayed".to_string(),
                     user_id: None,
                 },
-                stale_generation,
+                stale_reservation,
                 None,
                 &mut stale_output,
             )
@@ -3727,13 +3757,13 @@ mod tests {
 
         let mut current_output = CollectingRouterOutputSink::default();
         router
-            .handle_preempted_with_context(
+            .handle_reserved(
                 RouterInput {
                     session_key: "slack:C1:T1".to_string(),
                     text: "newer".to_string(),
                     user_id: None,
                 },
-                current_generation,
+                current_reservation,
                 None,
                 &mut current_output,
             )

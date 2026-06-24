@@ -18,8 +18,8 @@ use crate::{
     channel::EventDeduper,
     config::{ChannelEventMode, QqConfig},
     router::{
-        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
-        render_compact_channel_events,
+        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
+        TurnReservation, render_compact_channel_events,
     },
 };
 
@@ -243,16 +243,18 @@ impl QqBotChannel {
 
         let command = message.text.split_whitespace().next().unwrap_or("");
         let reply_generation = self.next_reply_generation.fetch_add(1, Ordering::Relaxed);
-        let preempt_generation = if matches!(command, "/stop" | "/agent" | "/yolo") {
+        let turn_reservation = if matches!(command, "/stop" | "/agent" | "/yolo") {
             None
         } else {
-            Some(router.preempt(&message.session_key).await?)
+            router
+                .reserve_turn(&message.session_key, TurnBeginMode::ReplaceActive)
+                .await?
         };
         let channel = self.clone();
         tokio::spawn(async move {
             let session_key = message.session_key.clone();
             if let Err(err) = channel
-                .route_message(message, preempt_generation, reply_generation, router)
+                .route_message(message, turn_reservation, reply_generation, router)
                 .await
             {
                 tracing::warn!(
@@ -268,7 +270,7 @@ impl QqBotChannel {
     async fn route_message(
         &self,
         message: QqInboundMessage,
-        preempt_generation: Option<u64>,
+        turn_reservation: Option<TurnReservation>,
         reply_generation: u64,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
@@ -294,9 +296,9 @@ impl QqBotChannel {
             text: message.text,
             user_id: Some(message.user_id),
         };
-        if let Some(preempt_generation) = preempt_generation {
+        if let Some(reservation) = turn_reservation {
             router
-                .handle_preempted_with_context(input, preempt_generation, None, &mut output)
+                .handle_reserved(input, reservation, None, &mut output)
                 .await
         } else {
             router.handle(input, &mut output).await

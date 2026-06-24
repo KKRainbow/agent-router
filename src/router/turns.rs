@@ -35,8 +35,14 @@ pub(crate) struct BegunTurn {
     pub(crate) interrupted: Option<InterruptedTurn>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnBeginMode {
+    ReplaceActive,
+    NoPreempt,
+}
+
 #[derive(Debug, Clone)]
-pub(crate) struct TurnReservation {
+pub struct TurnReservation {
     registry: Arc<TurnRegistry>,
     session_key: String,
     generation: u64,
@@ -124,21 +130,6 @@ impl TurnRegistry {
             },
             interrupted: replaced,
         }
-    }
-
-    pub(crate) async fn reservation_for(
-        self: &Arc<Self>,
-        session_key: &str,
-        generation: u64,
-    ) -> Option<TurnReservation> {
-        let active = self.active.lock().await;
-        let turn = active.get(session_key)?;
-        (turn.generation == generation).then(|| TurnReservation {
-            registry: self.clone(),
-            session_key: session_key.to_string(),
-            generation,
-            cancel: turn.cancel.clone(),
-        })
     }
 
     pub(crate) async fn stop(self: &Arc<Self>, session_key: &str) -> Option<InterruptedTurn> {

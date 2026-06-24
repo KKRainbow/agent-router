@@ -23,7 +23,7 @@ use crate::{
     channel::EventDeduper,
     config::{ChannelEventMode, SlackConfig},
     router::{
-        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
+        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
         render_live_compact_channel_events,
     },
     session::context::{
@@ -268,7 +268,7 @@ impl SlackSocketModeChannel {
         }
         let command = text.split_whitespace().next().unwrap_or("");
         let mut context_generation = None;
-        let preempt_generation =
+        let turn_reservation =
             if approval_command || matches!(command, "/stop" | "/agent" | "/yolo") {
                 None
             } else {
@@ -276,7 +276,9 @@ impl SlackSocketModeChannel {
                 self.remember_context_generation(&session_key, generation)
                     .await;
                 context_generation = Some(generation);
-                Some(router.preempt(&session_key).await?)
+                router
+                    .reserve_turn(&session_key, TurnBeginMode::ReplaceActive)
+                    .await?
             };
         let context_turn = context_generation.map(|generation| SlackContextTurn {
             session_key: session_key.clone(),
@@ -315,15 +317,15 @@ impl SlackSocketModeChannel {
         let reply_target = event.reply_target();
         let mut output =
             SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
-        if let Some(preempt_generation) = preempt_generation {
+        if let Some(reservation) = turn_reservation {
             router
-                .handle_preempted_with_context(
+                .handle_reserved(
                     RouterInput {
                         session_key,
                         text,
                         user_id: Some(event.user),
                     },
-                    preempt_generation,
+                    reservation,
                     context.map(|context| context.request),
                     &mut output,
                 )
@@ -2491,6 +2493,7 @@ fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::approval::{ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection};
+    use crate::router::TurnReservation;
 
     use serde_json::json;
 
@@ -2500,15 +2503,18 @@ mod tests {
     struct RecordingRouter {
         handled: Mutex<Vec<RouterInput>>,
         observed: Mutex<Vec<RouterInput>>,
-        preempted: Mutex<Vec<String>>,
+        reserved: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
     impl RouterService for RecordingRouter {
-        async fn preempt(&self, session_key: &str) -> anyhow::Result<u64> {
-            let mut preempted = self.preempted.lock().await;
-            preempted.push(session_key.to_string());
-            Ok(preempted.len() as u64)
+        async fn reserve_turn(
+            &self,
+            session_key: &str,
+            _mode: TurnBeginMode,
+        ) -> anyhow::Result<Option<TurnReservation>> {
+            self.reserved.lock().await.push(session_key.to_string());
+            Ok(None)
         }
 
         async fn handle(
@@ -3917,7 +3923,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(router.preempted.lock().await.is_empty());
+        assert!(router.reserved.lock().await.is_empty());
     }
 
     #[tokio::test]
