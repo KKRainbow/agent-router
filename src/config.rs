@@ -39,6 +39,7 @@ pub struct SlackConfig {
     pub bot_token: String,
     pub app_token: String,
     pub require_mention: bool,
+    pub channel_events: ChannelEventMode,
     pub allowed_channels: BTreeSet<String>,
     pub free_response_channels: BTreeSet<String>,
 }
@@ -50,8 +51,16 @@ pub struct QqConfig {
     pub client_secret: String,
     pub sandbox: bool,
     pub intents: u64,
+    pub channel_events: ChannelEventMode,
     pub allowed_users: BTreeSet<String>,
     pub allowed_groups: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelEventMode {
+    Off,
+    Compact,
+    Verbose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +110,7 @@ struct FileSlackConfig {
     bot_token: Option<String>,
     app_token: Option<String>,
     require_mention: Option<bool>,
+    channel_events: Option<String>,
     allowed_channels: Option<StringList>,
     free_response_channels: Option<StringList>,
 }
@@ -112,6 +122,7 @@ struct FileQqConfig {
     client_secret: Option<String>,
     sandbox: Option<bool>,
     intents: Option<u64>,
+    channel_events: Option<String>,
     allowed_users: Option<StringList>,
     allowed_groups: Option<StringList>,
 }
@@ -206,6 +217,12 @@ impl AppConfig {
                 .slack_require_mention
                 .or(slack_file.require_mention)
                 .unwrap_or(true),
+            channel_events: env_cfg
+                .slack_channel_events
+                .or(slack_file.channel_events)
+                .map(|value| parse_channel_event_mode("slack.channel_events", &value))
+                .transpose()?
+                .unwrap_or(ChannelEventMode::Compact),
             allowed_channels: env_cfg
                 .slack_allowed_channels
                 .or_else(|| slack_file.allowed_channels.map(StringList::into_set))
@@ -235,6 +252,12 @@ impl AppConfig {
                 .qq_intents
                 .or(qq_file.intents)
                 .unwrap_or((1_u64 << 25) | (1_u64 << 30)),
+            channel_events: env_cfg
+                .qq_channel_events
+                .or(qq_file.channel_events)
+                .map(|value| parse_channel_event_mode("qq.channel_events", &value))
+                .transpose()?
+                .unwrap_or(ChannelEventMode::Compact),
             allowed_users: env_cfg
                 .qq_allowed_users
                 .or_else(|| qq_file.allowed_users.map(StringList::into_set))
@@ -290,6 +313,7 @@ struct EnvConfig {
     slack_bot_token: Option<String>,
     slack_app_token: Option<String>,
     slack_require_mention: Option<bool>,
+    slack_channel_events: Option<String>,
     slack_allowed_channels: Option<BTreeSet<String>>,
     slack_free_response_channels: Option<BTreeSet<String>>,
     qq_enabled: Option<bool>,
@@ -297,6 +321,7 @@ struct EnvConfig {
     qq_client_secret: Option<String>,
     qq_sandbox: Option<bool>,
     qq_intents: Option<u64>,
+    qq_channel_events: Option<String>,
     qq_allowed_users: Option<BTreeSet<String>>,
     qq_allowed_groups: Option<BTreeSet<String>>,
 }
@@ -311,6 +336,7 @@ impl EnvConfig {
             slack_bot_token: nonempty_env("SLACK_BOT_TOKEN"),
             slack_app_token: nonempty_env("SLACK_APP_TOKEN"),
             slack_require_mention: env_bool("SLACK_REQUIRE_MENTION"),
+            slack_channel_events: nonempty_env("SLACK_CHANNEL_EVENTS"),
             slack_allowed_channels: env_set("SLACK_ALLOWED_CHANNELS"),
             slack_free_response_channels: env_set("SLACK_FREE_RESPONSE_CHANNELS"),
             qq_enabled: env_bool("QQ_ENABLED").or_else(|| env_bool("QQBOT_ENABLED")),
@@ -319,6 +345,8 @@ impl EnvConfig {
                 .or_else(|| nonempty_env("QQBOT_CLIENT_SECRET")),
             qq_sandbox: env_bool("QQ_SANDBOX").or_else(|| env_bool("QQBOT_SANDBOX")),
             qq_intents: env_u64("QQ_INTENTS").or_else(|| env_u64("QQBOT_INTENTS")),
+            qq_channel_events: nonempty_env("QQ_CHANNEL_EVENTS")
+                .or_else(|| nonempty_env("QQBOT_CHANNEL_EVENTS")),
             qq_allowed_users: env_set("QQ_ALLOWED_USERS")
                 .or_else(|| env_set("QQBOT_ALLOWED_USERS")),
             qq_allowed_groups: env_set("QQ_ALLOWED_GROUPS")
@@ -404,6 +432,15 @@ fn parse_approval_mode(value: &str) -> anyhow::Result<ApprovalMode> {
     }
 }
 
+fn parse_channel_event_mode(field: &str, value: &str) -> anyhow::Result<ChannelEventMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "false" => Ok(ChannelEventMode::Off),
+        "" | "compact" => Ok(ChannelEventMode::Compact),
+        "verbose" | "all" | "true" => Ok(ChannelEventMode::Verbose),
+        other => anyhow::bail!("{field} `{other}` is not supported"),
+    }
+}
+
 fn nonempty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
@@ -452,6 +489,8 @@ mod tests {
         assert_eq!(cfg.approval.default_mode, ApprovalMode::Normal);
         assert!(!cfg.slack.enabled);
         assert!(!cfg.qq.enabled);
+        assert_eq!(cfg.slack.channel_events, ChannelEventMode::Compact);
+        assert_eq!(cfg.qq.channel_events, ChannelEventMode::Compact);
     }
 
     #[test]
@@ -461,6 +500,7 @@ router:
   default_executor: kimi
 slack:
   require_mention: false
+  channel_events: verbose
   allowed_channels: "C1,C2"
   free_response_channels: ["C3", "C4,C5"]
 executors:
@@ -473,6 +513,7 @@ executors:
         let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
 
         assert!(!cfg.slack.require_mention);
+        assert_eq!(cfg.slack.channel_events, ChannelEventMode::Verbose);
         assert_eq!(
             cfg.slack.allowed_channels,
             ["C1".to_string(), "C2".to_string()].into_iter().collect()
@@ -491,6 +532,7 @@ qq:
   app_id: app
   client_secret: secret
   sandbox: true
+  channel_events: off
   allowed_users: "u1,u2"
   allowed_groups: ["g1", "g2,g3"]
 "#;
@@ -501,6 +543,7 @@ qq:
         assert_eq!(cfg.qq.app_id, "app");
         assert_eq!(cfg.qq.client_secret, "secret");
         assert!(cfg.qq.sandbox);
+        assert_eq!(cfg.qq.channel_events, ChannelEventMode::Off);
         assert_eq!(cfg.qq.intents, (1_u64 << 25) | (1_u64 << 30));
         assert_eq!(
             cfg.qq.allowed_users,

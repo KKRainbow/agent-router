@@ -13,8 +13,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::{
     approval::{SharedApprovalBroker, is_approval_command},
     channel::EventDeduper,
-    config::QqConfig,
-    router::{RouterInput, RouterOutputSink, RouterService},
+    config::{ChannelEventMode, QqConfig},
+    router::{
+        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
+        render_compact_channel_events,
+    },
     session::work_queue::{EnqueueResult, SessionWorkQueue},
 };
 
@@ -297,6 +300,8 @@ impl QqBotChannel {
             session_key: message.session_key.clone(),
             target: message.target,
             msg_id: message.msg_id,
+            channel_events: self.cfg.channel_events,
+            pending_events: Vec::new(),
         };
         router
             .handle(
@@ -570,26 +575,42 @@ struct QqRouterOutputSink {
     session_key: String,
     target: QqReplyTarget,
     msg_id: String,
+    channel_events: ChannelEventMode,
+    pending_events: Vec<RouterChannelEvent>,
 }
 
 #[async_trait::async_trait]
 impl RouterOutputSink for QqRouterOutputSink {
-    fn send_channel_event(&mut self, event: crate::router::RouterChannelEvent) {
-        let channel = self.channel.clone();
-        let session_key = self.session_key.clone();
-        let target = self.target.clone();
-        let msg_id = self.msg_id.clone();
-        tokio::spawn(async move {
-            if let Err(err) = channel
-                .send_reply_message(&session_key, &target, &msg_id, &event.render_text())
-                .await
-            {
-                tracing::warn!(error = %err, "failed to post QQ channel event");
+    fn send_channel_event(&mut self, event: RouterChannelEvent) {
+        match self.channel_events {
+            ChannelEventMode::Off => {}
+            ChannelEventMode::Compact => self.pending_events.push(event),
+            ChannelEventMode::Verbose => {
+                let channel = self.channel.clone();
+                let session_key = self.session_key.clone();
+                let target = self.target.clone();
+                let msg_id = self.msg_id.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = channel
+                        .send_reply_message(&session_key, &target, &msg_id, &event.render_text())
+                        .await
+                    {
+                        tracing::warn!(error = %err, "failed to post QQ channel event");
+                    }
+                });
             }
-        });
+        }
     }
 
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+        if let Some(summary) = render_compact_channel_events(&self.pending_events)
+            && let Err(err) = self
+                .channel
+                .send_reply_message(&self.session_key, &self.target, &self.msg_id, &summary)
+                .await
+        {
+            tracing::warn!(error = %err, "failed to post compact QQ channel event summary");
+        }
         self.channel
             .send_reply_message(&self.session_key, &self.target, &self.msg_id, &text)
             .await

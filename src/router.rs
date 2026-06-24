@@ -61,6 +61,121 @@ impl RouterChannelEvent {
     }
 }
 
+pub(crate) fn render_compact_channel_events(events: &[RouterChannelEvent]) -> Option<String> {
+    let first = events.first()?;
+    let mut latest_reasoning = None;
+    let mut tool_total = 0usize;
+    let mut tool_counts: Vec<(String, usize)> = Vec::new();
+    let mut attention = Vec::new();
+
+    for event in events {
+        match event.kind {
+            RouterChannelEventKind::ReasoningSummary => {
+                latest_reasoning = Some(truncate_chars(one_line(&event.text).as_str(), 240));
+            }
+            RouterChannelEventKind::ToolCall => {
+                tool_total += 1;
+                let label = compact_tool_label(event);
+                if let Some((_, count)) = tool_counts
+                    .iter_mut()
+                    .find(|(existing, _)| existing == &label)
+                {
+                    *count += 1;
+                } else {
+                    tool_counts.push((label.clone(), 1));
+                }
+                if let Some(status) = compact_attention_status(event) {
+                    attention.push(format!("{label}: {status}"));
+                }
+            }
+        }
+    }
+
+    if latest_reasoning.is_none() && attention.is_empty() && tool_total <= 1 {
+        return None;
+    }
+
+    let mut lines = vec![format!("[{}] Activity", first.executor)];
+    if let Some(reasoning) = latest_reasoning
+        && !reasoning.is_empty()
+    {
+        lines.push(format!("Reasoning: {reasoning}"));
+    }
+    if tool_total > 0 {
+        lines.push(format!(
+            "Tools: {}",
+            compact_tool_counts(tool_total, &tool_counts)
+        ));
+    }
+    if !attention.is_empty() {
+        lines.push(format!("Attention: {}", attention.join("; ")));
+    }
+    Some(lines.join("\n"))
+}
+
+fn compact_tool_counts(total: usize, counts: &[(String, usize)]) -> String {
+    let mut shown_steps = 0usize;
+    let mut labels = Vec::new();
+    for (label, count) in counts.iter().take(4) {
+        shown_steps += *count;
+        if *count > 1 {
+            labels.push(format!("{label} x{count}"));
+        } else {
+            labels.push(label.clone());
+        }
+    }
+    if total > shown_steps {
+        labels.push(format!("{} more", total - shown_steps));
+    }
+    let noun = if total == 1 { "step" } else { "steps" };
+    format!("{total} {noun}: {}", labels.join(", "))
+}
+
+fn compact_tool_label(event: &RouterChannelEvent) -> String {
+    let title = event.title.trim();
+    if !title.is_empty() && title != "mcpToolCall" && title != "dynamicToolCall" {
+        return title.to_string();
+    }
+    event
+        .text
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.to_ascii_lowercase().starts_with("status:")
+                && !line.to_ascii_lowercase().starts_with("exit:")
+        })
+        .unwrap_or("tool")
+        .to_string()
+}
+
+fn compact_attention_status(event: &RouterChannelEvent) -> Option<String> {
+    for line in event.text.lines().map(str::trim) {
+        let lower = line.to_ascii_lowercase();
+        if let Some(status) = lower.strip_prefix("status:") {
+            let status = status.trim();
+            if status.contains("fail")
+                || status.contains("error")
+                || status.contains("cancel")
+                || status.contains("denied")
+            {
+                return Some(line.to_string());
+            }
+        }
+        if let Some(exit) = lower.strip_prefix("exit:") {
+            let code = exit.trim();
+            if code.parse::<i64>().is_ok_and(|code| code != 0) {
+                return Some(line.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouterChannelEventKind {
     ReasoningSummary,
@@ -1278,6 +1393,64 @@ mod tests {
         assert_eq!(
             events[1].render_text(),
             "[codex] Reasoning summary\nI should inspect the config."
+        );
+    }
+
+    #[test]
+    fn compact_channel_events_suppress_single_successful_tool() {
+        let events = vec![RouterChannelEvent {
+            kind: RouterChannelEventKind::ToolCall,
+            executor: "codex".to_string(),
+            title: "Bash".to_string(),
+            text: "exit: 0\nstatus: completed".to_string(),
+        }];
+
+        assert_eq!(render_compact_channel_events(&events), None);
+    }
+
+    #[test]
+    fn compact_channel_events_group_activity() {
+        let events = vec![
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ReasoningSummary,
+                executor: "codex".to_string(),
+                title: "Reasoning".to_string(),
+                text: "Need to inspect the failing test first.".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "Bash".to_string(),
+                text: "exit: 0\nstatus: completed".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "dynamicToolCall".to_string(),
+                text: "read_file\nstatus: completed".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            render_compact_channel_events(&events).as_deref(),
+            Some(
+                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nTools: 2 steps: Bash, read_file"
+            )
+        );
+    }
+
+    #[test]
+    fn compact_channel_events_keep_failed_tool_attention() {
+        let events = vec![RouterChannelEvent {
+            kind: RouterChannelEventKind::ToolCall,
+            executor: "codex".to_string(),
+            title: "Bash".to_string(),
+            text: "exit: 2\nstatus: failed".to_string(),
+        }];
+
+        assert_eq!(
+            render_compact_channel_events(&events).as_deref(),
+            Some("[codex] Activity\nTools: 1 step: Bash\nAttention: Bash: exit: 2")
         );
     }
 

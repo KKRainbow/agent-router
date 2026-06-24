@@ -22,6 +22,9 @@ executors:
 slack:
   # Optional. When omitted, Slack is enabled if both tokens are configured.
   # enabled: true
+  # channel_events: off | compact | verbose
+  # compact groups useful turn activity and suppresses single successful tool calls.
+  channel_events: compact
   # Prefer environment variables for secrets:
   # SLACK_BOT_TOKEN=xoxb-...
   # SLACK_APP_TOKEN=xapp-...
@@ -32,6 +35,9 @@ slack:
 qq:
   # Optional. When omitted, QQ is enabled if app_id and client_secret are configured.
   # enabled: true
+  # channel_events: off | compact | verbose
+  # compact groups useful turn activity and suppresses single successful tool calls.
+  channel_events: compact
   # Prefer environment variables for secrets:
   # QQ_APP_ID=...
   # QQ_CLIENT_SECRET=...

@@ -10,8 +10,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::{
     approval::{SharedApprovalBroker, is_approval_command},
     channel::EventDeduper,
-    config::SlackConfig,
-    router::{RouterInput, RouterOutputSink, RouterService},
+    config::{ChannelEventMode, SlackConfig},
+    router::{
+        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
+        render_compact_channel_events,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -205,6 +208,8 @@ impl SlackSocketModeChannel {
         let mut output = SlackRouterOutputSink {
             channel: self.clone(),
             target: reply_target,
+            channel_events: self.cfg.channel_events,
+            pending_events: Vec::new(),
         };
         router
             .handle(
@@ -245,6 +250,8 @@ impl SlackSocketModeChannel {
         let mut output = SlackRouterOutputSink {
             channel: self.clone(),
             target: reply_target,
+            channel_events: self.cfg.channel_events,
+            pending_events: Vec::new(),
         };
         router
             .handle(
@@ -375,21 +382,34 @@ impl SlackSocketModeChannel {
 struct SlackRouterOutputSink {
     channel: SlackSocketModeChannel,
     target: SlackReplyTarget,
+    channel_events: ChannelEventMode,
+    pending_events: Vec<RouterChannelEvent>,
 }
 
 #[async_trait::async_trait]
 impl RouterOutputSink for SlackRouterOutputSink {
-    fn send_channel_event(&mut self, event: crate::router::RouterChannelEvent) {
-        let channel = self.channel.clone();
-        let target = self.target.clone();
-        tokio::spawn(async move {
-            if let Err(err) = channel.post_message(&target, &event.render_text()).await {
-                tracing::warn!(error = %err, "failed to post Slack channel event");
+    fn send_channel_event(&mut self, event: RouterChannelEvent) {
+        match self.channel_events {
+            ChannelEventMode::Off => {}
+            ChannelEventMode::Compact => self.pending_events.push(event),
+            ChannelEventMode::Verbose => {
+                let channel = self.channel.clone();
+                let target = self.target.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = channel.post_message(&target, &event.render_text()).await {
+                        tracing::warn!(error = %err, "failed to post Slack channel event");
+                    }
+                });
             }
-        });
+        }
     }
 
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+        if let Some(summary) = render_compact_channel_events(&self.pending_events)
+            && let Err(err) = self.channel.post_message(&self.target, &summary).await
+        {
+            tracing::warn!(error = %err, "failed to post compact Slack channel event summary");
+        }
         self.channel.post_message(&self.target, &text).await
     }
 }
@@ -568,6 +588,7 @@ mod tests {
             bot_token: String::new(),
             app_token: String::new(),
             require_mention,
+            channel_events: ChannelEventMode::Compact,
             allowed_channels: Default::default(),
             free_response_channels: Default::default(),
         }
