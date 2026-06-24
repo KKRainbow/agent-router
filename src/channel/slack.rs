@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -25,6 +26,8 @@ use crate::{
         sanitize_path_segment,
     },
 };
+
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct SlackSocketModeChannel {
@@ -50,14 +53,27 @@ impl SlackSocketModeChannel {
 
     pub async fn run(self, router: Arc<dyn RouterService>) -> anyhow::Result<()> {
         self.validate_tokens()?;
+        let channel = Arc::new(self);
+        channel.clone().spawn_approval_notifier();
+
+        loop {
+            match channel.clone().run_once(router.clone()).await {
+                Ok(()) => tracing::warn!("Slack Socket Mode ended; reconnecting"),
+                Err(err) => {
+                    tracing::warn!(error = %err, "Slack Socket Mode disconnected; reconnecting");
+                }
+            }
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+    }
+
+    async fn run_once(self: Arc<Self>, router: Arc<dyn RouterService>) -> anyhow::Result<()> {
         let bot_user_id = self.auth_test().await?;
         let url = self.open_socket_url().await?;
         tracing::info!("connecting Slack Socket Mode");
         let (stream, _) = connect_async(url).await?;
         tracing::info!(bot_user_id = %bot_user_id, "connected Slack Socket Mode");
         let (mut sink, mut stream) = stream.split();
-        let channel = Arc::new(self);
-        channel.clone().spawn_approval_notifier();
 
         while let Some(frame) = stream.next().await {
             let frame = frame?;
@@ -73,7 +89,7 @@ impl SlackSocketModeChannel {
                         ))
                         .await?;
                     }
-                    let channel_ref = channel.clone();
+                    let channel_ref = self.clone();
                     let router_ref = router.clone();
                     let bot_user_id = bot_user_id.clone();
                     tokio::spawn(async move {
