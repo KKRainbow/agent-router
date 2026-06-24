@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
@@ -32,6 +32,7 @@ pub struct SlackSocketModeChannel {
     http: Client,
     seen_events: Arc<Mutex<EventDeduper>>,
     context_cache: Arc<Mutex<SlackContextCache>>,
+    session_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl SlackSocketModeChannel {
@@ -42,6 +43,7 @@ impl SlackSocketModeChannel {
             http: Client::new(),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(512))),
             context_cache: Arc::new(Mutex::new(SlackContextCache::default())),
+            session_locks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -207,6 +209,8 @@ impl SlackSocketModeChannel {
             }
             return Ok(());
         }
+        let session_lock = self.session_lock(&session_key).await;
+        let _session_guard = session_lock.lock().await;
         tracing::info!(
             channel = %event.channel,
             user_id = %event.user,
@@ -248,6 +252,14 @@ impl SlackSocketModeChannel {
             self.mark_file_sync_completed(cache_key).await;
         }
         Ok(())
+    }
+
+    async fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        locks
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     async fn handle_slash_command(
@@ -615,10 +627,8 @@ impl SlackSocketModeChannel {
             let cache = self.context_cache.lock().await;
             cache.threads.get(&key).cloned().unwrap_or_default()
         };
-        let oldest = cached.last().map(|message| message.ts.as_str());
-        match self.fetch_thread_messages(channel, thread_ts, oldest).await {
-            Ok(new_messages) => {
-                let messages = merge_thread_messages(cached, new_messages);
+        match self.fetch_thread_messages(channel, thread_ts).await {
+            Ok(messages) => {
                 self.context_cache
                     .lock()
                     .await
@@ -641,7 +651,6 @@ impl SlackSocketModeChannel {
         &self,
         channel: &str,
         thread_ts: &str,
-        oldest: Option<&str>,
     ) -> anyhow::Result<Vec<SlackThreadMessage>> {
         let mut cursor = None;
         let mut messages = Vec::new();
@@ -653,10 +662,6 @@ impl SlackSocketModeChannel {
             ];
             if let Some(cursor) = cursor.clone() {
                 query.push(("cursor", cursor));
-            }
-            if let Some(oldest) = oldest {
-                query.push(("oldest", oldest.to_string()));
-                query.push(("inclusive", "false".to_string()));
             }
             let response = self
                 .http
@@ -705,7 +710,8 @@ impl SlackSocketModeChannel {
             .url_private_download
             .as_deref()
             .or(file.url_private.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("file has no private download URL"))?;
+            .ok_or_else(|| anyhow::anyhow!("file has no private download URL"))
+            .and_then(parse_slack_file_url)?;
         let mut response = self
             .http
             .get(url)
@@ -1221,10 +1227,40 @@ fn extract_slack_urls(text: &str) -> Vec<String> {
 }
 
 fn parse_slack_thread_permalink(url: &str) -> Option<(String, String)> {
-    let (_, after_archives) = url.split_once("/archives/")?;
-    let (channel, rest) = after_archives.split_once('/')?;
-    let raw = rest.strip_prefix('p')?;
+    let url = Url::parse(url).ok()?;
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let archive_index = segments.iter().position(|segment| *segment == "archives")?;
+    let channel = segments.get(archive_index + 1)?.to_string();
+    let path_ts = segments.get(archive_index + 2)?;
+    if channel.is_empty() {
+        return None;
+    }
+    let thread_ts = url
+        .query_pairs()
+        .find_map(|(key, value)| {
+            (key == "thread_ts")
+                .then(|| parse_slack_timestamp(&value))
+                .flatten()
+        })
+        .or_else(|| parse_slack_timestamp(path_ts))?;
+    Some((channel, thread_ts))
+}
+
+fn parse_slack_timestamp(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if let Some((seconds, micros)) = raw.split_once('.') {
+        if !seconds.is_empty()
+            && seconds.chars().all(|ch| ch.is_ascii_digit())
+            && micros.len() == 6
+            && micros.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Some(raw.to_string());
+        }
+        return None;
+    }
     let timestamp = raw
+        .strip_prefix('p')
+        .unwrap_or(raw)
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
@@ -1232,7 +1268,27 @@ fn parse_slack_thread_permalink(url: &str) -> Option<(String, String)> {
         return None;
     }
     let (seconds, micros) = timestamp.split_at(timestamp.len() - 6);
-    Some((channel.to_string(), format!("{seconds}.{micros}")))
+    Some(format!("{seconds}.{micros}"))
+}
+
+fn parse_slack_file_url(raw: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(raw).map_err(|_| anyhow::anyhow!("Slack file URL is invalid"))?;
+    anyhow::ensure!(url.scheme() == "https", "Slack file URL must use https");
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Slack file URL has no host"))?;
+    anyhow::ensure!(
+        is_allowed_slack_file_host(host),
+        "Slack file URL host is not allowed"
+    );
+    Ok(url)
+}
+
+fn is_allowed_slack_file_host(host: &str) -> bool {
+    host == "slack.com"
+        || host.ends_with(".slack.com")
+        || host == "slack-files.com"
+        || host.ends_with(".slack-files.com")
 }
 
 fn filter_context_messages(
@@ -1268,17 +1324,6 @@ fn is_router_noise_message(text: &str) -> bool {
         || rest.starts_with("Reasoning summary")
 }
 
-fn merge_thread_messages(
-    cached: Vec<SlackThreadMessage>,
-    fetched: Vec<SlackThreadMessage>,
-) -> Vec<SlackThreadMessage> {
-    let mut by_ts = BTreeMap::new();
-    for message in cached.into_iter().chain(fetched) {
-        by_ts.insert(message.ts.clone(), message);
-    }
-    by_ts.into_values().collect()
-}
-
 fn slack_thread_cache_key(channel: &str, thread_ts: &str) -> String {
     format!("{channel}:{thread_ts}")
 }
@@ -1304,9 +1349,17 @@ fn build_slack_context_request(
     let mut artifacts = Vec::new();
     if !messages.is_empty() {
         let mut metadata = BTreeMap::new();
+        let thread_ref = format!("{channel}:{thread_ts}");
         metadata.insert("channel".to_string(), json!(channel));
         metadata.insert("thread_ts".to_string(), json!(thread_ts));
         metadata.insert("message_count".to_string(), json!(messages.len()));
+        metadata.insert(
+            "resolves_unresolved".to_string(),
+            json!([
+                {"kind": "current_thread", "reference": &thread_ref},
+                {"kind": "current_thread_cache", "reference": &thread_ref},
+            ]),
+        );
         artifacts.push(ContextArtifactInput {
             id: format!("slack:thread:{channel}:{thread_ts}"),
             kind: "slack_current_thread".to_string(),
@@ -1359,6 +1412,13 @@ fn linked_thread_artifact(linked_thread: &LinkedSlackThread) -> ContextArtifactI
     metadata.insert("channel".to_string(), json!(channel));
     metadata.insert("thread_ts".to_string(), json!(thread_ts));
     metadata.insert(
+        "resolves_unresolved".to_string(),
+        json!([
+            {"kind": "linked_thread", "reference": &linked_thread.link.url},
+            {"kind": "linked_thread_cache", "reference": &linked_thread.link.url},
+        ]),
+    );
+    metadata.insert(
         "source_message_ts".to_string(),
         json!(linked_thread.link.source_message_ts),
     );
@@ -1406,6 +1466,10 @@ fn slack_file_artifact(downloaded: &DownloadedSlackFile) -> ContextArtifactInput
     metadata.insert("file_id".to_string(), json!(downloaded.file.id));
     metadata.insert("name".to_string(), json!(downloaded.file.name));
     metadata.insert("size_bytes".to_string(), json!(downloaded.file.size_bytes));
+    metadata.insert(
+        "resolves_unresolved".to_string(),
+        json!([{"kind": "file", "reference": &downloaded.file.id}]),
+    );
     if let Some(mimetype) = &downloaded.file.mimetype {
         metadata.insert("mimetype".to_string(), json!(mimetype));
     }
@@ -1782,6 +1846,40 @@ mod tests {
         assert_eq!(links[0].channel, "C6KFDTA49");
         assert_eq!(links[0].thread_ts, "1782253434.835649");
         assert_eq!(links[0].source_message_ts, "111.000");
+    }
+
+    #[test]
+    fn slack_reply_permalinks_use_thread_ts_query_as_root() {
+        let parsed = parse_slack_thread_permalink(
+            "https://smartx1.slack.com/archives/C6KFDTA49/p1782259999000000?thread_ts=1782253434.835649&cid=C6KFDTA49",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.0, "C6KFDTA49");
+        assert_eq!(parsed.1, "1782253434.835649");
+    }
+
+    #[test]
+    fn slack_file_urls_must_use_slack_hosts() {
+        assert!(parse_slack_file_url("https://files.slack.com/files-pri/T1/F1/a.txt").is_ok());
+        assert!(parse_slack_file_url("https://slack-files.com/T1-F1-a/download").is_ok());
+        assert!(parse_slack_file_url("http://files.slack.com/files-pri/T1/F1/a.txt").is_err());
+        assert!(parse_slack_file_url("https://example.com/files/F1").is_err());
+    }
+
+    #[tokio::test]
+    async fn slack_session_locks_are_scoped_by_session_key() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+
+        let first = channel.session_lock("slack:channel:C1:111.000").await;
+        let same = channel.session_lock("slack:channel:C1:111.000").await;
+        let other = channel.session_lock("slack:channel:C1:222.000").await;
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[test]
