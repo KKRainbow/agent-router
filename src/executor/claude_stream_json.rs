@@ -1,5 +1,18 @@
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::path::PathBuf;
+
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::{Mutex, broadcast, oneshot};
+
+use crate::approval::SharedApprovalBroker;
+use crate::config::ExecutorConfig;
+use crate::executor::{ExecutorChannelEvent, ExecutorUpdate};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -360,5 +373,327 @@ mod outgoing_tests {
                 }
             })
         );
+    }
+}
+
+type SharedStdin = Arc<Mutex<ChildStdin>>;
+
+#[allow(dead_code)]
+pub struct ClaudeSession {
+    cfg: ExecutorConfig,
+    cwd: PathBuf,
+    stdin: SharedStdin,
+    child: Arc<Mutex<Child>>,
+    updates: broadcast::Sender<ExecutorUpdate>,
+    session_id: Arc<Mutex<Option<String>>>,
+    active_user_id: Arc<Mutex<Option<String>>>,
+    approvals: SharedApprovalBroker,
+    session_key: String,
+    executor: String,
+    alive: AtomicBool,
+    _shutdown_tx: oneshot::Sender<()>,
+}
+
+impl ClaudeSession {
+    pub async fn start(
+        cfg: ExecutorConfig,
+        cwd: PathBuf,
+        session_key: String,
+        executor: String,
+        approvals: SharedApprovalBroker,
+        previous_session_id: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let mut cmd = Command::new(&cfg.command);
+        cmd.args(&cfg.args)
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--input-format")
+            .arg("stream-json")
+            .arg("--permission-prompt-tool")
+            .arg("stdio")
+            .arg("--replay-user-messages");
+        if let Some(id) = previous_session_id.filter(|id| !id.is_empty()) {
+            cmd.arg("--resume").arg(id);
+        }
+        cmd.kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(&cwd);
+        for (key, value) in &cfg.env {
+            cmd.env(key, value);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn claude executor: {}", cfg.command))?;
+        let stdin = Arc::new(Mutex::new(
+            child.stdin.take().context("missing child stdin")?,
+        ));
+        let stdout = child.stdout.take().context("missing child stdout")?;
+        let stderr = child.stderr.take().context("missing child stderr")?;
+        let child = Arc::new(Mutex::new(child));
+        let (updates, _) = broadcast::channel(256);
+        let session_id = Arc::new(Mutex::new(None));
+        let active_user_id = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(read_stdout(
+            BufReader::new(stdout),
+            BufReader::new(stderr),
+            updates.clone(),
+            session_id.clone(),
+            active_user_id.clone(),
+            approvals.clone(),
+            session_key.clone(),
+            executor.clone(),
+            stdin.clone(),
+            child.clone(),
+            shutdown_rx,
+        ));
+
+        Ok(Self {
+            cfg,
+            cwd,
+            stdin,
+            child,
+            updates,
+            session_id,
+            active_user_id,
+            approvals,
+            session_key,
+            executor,
+            alive: AtomicBool::new(true),
+            _shutdown_tx: shutdown_tx,
+        })
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ExecutorUpdate> {
+        self.updates.subscribe()
+    }
+
+    pub async fn session_id(&self) -> Option<String> {
+        self.session_id.lock().await.clone()
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    pub async fn send_prompt(&self, prompt: &str) -> anyhow::Result<()> {
+        let event = UserEvent::new(prompt.to_string());
+        let mut json = serde_json::to_string(&event).context("serialize user event")?;
+        json.push('\n');
+        let mut stdin = self.stdin.lock().await;
+        stdin
+            .write_all(json.as_bytes())
+            .await
+            .context("write to claude stdin")?;
+        stdin.flush().await.context("flush claude stdin")?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_stdout<R, E>(
+    mut reader: R,
+    mut stderr: E,
+    updates: broadcast::Sender<ExecutorUpdate>,
+    session_id: Arc<Mutex<Option<String>>>,
+    _active_user_id: Arc<Mutex<Option<String>>>,
+    _approvals: SharedApprovalBroker,
+    session_key: String,
+    executor: String,
+    stdin: SharedStdin,
+    child: Arc<Mutex<Child>>,
+    mut shutdown: oneshot::Receiver<()>,
+) where
+    R: AsyncBufReadExt + Unpin,
+    E: AsyncBufReadExt + Unpin,
+{
+    let mut stdout_line = String::new();
+    let mut stderr_line = String::new();
+    loop {
+        stdout_line.clear();
+        stderr_line.clear();
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::debug!(target: "agent_router::claude", "read_stdout shutting down");
+                break;
+            }
+            res = reader.read_line(&mut stdout_line) => {
+                match res {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        handle_event_line(
+                            &stdout_line,
+                            updates.clone(),
+                            &session_id,
+                            _approvals.clone(),
+                            session_key.clone(),
+                            executor.clone(),
+                            &_active_user_id,
+                            stdin.clone(),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(target: "agent_router::claude", error = %err, "stdout read error");
+                        break;
+                    }
+                }
+            }
+            res = stderr.read_line(&mut stderr_line) => {
+                match res {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = stderr_line.trim();
+                        if !trimmed.is_empty() {
+                            tracing::debug!(target: "agent_router::claude", line = %trimmed, "claude stderr");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(target: "agent_router::claude", error = %err, "stderr read error");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut child = child.lock().await;
+    if let Err(err) = child.start_kill() {
+        tracing::warn!(target: "agent_router::claude", error = %err, "failed to kill claude child");
+    }
+    let _ = child.wait().await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_event_line(
+    line: &str,
+    updates: broadcast::Sender<ExecutorUpdate>,
+    session_id: &Arc<Mutex<Option<String>>>,
+    _approvals: SharedApprovalBroker,
+    session_key: String,
+    executor: String,
+    _user_id: &Arc<Mutex<Option<String>>>,
+    stdin: SharedStdin,
+) {
+    let _ = (session_key, executor, stdin);
+    let Some(event) = parse_event_line(line) else {
+        return;
+    };
+
+    if let ClaudeEvent::System { session_id: id, .. }
+        | ClaudeEvent::Result { session_id: id, .. } = &event
+        && let Some(id) = id.clone()
+    {
+        *session_id.lock().await = Some(id);
+    }
+
+    for update in event_to_updates(event) {
+        let _ = updates.send(update);
+    }
+}
+
+fn event_to_updates(event: ClaudeEvent) -> Vec<ExecutorUpdate> {
+    let mut updates = Vec::new();
+    match event {
+        ClaudeEvent::System { .. } => {}
+        ClaudeEvent::Assistant { message } => {
+            for content in message.content {
+                match content {
+                    AssistantContent::Text { text } => {
+                        updates.push(ExecutorUpdate::new(
+                            "agent_message_chunk",
+                            "Assistant",
+                            text,
+                            "",
+                        ));
+                    }
+                    AssistantContent::Thinking { thinking } => {
+                        updates.push(
+                            ExecutorUpdate::new("reasoning_summary", "Reasoning", &thinking, "")
+                                .with_channel_event(ExecutorChannelEvent::reasoning_summary(
+                                    thinking,
+                                )),
+                        );
+                    }
+                    AssistantContent::ToolUse { name, input } => {
+                        let text = serde_json::to_string(&input).unwrap_or_default();
+                        updates.push(
+                            ExecutorUpdate::new("tool_call", &name, &text, "")
+                                .with_channel_event(ExecutorChannelEvent::tool_call(
+                                    name,
+                                    text.clone(),
+                                )),
+                        );
+                    }
+                }
+            }
+        }
+        ClaudeEvent::User { message } => {
+            for content in message.content {
+                if let UserContent::ToolResult { content, is_error } = content {
+                    let text = content.to_string();
+                    let title = if is_error == Some(true) {
+                        "Tool result (error)"
+                    } else {
+                        "Tool result"
+                    };
+                    updates.push(ExecutorUpdate::new("tool_result", title, text, ""));
+                }
+            }
+        }
+        ClaudeEvent::Result {
+            result,
+            subtype,
+            ..
+        } => {
+            if !is_compaction_result(subtype.as_deref()) && let Some(text) = result {
+                updates.push(ExecutorUpdate::new("result", "Result", text, ""));
+            }
+        }
+        ClaudeEvent::ControlRequest { .. } | ClaudeEvent::ControlCancelRequest { .. } => {}
+    }
+    updates
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn session_tracks_external_id_from_system_event() {
+        let system_line = r#"{"type":"system","session_id":"sess-ext-123"}"#;
+        let cfg = ExecutorConfig {
+            name: "claude-test".to_string(),
+            protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+            command: "printf".to_string(),
+            args: vec!["%s\n".to_string(), system_line.to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let approvals = Arc::new(crate::approval::ApprovalBroker::default());
+        let session = ClaudeSession::start(
+            cfg,
+            PathBuf::from("."),
+            "test-key".to_string(),
+            "claude".to_string(),
+            approvals,
+            None,
+        )
+        .await
+        .expect("start session");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while session.session_id().await.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(session.session_id().await, Some("sess-ext-123".to_string()));
     }
 }
