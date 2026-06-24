@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -35,7 +35,32 @@ type SharedCodexSession = Arc<Mutex<CodexAppServerSession>>;
 type SessionMap = HashMap<SessionKey, SharedCodexSession>;
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
+type SharedCodexEventStreams = Arc<StdMutex<CodexEventStreams>>;
 const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
+
+#[derive(Debug, Default)]
+struct CodexEventStreams {
+    notifications: Option<mpsc::UnboundedSender<Value>>,
+    server_requests: Option<mpsc::UnboundedSender<Value>>,
+}
+
+struct CodexTurnStreams {
+    notifications: mpsc::UnboundedReceiver<Value>,
+    server_requests: mpsc::UnboundedReceiver<Value>,
+    _guard: CodexTurnStreamGuard,
+}
+
+struct CodexTurnStreamGuard {
+    streams: SharedCodexEventStreams,
+}
+
+impl Drop for CodexTurnStreamGuard {
+    fn drop(&mut self) {
+        let mut streams = self.streams.lock().unwrap();
+        streams.notifications = None;
+        streams.server_requests = None;
+    }
+}
 
 struct CodexServerRequest {
     message: Value,
@@ -398,8 +423,11 @@ impl CodexAppServerSession {
             .thread_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("codex app-server thread has not been created"))?;
-        let mut notifications = self.client.subscribe_notifications();
-        let mut server_requests = self.client.subscribe_server_requests();
+        let CodexTurnStreams {
+            mut notifications,
+            mut server_requests,
+            _guard: _turn_stream_guard,
+        } = self.client.open_turn_streams();
         let mut closed = self.client.subscribe_closed();
         let turn_scope = CodexTurnScope::new();
         let (server_response_tx, mut server_responses) = mpsc::channel(64);
@@ -443,7 +471,7 @@ impl CodexAppServerSession {
                 }
                 request = server_requests.recv() => {
                     match request {
-                        Ok(request) => {
+                        Some(request) => {
                             idle_timeout
                                 .as_mut()
                                 .reset(Instant::now() + self.limits.idle_timeout);
@@ -471,8 +499,7 @@ impl CodexAppServerSession {
                                     anyhow::anyhow!("codex app-server request worker closed")
                                 })?;
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => {
+                        None => {
                             anyhow::bail!("codex app-server request stream closed")
                         }
                     }
@@ -513,7 +540,7 @@ impl CodexAppServerSession {
                 }
                 notification = notifications.recv() => {
                     match notification {
-                        Ok(notification) => {
+                        Some(notification) => {
                             idle_timeout
                                 .as_mut()
                                 .reset(Instant::now() + self.limits.idle_timeout);
@@ -527,8 +554,7 @@ impl CodexAppServerSession {
                                 break;
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => {
+                        None => {
                             anyhow::bail!("codex app-server notification stream closed")
                         }
                     }
@@ -568,7 +594,7 @@ impl CodexAppServerSession {
 
     async fn drain_ready_notifications(
         &mut self,
-        notifications: &mut broadcast::Receiver<Value>,
+        notifications: &mut mpsc::UnboundedReceiver<Value>,
         final_text: &mut String,
         events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
@@ -583,9 +609,8 @@ impl CodexAppServerSession {
                     self.handle_notification(notification, final_text, events, turn_completed)
                         .await?;
                 }
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(broadcast::error::TryRecvError::Closed) => {
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
                     anyhow::bail!("codex app-server notification stream closed")
                 }
             }
@@ -833,8 +858,7 @@ struct CodexJsonRpcClient {
     stdin: SharedStdin,
     state: SharedJsonRpcState,
     next_id: AtomicU64,
-    notifications: broadcast::Sender<Value>,
-    server_requests: broadcast::Sender<Value>,
+    event_streams: SharedCodexEventStreams,
     closed: broadcast::Sender<String>,
     child: Arc<Mutex<Child>>,
     session_key: String,
@@ -905,16 +929,14 @@ impl CodexJsonRpcClient {
 
         let stdin = Arc::new(Mutex::new(stdin));
         let state = Arc::new(Mutex::new(JsonRpcState::default()));
-        let (notifications, _) = broadcast::channel(512);
-        let (server_requests, _) = broadcast::channel(64);
+        let event_streams = Arc::new(StdMutex::new(CodexEventStreams::default()));
         let (closed, _) = broadcast::channel(8);
         let child = Arc::new(Mutex::new(child));
 
         tokio::spawn(read_codex_stdout(
             BufReader::new(stdout),
             state.clone(),
-            notifications.clone(),
-            server_requests.clone(),
+            event_streams.clone(),
             closed.clone(),
             session_key.clone(),
             executor.clone(),
@@ -936,8 +958,7 @@ impl CodexJsonRpcClient {
             stdin,
             state,
             next_id: AtomicU64::new(1),
-            notifications,
-            server_requests,
+            event_streams,
             closed,
             child,
             session_key,
@@ -945,12 +966,21 @@ impl CodexJsonRpcClient {
         })
     }
 
-    fn subscribe_notifications(&self) -> broadcast::Receiver<Value> {
-        self.notifications.subscribe()
-    }
-
-    fn subscribe_server_requests(&self) -> broadcast::Receiver<Value> {
-        self.server_requests.subscribe()
+    fn open_turn_streams(&self) -> CodexTurnStreams {
+        let (notifications_tx, notifications) = mpsc::unbounded_channel();
+        let (server_requests_tx, server_requests) = mpsc::unbounded_channel();
+        {
+            let mut streams = self.event_streams.lock().unwrap();
+            streams.notifications = Some(notifications_tx);
+            streams.server_requests = Some(server_requests_tx);
+        }
+        CodexTurnStreams {
+            notifications,
+            server_requests,
+            _guard: CodexTurnStreamGuard {
+                streams: self.event_streams.clone(),
+            },
+        }
     }
 
     fn subscribe_closed(&self) -> broadcast::Receiver<String> {
@@ -1109,8 +1139,7 @@ fn codex_error_response(id: Value, code: i64, message: String) -> Value {
 async fn read_codex_stdout<R>(
     reader: BufReader<R>,
     state: SharedJsonRpcState,
-    notifications: broadcast::Sender<Value>,
-    server_requests: broadcast::Sender<Value>,
+    event_streams: SharedCodexEventStreams,
     closed: broadcast::Sender<String>,
     session_key: String,
     executor: String,
@@ -1127,7 +1156,7 @@ async fn read_codex_stdout<R>(
             );
             continue;
         };
-        dispatch_codex_message(message, &state, &notifications, &server_requests).await;
+        dispatch_codex_message(message, &state, &event_streams).await;
     }
     tracing::warn!(
         target: "agent_router::codex_app_server",
@@ -1142,8 +1171,7 @@ async fn read_codex_stdout<R>(
 async fn dispatch_codex_message(
     message: Value,
     state: &SharedJsonRpcState,
-    notifications: &broadcast::Sender<Value>,
-    server_requests: &broadcast::Sender<Value>,
+    event_streams: &SharedCodexEventStreams,
 ) {
     let has_method = message.get("method").is_some();
     let has_id = message.get("id").is_some();
@@ -1158,11 +1186,31 @@ async fn dispatch_codex_message(
         return;
     }
     if has_id && has_method {
-        let _ = server_requests.send(message);
+        let sender = {
+            event_streams
+                .lock()
+                .unwrap()
+                .server_requests
+                .as_ref()
+                .cloned()
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(message);
+        }
         return;
     }
     if has_method {
-        let _ = notifications.send(message);
+        let sender = {
+            event_streams
+                .lock()
+                .unwrap()
+                .notifications
+                .as_ref()
+                .cloned()
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(message);
+        }
     }
 }
 
@@ -2480,7 +2528,7 @@ for line in sys.stdin:
             .await
             .unwrap();
         let mut session = session.lock().await;
-        let (tx, mut notifications) = broadcast::channel(4);
+        let (tx, mut notifications) = mpsc::unbounded_channel();
         let mut events = CollectingExecutorEventSink::default();
         let mut final_text = String::new();
         let mut turn_completed = false;
