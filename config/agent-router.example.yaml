@@ -1,14 +1,14 @@
 router:
-  default_executor: kimi
+  default_executor: codex
 
 approval:
   # normal: ask for approval prompts.
   # yolo: auto-approve one-shot allow options unless a session overrides it.
-  default_mode: normal
+  default_mode: yolo
 
 workspace:
   # Optional. When set, each router session runs under a stable child directory.
-  # root: /data/project/hermes-workspaces
+  root: /data/project/agent-router-workspaces
 
 executors:
   kimi:
@@ -18,6 +18,13 @@ executors:
   codex:
     protocol: app_server
     command: codex
+  # Claude Code CLI via stream-json stdio protocol.
+  # Requires `claude` installed and ANTHROPIC_API_KEY available.
+  # claude:
+  #   protocol: claude_stream_json
+  #   command: claude
+  #   args: []
+  #   cwd: /data/project/hermes
 
 slack:
   # Optional. When omitted, Slack is enabled if both tokens are configured.

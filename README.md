@@ -36,9 +36,10 @@ Agent integrations:
 
 - Kimi through ACP, for example `kimi acp`
 - Codex through app-server
+- Claude Code through stream-json stdio
 
-Other agents, such as Claude Code, are intended to be added through executor
-adapters as their protocol integrations land.
+Other agents can be added through executor adapters as their protocol
+integrations land.
 
 User commands:
 
