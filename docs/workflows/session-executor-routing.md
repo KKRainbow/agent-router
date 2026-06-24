@@ -25,9 +25,9 @@ Each executor backend keeps its own private state.
 - The canonical transcript is unified and safe to show to the user.
 - Shared context is derived from the canonical transcript and router-owned
   session metadata.
-- When `workspace.root` is configured, each session gets a stable cwd under
-  that root; executor-level `cwd` remains the fallback when no session cwd is
-  allocated.
+- When `workspace.root` is configured, each session gets a stable Router
+  Workspace for router-owned artifacts. Each Machine may also create a session
+  Machine Workspace that is visible to executors on that Machine.
 - Each executor can keep private state, such as an ACP session id,
   permission mode, model hint, or protocol-specific cache.
 - Backend raw logs, stderr, secrets, and full internal reasoning are not
@@ -101,7 +101,8 @@ Each router session stores:
 - `session_key`
 - `default_executor`
 - `active_executor`
-- session cwd, when `workspace.root` is configured
+- Router Workspace, when `workspace.root` is configured
+- per-Machine Workspace records, when executors run on configured Machines
 - canonical user-visible transcript
 - per-executor backend bindings
 - safe projected event log
@@ -109,9 +110,10 @@ Each router session stores:
 Each executor binding stores protocol-specific private state:
 
 - protocol name
+- Machine id
 - external session id
 - backend process or connection identity
-- effective cwd used for that backend session
+- effective executor-visible cwd used for that backend session
 - permission mode
 - MCP server selection
 - model hint

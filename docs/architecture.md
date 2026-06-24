@@ -71,6 +71,20 @@ The first supported backend protocol is ACP. A configured executor such as
 added later as a separate protocol adapter without changing the session routing
 model.
 
+### Machine
+
+A Machine is a named execution environment where Agent Router can create session
+workspaces, spawn executor commands, and collect configured skill roots.
+
+The default Machine is `local`, the host where Agent Router itself is running.
+Remote Machines, such as SSH targets, are configured separately from executors.
+Executors reference a Machine by id, so ACP, future backend protocols, workspace
+materialization, and skill management can reuse the same Machine interface.
+
+The router must distinguish the Router Workspace, where channel artifacts are
+written locally, from Machine Workspaces, which are the paths visible to
+executors and skill collection on each Machine.
+
 ### Handoff
 
 Handoff lets one session call multiple agents while preserving shared context.
@@ -125,6 +139,10 @@ Channel adapters depend on router-core abstractions.
 Router core depends on no channel-specific crates.
 
 Backend protocol integrations depend on router-core abstractions.
+
+Backend protocol integrations use Machine adapters for process spawning,
+workspace creation, and remote access. They should not embed SSH command
+construction or remote path semantics.
 
 Router core should not depend on Hermes, ZeroClaw, Slack, QQ, or any LLM
 provider SDK.
