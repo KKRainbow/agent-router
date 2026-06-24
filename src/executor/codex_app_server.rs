@@ -247,14 +247,14 @@ impl CodexAppServerManager {
         executor: &str,
         cfg: &ExecutorConfig,
         session_cwd: Option<&Path>,
-    ) -> anyhow::Result<SharedCodexSession> {
+    ) -> anyhow::Result<(SharedCodexSession, bool)> {
         let key = (session_key.to_string(), executor.to_string());
         let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
         let existing = self.sessions.lock().await.get(&key).cloned();
         if let Some(existing) = existing {
             let matches = existing.lock().await.matches(cfg, &cwd);
             if matches {
-                return Ok(existing);
+                return Ok((existing, false));
             }
         }
         let session = Arc::new(Mutex::new(
@@ -269,7 +269,7 @@ impl CodexAppServerManager {
             .await?,
         ));
         self.sessions.lock().await.insert(key, session.clone());
-        Ok(session)
+        Ok((session, true))
     }
 
     async fn discard_session_if_same(
@@ -342,7 +342,7 @@ impl ExecutorBackend for CodexAppServerManager {
             session_key = %request.session_key,
             "preparing Codex app-server executor session"
         );
-        let session = self
+        let (session, created_session) = self
             .get_or_create_session(
                 &request.session_key,
                 &request.executor,
@@ -351,13 +351,15 @@ impl ExecutorBackend for CodexAppServerManager {
             )
             .await?;
         if cancel.is_cancelled().await {
-            self.discard_session_if_same(&request.session_key, &request.executor, &session)
-                .await;
-            let session = session.lock().await;
-            session
-                .client
-                .close("Codex app-server prepare cancelled")
-                .await;
+            if created_session {
+                self.discard_session_if_same(&request.session_key, &request.executor, &session)
+                    .await;
+                let session = session.lock().await;
+                session
+                    .client
+                    .close("Codex app-server prepare cancelled")
+                    .await;
+            }
             anyhow::bail!("Codex app-server prepare cancelled");
         }
         let mut session = session.lock().await;

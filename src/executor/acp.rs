@@ -76,14 +76,14 @@ impl AcpExecutorManager {
         executor: &str,
         cfg: &ExecutorConfig,
         session_cwd: Option<&Path>,
-    ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
+    ) -> anyhow::Result<(Arc<Mutex<AcpSession>>, bool)> {
         let key = (session_key.to_string(), executor.to_string());
         let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
         let existing = self.sessions.lock().await.get(&key).cloned();
         if let Some(existing) = existing {
             let matches = existing.lock().await.matches(cfg, &cwd);
             if matches {
-                return Ok(existing);
+                return Ok((existing, false));
             }
         }
         let session = Arc::new(Mutex::new(
@@ -98,7 +98,7 @@ impl AcpExecutorManager {
         ));
         let mut sessions = self.sessions.lock().await;
         sessions.insert(key, session.clone());
-        Ok(session)
+        Ok((session, true))
     }
 
     async fn discard_session_if_same(
@@ -172,7 +172,7 @@ impl ExecutorBackend for AcpExecutorManager {
             previous_session_id = ?request.previous_session_id,
             "preparing ACP executor session"
         );
-        let session = self
+        let (session, created_session) = self
             .get_or_create_session(
                 &request.session_key,
                 &request.executor,
@@ -181,11 +181,13 @@ impl ExecutorBackend for AcpExecutorManager {
             )
             .await?;
         if cancel.is_cancelled().await {
-            self.discard_session_if_same(&request.session_key, &request.executor, &session)
-                .await;
-            let mut session = session.lock().await;
-            session.client.close("ACP prepare cancelled").await;
-            session.session_id = None;
+            if created_session {
+                self.discard_session_if_same(&request.session_key, &request.executor, &session)
+                    .await;
+                let mut session = session.lock().await;
+                session.client.close("ACP prepare cancelled").await;
+                session.session_id = None;
+            }
             anyhow::bail!("ACP prepare cancelled");
         }
         let mut session = session.lock().await;
@@ -1122,11 +1124,14 @@ fn project_acp_update_with_state(
     } else {
         update
     };
-    let text = extract_text(update.get("content"))
-        .or_else(|| extract_text(update.get("text")))
-        .or_else(|| extract_text(tool.get("content")))
-        .or_else(|| extract_tool_raw_input(tool.get("rawInput")))
-        .or_else(|| extract_tool_raw_input(tool.get("raw_input")));
+    let text = if is_tool_update {
+        extract_tool_raw_input(update.get("rawInput"))
+            .or_else(|| extract_tool_raw_input(update.get("raw_input")))
+            .or_else(|| extract_tool_raw_input(tool.get("rawInput")))
+            .or_else(|| extract_tool_raw_input(tool.get("raw_input")))
+    } else {
+        extract_text(update.get("content")).or_else(|| extract_text(update.get("text")))
+    };
     let title = update
         .get("title")
         .or_else(|| update.get("name"))
@@ -1158,6 +1163,8 @@ fn project_acp_update_with_state(
         kind.to_string()
     };
     let text = text.unwrap_or_default();
+    let tool_activity_changed = is_tool_update
+        && (!title.trim().is_empty() || !text.trim().is_empty() || !status.trim().is_empty());
     let (title, text, status) = if is_tool_update {
         merge_acp_tool_update(tool_calls, tool_call_id, title, text, status)
     } else {
@@ -1165,7 +1172,7 @@ fn project_acp_update_with_state(
     };
     let mut update =
         ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
-    if is_tool_update {
+    if tool_activity_changed {
         update = update.with_channel_event(ExecutorChannelEvent::tool_call(
             acp_tool_title(&title),
             acp_tool_channel_summary(&title, &text, &status),
@@ -1388,7 +1395,7 @@ mod tests {
                 "update": {
                     "sessionUpdate": "tool_call",
                     "title": "Bash",
-                    "content": {"text": "$ cargo test"},
+                    "rawInput": {"command": "cargo test"},
                     "status": "completed"
                 }
             }
@@ -1411,7 +1418,7 @@ mod tests {
                     "sessionUpdate": "tool_call",
                     "toolCall": {
                         "name": "read_file",
-                        "content": {"text": "src/main.rs"},
+                        "rawInput": {"path": "src/main.rs"},
                         "status": "failed"
                     }
                 }
@@ -1422,6 +1429,65 @@ mod tests {
         assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
         assert_eq!(event.title, "read_file");
         assert_eq!(event.text, "src/main.rs\nstatus: failed");
+    }
+
+    #[test]
+    fn acp_tool_content_only_updates_do_not_project_channel_events() {
+        let mut tool_calls = HashMap::new();
+        let started = project_acp_update_with_state(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-1",
+                        "title": "Bash",
+                        "rawInput": {"command": "sleep 3"},
+                        "status": "pending"
+                    }
+                }
+            }),
+            &mut tool_calls,
+        )
+        .unwrap();
+        assert!(started.channel_event.is_some());
+
+        let output = project_acp_update_with_state(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-1",
+                        "content": {"text": "5 times sleep 3 completed"}
+                    }
+                }
+            }),
+            &mut tool_calls,
+        )
+        .unwrap();
+        assert_eq!(output.title, "Bash");
+        assert_eq!(output.text, "$ sleep 3");
+        assert_eq!(output.status, "pending");
+        assert!(output.channel_event.is_none());
+
+        let json_args = project_acp_update_with_state(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-1",
+                        "content": {
+                            "text": "{\"command\":\"sleep 3 && sleep 3\",\"timeout\":60}"
+                        }
+                    }
+                }
+            }),
+            &mut tool_calls,
+        )
+        .unwrap();
+        assert!(json_args.channel_event.is_none());
     }
 
     #[test]

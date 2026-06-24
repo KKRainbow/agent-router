@@ -273,11 +273,15 @@ impl SlackSocketModeChannel {
                 None
             } else {
                 let generation = self.next_context_generation.fetch_add(1, Ordering::Relaxed);
-                self.remember_context_generation(generation).await;
+                self.remember_context_generation(&session_key, generation)
+                    .await;
                 context_generation = Some(generation);
                 Some(router.preempt(&session_key).await?)
             };
-        let context_turn = context_generation.map(|generation| SlackContextTurn { generation });
+        let context_turn = context_generation.map(|generation| SlackContextTurn {
+            session_key: session_key.clone(),
+            generation,
+        });
         tracing::info!(
             channel = %event.channel,
             user_id = %event.user,
@@ -1104,9 +1108,13 @@ impl SlackSocketModeChannel {
         file_sync_state_from_context_artifacts(session_key, existing_context, &cache)
     }
 
-    async fn remember_context_generation(&self, generation: u64) {
+    async fn remember_context_generation(&self, session_key: &str, generation: u64) {
         let mut cache = self.context_cache.lock().await;
-        cache.latest_context_generation = cache.latest_context_generation.max(generation);
+        let latest = cache
+            .latest_context_generations
+            .entry(session_key.to_string())
+            .or_default();
+        *latest = (*latest).max(generation);
     }
 
     async fn mark_file_sync_succeeded(&self, cache_key: String, turn: Option<&SlackContextTurn>) {
@@ -1131,7 +1139,7 @@ impl SlackSocketModeChannel {
 
 #[derive(Debug, Default)]
 struct SlackContextCache {
-    latest_context_generation: u64,
+    latest_context_generations: BTreeMap<String, u64>,
     threads: BTreeMap<String, CachedSlackThreadMessages>,
     synced_files: BTreeSet<String>,
     failed_files: BTreeSet<String>,
@@ -1145,6 +1153,7 @@ struct CachedSlackThreadMessages {
 
 #[derive(Debug, Clone)]
 struct SlackContextTurn {
+    session_key: String,
     generation: u64,
 }
 
@@ -1193,7 +1202,12 @@ fn context_turn_is_current_for_cache(
     cache: &SlackContextCache,
     turn: Option<&SlackContextTurn>,
 ) -> bool {
-    turn.is_none_or(|turn| cache.latest_context_generation <= turn.generation)
+    turn.is_none_or(|turn| {
+        cache
+            .latest_context_generations
+            .get(&turn.session_key)
+            .is_none_or(|generation| *generation <= turn.generation)
+    })
 }
 
 fn thread_cache_entry_is_newer(
@@ -3287,7 +3301,10 @@ mod tests {
                 generation: Some(2),
             },
         );
-        let stale_turn = SlackContextTurn { generation: 1 };
+        let stale_turn = SlackContextTurn {
+            session_key: "session".to_string(),
+            generation: 1,
+        };
         let message = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
@@ -3333,7 +3350,10 @@ mod tests {
                 generation: Some(2),
             },
         );
-        let stale_turn = SlackContextTurn { generation: 1 };
+        let stale_turn = SlackContextTurn {
+            session_key: "session".to_string(),
+            generation: 1,
+        };
 
         let result =
             channel
@@ -3361,8 +3381,14 @@ mod tests {
             Arc::new(ApprovalBroker::default()),
         );
         let key = slack_thread_cache_key("C1", "111.000");
-        let newer_turn = SlackContextTurn { generation: 2 };
-        let stale_turn = SlackContextTurn { generation: 1 };
+        let newer_turn = SlackContextTurn {
+            session_key: "session".to_string(),
+            generation: 2,
+        };
+        let stale_turn = SlackContextTurn {
+            session_key: "session".to_string(),
+            generation: 1,
+        };
 
         let removal =
             channel
@@ -3407,9 +3433,15 @@ mod tests {
             test_slack_config(true),
             Arc::new(ApprovalBroker::default()),
         );
-        channel.remember_context_generation(2).await;
-        let stale_turn = SlackContextTurn { generation: 1 };
-        let current_turn = SlackContextTurn { generation: 2 };
+        channel.remember_context_generation("session", 2).await;
+        let stale_turn = SlackContextTurn {
+            session_key: "session".to_string(),
+            generation: 1,
+        };
+        let current_turn = SlackContextTurn {
+            session_key: "session".to_string(),
+            generation: 2,
+        };
 
         channel
             .mark_file_sync_failed("session:F1".to_string(), Some(&stale_turn))
@@ -3433,6 +3465,32 @@ mod tests {
                 .await
                 .failed_files
                 .contains("session:F1")
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_session_generation_does_not_block_file_sync_cache() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        channel.remember_context_generation("session-b", 2).await;
+        let session_a_turn = SlackContextTurn {
+            session_key: "session-a".to_string(),
+            generation: 1,
+        };
+
+        channel
+            .mark_file_sync_failed("session-a:F1".to_string(), Some(&session_a_turn))
+            .await;
+
+        assert!(
+            channel
+                .context_cache
+                .lock()
+                .await
+                .failed_files
+                .contains("session-a:F1")
         );
     }
 
