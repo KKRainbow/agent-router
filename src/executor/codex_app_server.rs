@@ -716,6 +716,11 @@ impl CodexAppServerSession {
                 }
             }
 
+            if !cancelled && cancel.is_cancelled().await {
+                cancelled = true;
+                self.client.cancel_pending(turn_start.id).await;
+                self.client.close("codex app-server turn cancelled").await;
+            }
             self.client
                 .finish_turn_streams(turn_generation, active_turn_id.as_deref());
             Ok(ExecutorResponse { final_text })

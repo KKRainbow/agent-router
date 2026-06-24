@@ -261,7 +261,8 @@ impl QqBotChannel {
         preempt_generation: Option<u64>,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
-        self.remember_reply_context(&message).await;
+        self.remember_reply_context(&message, preempt_generation)
+            .await;
         tracing::info!(
             session_key = %message.session_key,
             user_id = %message.user_id,
@@ -324,18 +325,34 @@ impl QqBotChannel {
         // chat and let tool activity summaries carry the useful progress.
     }
 
-    async fn remember_reply_context(&self, message: &QqInboundMessage) {
+    async fn remember_reply_context(&self, message: &QqInboundMessage, generation: Option<u64>) {
         let mut contexts = self.reply_contexts.lock().await;
-        let next_seq = contexts
-            .get(&message.session_key)
-            .map(|context| context.next_seq)
-            .unwrap_or(1);
+        let Some(generation) = generation else {
+            contexts
+                .entry(message.session_key.clone())
+                .or_insert_with(|| QqReplyContext {
+                    target: message.target.clone(),
+                    msg_id: message.msg_id.clone(),
+                    next_seq: 1,
+                    generation: 0,
+                });
+            return;
+        };
+        if let Some(context) = contexts.get_mut(&message.session_key) {
+            if generation >= context.generation {
+                context.target = message.target.clone();
+                context.msg_id = message.msg_id.clone();
+                context.generation = generation;
+            }
+            return;
+        }
         contexts.insert(
             message.session_key.clone(),
             QqReplyContext {
                 target: message.target.clone(),
                 msg_id: message.msg_id.clone(),
-                next_seq,
+                next_seq: 1,
+                generation,
             },
         );
     }
@@ -600,6 +617,7 @@ struct QqReplyContext {
     target: QqReplyTarget,
     msg_id: String,
     next_seq: u32,
+    generation: u64,
 }
 
 impl QqReplyContext {
@@ -749,6 +767,9 @@ fn truncate_for_error(mut body: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::approval::ApprovalBroker;
     use serde_json::json;
 
     use super::*;
@@ -824,5 +845,58 @@ mod tests {
         assert_eq!(value_as_u64(&json!(12)), Some(12));
         assert_eq!(value_as_u64(&json!("34")), Some(34));
         assert_eq!(value_as_u64(&json!("bad")), None);
+    }
+
+    #[tokio::test]
+    async fn older_generation_does_not_overwrite_reply_context() {
+        let channel = QqBotChannel::new(
+            QqConfig {
+                enabled: true,
+                app_id: String::new(),
+                client_secret: String::new(),
+                sandbox: false,
+                intents: 0,
+                channel_events: ChannelEventMode::Off,
+                allowed_users: BTreeSet::new(),
+                allowed_groups: BTreeSet::new(),
+            },
+            Arc::new(ApprovalBroker::default()),
+        );
+        let older = QqInboundMessage {
+            event_key: "old".to_string(),
+            session_key: "qq:group:g1".to_string(),
+            user_id: "u1".to_string(),
+            group_id: Some("g1".to_string()),
+            text: "old".to_string(),
+            target: QqReplyTarget::Group {
+                group_openid: "old_group".to_string(),
+            },
+            msg_id: "old_msg".to_string(),
+        };
+        let newer = QqInboundMessage {
+            event_key: "new".to_string(),
+            session_key: "qq:group:g1".to_string(),
+            user_id: "u1".to_string(),
+            group_id: Some("g1".to_string()),
+            text: "new".to_string(),
+            target: QqReplyTarget::Group {
+                group_openid: "new_group".to_string(),
+            },
+            msg_id: "new_msg".to_string(),
+        };
+
+        channel.remember_reply_context(&newer, Some(2)).await;
+        channel.remember_reply_context(&older, Some(1)).await;
+
+        let contexts = channel.reply_contexts.lock().await;
+        let context = contexts.get("qq:group:g1").unwrap();
+        assert_eq!(
+            context.target,
+            QqReplyTarget::Group {
+                group_openid: "new_group".to_string()
+            }
+        );
+        assert_eq!(context.msg_id, "new_msg");
+        assert_eq!(context.generation, 2);
     }
 }

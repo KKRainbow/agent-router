@@ -23,7 +23,7 @@ use crate::{
     session::{
         ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding, ExecutorHealth,
         SessionState, TranscriptMessage,
-        context::{read_context_artifacts_from_manifest, write_context_sync},
+        context::{ContextSyncPlan, prepare_context_sync, read_context_artifacts_from_manifest},
         projection::{
             ProjectionInput, build_context_projection, merge_seen_context,
             projected_assistant_content, visible_message_fingerprints,
@@ -32,6 +32,9 @@ use crate::{
     },
     text::truncate_chars,
 };
+
+#[cfg(test)]
+use crate::session::context::write_context_sync;
 
 #[derive(Debug, Clone)]
 pub struct RouterInput {
@@ -425,6 +428,16 @@ struct ActiveRouterTurn {
     cancel: TurnCancellation,
 }
 
+struct PreparedContextSync {
+    state: SessionState,
+    plan: ContextSyncPlan,
+    session_key: String,
+    source: String,
+    unresolved_count: usize,
+    record_count: usize,
+    session_cwd: PathBuf,
+}
+
 impl<S, E> AgentRouter<S, E>
 where
     S: SessionStore,
@@ -643,7 +656,10 @@ where
         Ok(())
     }
 
-    async fn sync_context_locked(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
+    async fn prepare_context_sync_locked(
+        &self,
+        request: ContextSyncRequest,
+    ) -> anyhow::Result<Option<PreparedContextSync>> {
         let mut state = self
             .store
             .load_or_create(&request.session_key, &self.default_executor)
@@ -654,7 +670,7 @@ where
                 source = %request.source,
                 "skipping context sync because no workspace root is configured"
             );
-            return Ok(());
+            return Ok(None);
         };
         let session_key = request.session_key.clone();
         let source = request.source.clone();
@@ -676,18 +692,67 @@ where
                 "using recovered session context artifacts from manifest"
             );
         }
-        let records = write_context_sync(&session_cwd, request, &existing_context)?;
-        let record_count = records.len();
-        state.context_artifacts = records;
-        self.store.save(state).await;
-        tracing::info!(
-            session_key = %session_key,
-            source = %source,
-            context_records = record_count,
+        let plan = prepare_context_sync(&session_cwd, request, &existing_context)?;
+        let record_count = plan.record_count();
+        Ok(Some(PreparedContextSync {
+            state,
+            plan,
+            session_key,
+            source,
             unresolved_count,
-            cwd = %session_cwd.display(),
+            record_count,
+            session_cwd,
+        }))
+    }
+
+    async fn commit_context_sync(&self, mut prepared: PreparedContextSync) -> anyhow::Result<()> {
+        let records = prepared.plan.commit()?;
+        prepared.state.context_artifacts = records;
+        self.store.save(prepared.state).await;
+        tracing::info!(
+            session_key = %prepared.session_key,
+            source = %prepared.source,
+            context_records = prepared.record_count,
+            unresolved_count = prepared.unresolved_count,
+            cwd = %prepared.session_cwd.display(),
             "synced session context artifacts"
         );
+        Ok(())
+    }
+
+    async fn commit_context_sync_if_current(
+        &self,
+        session_key: &str,
+        generation: u64,
+        mut prepared: PreparedContextSync,
+    ) -> anyhow::Result<bool> {
+        let active_turns = self.active_turns.lock().await;
+        let current = active_turns
+            .get(session_key)
+            .is_some_and(|turn| turn.generation == generation);
+        if !current {
+            return Ok(false);
+        }
+        let records = prepared.plan.commit()?;
+        prepared.state.context_artifacts = records;
+        self.store.save(prepared.state).await;
+        tracing::info!(
+            session_key = %prepared.session_key,
+            source = %prepared.source,
+            context_records = prepared.record_count,
+            unresolved_count = prepared.unresolved_count,
+            cwd = %prepared.session_cwd.display(),
+            generation,
+            "synced session context artifacts"
+        );
+        drop(active_turns);
+        Ok(true)
+    }
+
+    async fn sync_context_locked(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
+        if let Some(prepared) = self.prepare_context_sync_locked(request).await? {
+            self.commit_context_sync(prepared).await?;
+        }
         Ok(())
     }
 
@@ -837,16 +902,22 @@ where
                 return Ok(());
             }
             if let Some(context) = context {
-                self.sync_context_locked(context).await?;
-                if let Some(generation) = preempt_generation
-                    && !self.active_turn_is_current(&session_key, generation).await
-                {
-                    tracing::debug!(
-                        session_key = %session_key,
-                        generation,
-                        "discarded stale preempted router turn after context sync"
-                    );
-                    return Ok(());
+                if let Some(generation) = preempt_generation {
+                    if let Some(prepared) = self.prepare_context_sync_locked(context).await? {
+                        let committed = self
+                            .commit_context_sync_if_current(&session_key, generation, prepared)
+                            .await?;
+                        if !committed {
+                            tracing::debug!(
+                                session_key = %session_key,
+                                generation,
+                                "discarded stale preempted router turn before context commit"
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    self.sync_context_locked(context).await?;
                 }
             }
             let mut state = self

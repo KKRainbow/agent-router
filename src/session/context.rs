@@ -109,11 +109,104 @@ struct ContextFileManifest {
     sha256: String,
 }
 
+#[derive(Debug)]
+pub struct ContextSyncPlan {
+    cwd: PathBuf,
+    base_path: PathBuf,
+    records: Vec<ContextArtifactRecord>,
+    removed_source_records: Vec<ContextArtifactRecord>,
+    replaced_source_records: Vec<ContextArtifactRecord>,
+    staged_files: Vec<StagedContextFile>,
+    committed: bool,
+}
+
+impl ContextSyncPlan {
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn commit(mut self) -> anyhow::Result<Vec<ContextArtifactRecord>> {
+        remove_context_artifact_files(&self.cwd, &self.base_path, &self.removed_source_records)?;
+        for staged in &self.staged_files {
+            staged.commit()?;
+        }
+        remove_context_artifact_files(&self.cwd, &self.base_path, &self.replaced_source_records)?;
+        self.committed = true;
+        Ok(std::mem::take(&mut self.records))
+    }
+}
+
+impl Drop for ContextSyncPlan {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for staged in &self.staged_files {
+            staged.cleanup();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StagedContextFile {
+    temp_path: PathBuf,
+    target_path: PathBuf,
+}
+
+impl StagedContextFile {
+    fn commit(&self) -> anyhow::Result<()> {
+        match std::fs::rename(&self.temp_path, &self.target_path) {
+            Ok(()) => return Ok(()),
+            Err(err) if self.target_path.try_exists().unwrap_or(false) => {
+                std::fs::remove_file(&self.target_path).with_context(|| {
+                    format!(
+                        "remove existing context file {}",
+                        self.target_path.display()
+                    )
+                })?;
+                if let Err(rename_err) = std::fs::rename(&self.temp_path, &self.target_path) {
+                    let _ = std::fs::remove_file(&self.temp_path);
+                    return Err(rename_err).with_context(|| {
+                        format!(
+                            "replace context file {} with {}",
+                            self.target_path.display(),
+                            self.temp_path.display()
+                        )
+                    });
+                }
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&self.temp_path);
+                return Err(err).with_context(|| {
+                    format!(
+                        "replace context file {} with {}",
+                        self.target_path.display(),
+                        self.temp_path.display()
+                    )
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.temp_path);
+    }
+}
+
 pub fn write_context_sync(
     cwd: &Path,
     request: ContextSyncRequest,
     existing: &[ContextArtifactRecord],
 ) -> anyhow::Result<Vec<ContextArtifactRecord>> {
+    prepare_context_sync(cwd, request, existing)?.commit()
+}
+
+pub fn prepare_context_sync(
+    cwd: &Path,
+    request: ContextSyncRequest,
+    existing: &[ContextArtifactRecord],
+) -> anyhow::Result<ContextSyncPlan> {
     let synced_at_ms = now_ms();
     validate_relative_path(&request.base_path)?;
     let resolved_issue_keys = request
@@ -165,7 +258,6 @@ pub fn write_context_sync(
             }
             false
         });
-    remove_context_artifact_files(cwd, &request.base_path, &removed_source_records)?;
     let mut source_records = retained_source_records;
     for record in &source_records {
         for path in &record.paths {
@@ -173,6 +265,7 @@ pub fn write_context_sync(
         }
     }
     let mut updates = Vec::new();
+    let mut staged_files = Vec::new();
 
     for artifact in request.artifacts {
         let mut path_records = Vec::new();
@@ -181,7 +274,12 @@ pub fn write_context_sync(
             validate_source_context_path(&request.base_path, &file.relative_path)?;
             let content = file.content.into_bytes();
             let hash = sha256_hex(&content);
-            write_context_file(cwd, &request.base_path, &file.relative_path, &content)?;
+            staged_files.push(stage_context_file(
+                cwd,
+                &request.base_path,
+                &file.relative_path,
+                &content,
+            )?);
             let relative_path = file.relative_path.display().to_string();
             path_records.push(relative_path.clone());
             file_manifest.push(ContextFileManifest {
@@ -211,7 +309,7 @@ pub fn write_context_sync(
         });
     }
 
-    remove_replaced_context_artifact_files(cwd, &request.base_path, &source_records, &updates)?;
+    let replaced_source_records = replaced_context_artifact_file_records(&source_records, &updates);
     merge_context_artifacts(&mut source_records, updates);
 
     let manifest = ContextManifest {
@@ -230,7 +328,12 @@ pub fn write_context_sync(
         &unresolved,
     );
     let manifest_rel = request.base_path.join("manifest.json");
-    write_context_file(cwd, &request.base_path, &manifest_rel, &manifest_bytes)?;
+    staged_files.push(stage_context_file(
+        cwd,
+        &request.base_path,
+        &manifest_rel,
+        &manifest_bytes,
+    )?);
 
     let manifest_record = ContextArtifactRecord {
         id: format!("{}:manifest", request.source),
@@ -257,7 +360,15 @@ pub fn write_context_sync(
             .then_with(|| left.id.cmp(&right.id))
     });
 
-    Ok(records)
+    Ok(ContextSyncPlan {
+        cwd: cwd.to_path_buf(),
+        base_path: request.base_path,
+        records,
+        removed_source_records,
+        replaced_source_records,
+        staged_files,
+        committed: false,
+    })
 }
 
 pub fn read_context_artifacts_from_manifest(
@@ -393,12 +504,12 @@ fn read_context_file(cwd: &Path, base_path: &Path, path: &Path) -> std::io::Resu
     std::fs::read(target)
 }
 
-fn write_context_file(
+fn stage_context_file(
     cwd: &Path,
     base_path: &Path,
     path: &Path,
     bytes: &[u8],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StagedContextFile> {
     validate_source_context_path(base_path, path)?;
     let parent_rel = path
         .parent()
@@ -442,17 +553,10 @@ fn write_context_file(
             target.display()
         )
     })?;
-    if let Err(err) = std::fs::rename(&temp_path, &target) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
-            format!(
-                "replace context file {} with {}",
-                target.display(),
-                temp_path.display()
-            )
-        });
-    }
-    Ok(())
+    Ok(StagedContextFile {
+        temp_path,
+        target_path: target,
+    })
 }
 
 fn ensure_context_dir_without_symlink(cwd: &Path, relative_dir: &Path) -> anyhow::Result<()> {
@@ -579,12 +683,10 @@ fn remove_context_artifact_files(
     Ok(())
 }
 
-fn remove_replaced_context_artifact_files(
-    cwd: &Path,
-    base_path: &Path,
+fn replaced_context_artifact_file_records(
     existing: &[ContextArtifactRecord],
     updates: &[ContextArtifactRecord],
-) -> anyhow::Result<()> {
+) -> Vec<ContextArtifactRecord> {
     let mut stale_records = Vec::new();
     for update in updates {
         let Some(existing) = existing.iter().find(|record| {
@@ -606,7 +708,7 @@ fn remove_replaced_context_artifact_files(
         stale_record.paths = stale_paths;
         stale_records.push(stale_record);
     }
-    remove_context_artifact_files(cwd, base_path, &stale_records)
+    stale_records
 }
 
 fn prune_empty_context_dirs(mut dir: Option<&Path>, base_path: &Path) -> anyhow::Result<()> {
@@ -1061,6 +1163,79 @@ mod tests {
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0]["kind"].as_str(), Some("current_thread_cache"));
         assert_eq!(unresolved[0]["reference"].as_str(), Some("C1:111.000"));
+    }
+
+    #[test]
+    fn prepared_context_sync_does_not_mutate_until_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("old thread".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        let records = write_context_sync(tmp.path(), first, &[]).unwrap();
+        let manifest_path = tmp.path().join("slack/manifest.json");
+        let original_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let replacement = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("new thread".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        let plan = prepare_context_sync(tmp.path(), replacement, &records).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("slack/current-thread.md")).unwrap(),
+            "old thread"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            original_manifest
+        );
+        drop(plan);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("slack/current-thread.md")).unwrap(),
+            "old thread"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            original_manifest
+        );
+        assert!(
+            !std::fs::read_dir(tmp.path().join("slack"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp"))
+        );
     }
 
     #[test]

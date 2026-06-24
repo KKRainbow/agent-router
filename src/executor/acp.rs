@@ -458,20 +458,7 @@ impl AcpSession {
                     break response.get("result").cloned().unwrap_or(Value::Null);
                 }
                 _ = cancel.cancelled() => {
-                    let notify_result = self.client.notify(
-                        "session/cancel",
-                        json!({ "sessionId": session_id }),
-                    ).await;
-                    self.client.cancel_pending(request.id).await;
-                    self.client.close("ACP turn cancelled").await;
-                    self.session_id = None;
-                    if let Err(err) = notify_result {
-                        tracing::debug!(
-                            target: "agent_router::acp",
-                            error = %err,
-                            "ignored failed ACP session/cancel notification after local cancellation"
-                        );
-                    }
+                    self.cancel_prompt_session(&session_id, request.id).await;
                     return ExecutorPromptOutcome::Cancelled;
                 }
                 received = updates_rx.recv() => {
@@ -487,6 +474,10 @@ impl AcpSession {
                 }
             }
         };
+        if cancel.is_cancelled().await {
+            self.cancel_prompt_session(&session_id, request.id).await;
+            return ExecutorPromptOutcome::Cancelled;
+        }
         while let Ok(update) = updates_rx.try_recv() {
             if let Err(err) = collect_update(update, events, &mut text_parts).await {
                 return ExecutorPromptOutcome::Failed(err);
@@ -503,6 +494,23 @@ impl AcpSession {
             text_parts.join("")
         };
         ExecutorPromptOutcome::Completed(ExecutorResponse { final_text })
+    }
+
+    async fn cancel_prompt_session(&mut self, session_id: &str, request_id: u64) {
+        let notify_result = self
+            .client
+            .notify("session/cancel", json!({ "sessionId": session_id }))
+            .await;
+        self.client.cancel_pending(request_id).await;
+        self.client.close("ACP turn cancelled").await;
+        self.session_id = None;
+        if let Err(err) = notify_result {
+            tracing::debug!(
+                target: "agent_router::acp",
+                error = %err,
+                "ignored failed ACP session/cancel notification after local cancellation"
+            );
+        }
     }
 }
 
