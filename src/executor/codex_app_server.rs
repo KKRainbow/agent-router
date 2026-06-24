@@ -442,6 +442,7 @@ impl CodexAppServerSession {
                                 &mut final_text,
                                 events,
                                 &mut turn_completed,
+                                &mut idle_timeout,
                             ).await?;
                             if turn_completed {
                                 if turn_start_acknowledged {
@@ -469,6 +470,7 @@ impl CodexAppServerSession {
                             &mut final_text,
                             events,
                             &mut turn_completed,
+                            &mut idle_timeout,
                         ).await?;
                         if turn_completed {
                             if turn_start_acknowledged {
@@ -541,10 +543,14 @@ impl CodexAppServerSession {
         final_text: &mut String,
         events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
+        idle_timeout: &mut std::pin::Pin<&mut tokio::time::Sleep>,
     ) -> anyhow::Result<()> {
         for _ in 0..MAX_READY_NOTIFICATIONS_BEFORE_REQUEST {
             match notifications.try_recv() {
                 Ok(notification) => {
+                    idle_timeout
+                        .as_mut()
+                        .reset(Instant::now() + self.limits.idle_timeout);
                     self.handle_notification(notification, final_text, events, turn_completed)
                         .await?;
                 }
@@ -2350,5 +2356,61 @@ for line in sys.stdin:
             .unwrap();
 
         assert_eq!(response.final_text, "done");
+    }
+
+    #[tokio::test]
+    async fn codex_drain_ready_notifications_resets_idle_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fake_codex.py");
+        write_fake_codex_script(&script, "");
+        let manager = CodexAppServerManager::with_limits(
+            executor_config(&script, tmp.path()),
+            Arc::new(ApprovalBroker::default()),
+            CodexRuntimeLimits {
+                rpc_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_secs(5),
+            },
+        );
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                cwd: None,
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let session = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        let mut session = session.lock().await;
+        let (tx, mut notifications) = broadcast::channel(4);
+        let mut events = CollectingExecutorEventSink::default();
+        let mut final_text = String::new();
+        let mut turn_completed = false;
+        let idle_timeout = sleep(Duration::from_millis(1));
+        tokio::pin!(idle_timeout);
+
+        tx.send(json!({
+            "method": "item/completed",
+            "params": {"item": {"type": "reasoning", "summary": [{"text": "still working"}]}}
+        }))
+        .unwrap();
+
+        session
+            .drain_ready_notifications(
+                &mut notifications,
+                &mut final_text,
+                &mut events,
+                &mut turn_completed,
+                &mut idle_timeout,
+            )
+            .await
+            .unwrap();
+
+        assert!(!turn_completed);
+        assert!(idle_timeout.deadline() > Instant::now() + Duration::from_secs(4));
     }
 }
