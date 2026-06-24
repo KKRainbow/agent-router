@@ -1,10 +1,9 @@
+mod turns;
+
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -18,7 +17,6 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorChannelEventKind, ExecutorEventSink, ExecutorInterruptRequest,
         ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorUpdate,
-        InterruptReason, TurnCancellation,
     },
     session::{
         ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding, ExecutorHealth,
@@ -33,6 +31,10 @@ use crate::{
     text::truncate_chars,
 };
 
+use self::turns::{InterruptedTurn, TurnGuard, TurnRegistry, TurnReservation};
+
+#[cfg(test)]
+use crate::executor::{InterruptReason, TurnCancellation};
 #[cfg(test)]
 use crate::session::context::write_context_sync;
 
@@ -417,15 +419,7 @@ where
     approvals: SharedApprovalBroker,
     workspace_root: Option<PathBuf>,
     session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    active_turns: Mutex<HashMap<String, ActiveRouterTurn>>,
-    next_turn_generation: AtomicU64,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveRouterTurn {
-    generation: u64,
-    executor: Option<String>,
-    cancel: TurnCancellation,
+    turns: Arc<TurnRegistry>,
 }
 
 struct PreparedContextSync {
@@ -482,8 +476,7 @@ where
             approvals,
             workspace_root: None,
             session_locks: Mutex::new(HashMap::new()),
-            active_turns: Mutex::new(HashMap::new()),
-            next_turn_generation: AtomicU64::new(1),
+            turns: TurnRegistry::new(),
         }
     }
 
@@ -500,118 +493,35 @@ where
             .clone()
     }
 
-    async fn install_active_turn(
-        &self,
-        session_key: &str,
-        executor: String,
-        cancel: TurnCancellation,
-    ) -> (u64, Option<ActiveRouterTurn>) {
-        let generation = self.next_turn_generation.fetch_add(1, Ordering::Relaxed);
-        let mut active_turns = self.active_turns.lock().await;
-        let replaced = active_turns.insert(
-            session_key.to_string(),
-            ActiveRouterTurn {
-                generation,
-                executor: Some(executor),
-                cancel,
-            },
-        );
-        (generation, replaced)
-    }
-
     async fn preempt_active_turn(&self, session_key: &str) -> u64 {
-        let generation = self.next_turn_generation.fetch_add(1, Ordering::Relaxed);
-        let cancel = TurnCancellation::new();
-        let replaced = self.active_turns.lock().await.insert(
-            session_key.to_string(),
-            ActiveRouterTurn {
-                generation,
-                executor: None,
-                cancel,
-            },
-        );
-        if let Some(replaced) = replaced {
-            self.interrupt_turn(session_key, replaced, InterruptReason::ReplacedByNewMessage)
-                .await;
+        let reserved = self.turns.reserve_replacement(session_key).await;
+        if let Some(interrupted) = reserved.interrupted {
+            self.interrupt_turn(interrupted).await;
         }
-        generation
+        reserved.reservation.generation()
     }
 
-    async fn interrupt_turn(
-        &self,
-        session_key: &str,
-        turn: ActiveRouterTurn,
-        reason: InterruptReason,
-    ) {
-        let _ = turn.cancel.cancel(reason).await;
+    async fn interrupt_turn(&self, turn: InterruptedTurn) {
         let Some(executor) = turn.executor else {
             return;
         };
         if let Err(err) = self
             .executor
             .interrupt(ExecutorInterruptRequest {
-                session_key: session_key.to_string(),
+                session_key: turn.session_key.clone(),
                 executor,
                 generation: turn.generation,
-                reason,
+                reason: turn.reason,
             })
             .await
         {
             tracing::debug!(
                 error = %err,
-                session_key,
+                session_key = %turn.session_key,
                 generation = turn.generation,
                 "executor interrupt request failed"
             );
         }
-    }
-
-    async fn take_active_turn_if_current(&self, session_key: &str, generation: u64) -> bool {
-        let mut active_turns = self.active_turns.lock().await;
-        if active_turns
-            .get(session_key)
-            .is_some_and(|turn| turn.generation == generation)
-        {
-            active_turns.remove(session_key);
-            return true;
-        }
-        false
-    }
-
-    async fn active_turn_is_current(&self, session_key: &str, generation: u64) -> bool {
-        self.active_turns
-            .lock()
-            .await
-            .get(session_key)
-            .is_some_and(|turn| turn.generation == generation)
-    }
-
-    async fn active_turn_cancel_if_current(
-        &self,
-        session_key: &str,
-        generation: u64,
-    ) -> Option<TurnCancellation> {
-        self.active_turns
-            .lock()
-            .await
-            .get(session_key)
-            .filter(|turn| turn.generation == generation)
-            .map(|turn| turn.cancel.clone())
-    }
-
-    async fn adopt_preempted_turn(
-        &self,
-        session_key: &str,
-        generation: u64,
-        executor: String,
-    ) -> Option<TurnCancellation> {
-        let mut active_turns = self.active_turns.lock().await;
-        let turn = active_turns.get_mut(session_key)?;
-        if turn.generation != generation {
-            return None;
-        }
-        turn.executor = Some(executor);
-        Some(turn.cancel.clone())
     }
 
     async fn handle_input(
@@ -735,20 +645,15 @@ where
 
     async fn commit_context_sync_if_current(
         &self,
-        session_key: &str,
-        generation: u64,
-        cancel: &TurnCancellation,
+        turn: &TurnReservation,
         mut prepared: PreparedContextSync,
     ) -> anyhow::Result<bool> {
-        if cancel.is_cancelled().await
-            || !self.active_turn_is_current(session_key, generation).await
-        {
+        let cancel = turn.cancellation();
+        if cancel.is_cancelled().await || !turn.is_current().await {
             return Ok(false);
         }
         let installed = prepared.plan.install()?;
-        if cancel.is_cancelled().await
-            || !self.active_turn_is_current(session_key, generation).await
-        {
+        if cancel.is_cancelled().await || !turn.is_current().await {
             drop(installed);
             return Ok(false);
         }
@@ -756,9 +661,7 @@ where
         let records = installed.records().to_vec();
         prepared.state.context_artifacts = records;
         self.store.save(prepared.state).await;
-        if cancel.is_cancelled().await
-            || !self.active_turn_is_current(session_key, generation).await
-        {
+        if cancel.is_cancelled().await || !turn.is_current().await {
             drop(installed);
             self.store.save(old_state).await;
             return Ok(false);
@@ -770,7 +673,7 @@ where
             context_records = prepared.record_count,
             unresolved_count = prepared.unresolved_count,
             cwd = %prepared.session_cwd.display(),
-            generation,
+            generation = turn.generation(),
             "synced session context artifacts"
         );
         Ok(true)
@@ -893,10 +796,8 @@ where
         session_key: &str,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
-        let active = self.active_turns.lock().await.remove(session_key);
-        if let Some(active) = active {
-            self.interrupt_turn(session_key, active, InterruptReason::UserStop)
-                .await;
+        if let Some(active) = self.turns.stop(session_key).await {
+            self.interrupt_turn(active).await;
             output
                 .send_final_reply("Stopped the active turn.".to_string())
                 .await
@@ -915,63 +816,48 @@ where
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
         let session_key = input.session_key.clone();
-        let (generation, cancel, replaced, state, executor_name, descriptor, binding, session_cwd) = {
+        let (turn, replaced, state, executor_name, descriptor, binding, session_cwd) = {
             let lock = self.session_lock(&session_key).await;
             let _guard = lock.lock().await;
-            if let Some(generation) = preempt_generation
-                && !self.active_turn_is_current(&session_key, generation).await
-            {
-                tracing::debug!(
-                    session_key = %session_key,
-                    generation,
-                    "discarded stale preempted router turn before context sync"
-                );
-                return Ok(());
-            }
-            if let Some(context) = context {
-                if let Some(generation) = preempt_generation {
-                    let Some(preempt_cancel) = self
-                        .active_turn_cancel_if_current(&session_key, generation)
-                        .await
-                    else {
+            let preempt_reservation = if let Some(generation) = preempt_generation {
+                match self.turns.reservation_for(&session_key, generation).await {
+                    Some(reservation) => Some(reservation),
+                    None => {
                         tracing::debug!(
                             session_key = %session_key,
                             generation,
                             "discarded stale preempted router turn before context sync"
                         );
                         return Ok(());
-                    };
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(context) = context {
+                if let Some(reservation) = preempt_reservation.as_ref() {
                     let prepared = match self.prepare_context_sync_locked(context).await {
                         Ok(prepared) => prepared,
                         Err(err) => {
-                            let _ = self
-                                .take_active_turn_if_current(&session_key, generation)
-                                .await;
+                            let _ = reservation.discard_if_current().await;
                             return Err(err);
                         }
                     };
                     if let Some(prepared) = prepared {
                         let committed = match self
-                            .commit_context_sync_if_current(
-                                &session_key,
-                                generation,
-                                &preempt_cancel,
-                                prepared,
-                            )
+                            .commit_context_sync_if_current(reservation, prepared)
                             .await
                         {
                             Ok(committed) => committed,
                             Err(err) => {
-                                let _ = self
-                                    .take_active_turn_if_current(&session_key, generation)
-                                    .await;
+                                let _ = reservation.discard_if_current().await;
                                 return Err(err);
                             }
                         };
                         if !committed {
                             tracing::debug!(
                                 session_key = %session_key,
-                                generation,
+                                generation = reservation.generation(),
                                 "discarded stale preempted router turn before context commit"
                             );
                             return Ok(());
@@ -994,33 +880,24 @@ where
                 self.store.save(state.clone()).await;
             }
             let binding = state.binding_for(&executor_name);
-            let (generation, cancel, replaced) = if let Some(preempt_generation) =
-                preempt_generation
-            {
-                match self
-                    .adopt_preempted_turn(&session_key, preempt_generation, executor_name.clone())
-                    .await
-                {
-                    Some(cancel) => (preempt_generation, cancel, None),
+            let (turn, replaced) = if let Some(reservation) = preempt_reservation {
+                match reservation.adopt(executor_name.clone()).await {
+                    Some(turn) => (turn, None),
                     None => {
                         tracing::debug!(
                             session_key = %session_key,
-                            generation = preempt_generation,
+                            generation = reservation.generation(),
                             "discarded stale preempted router turn before prompt"
                         );
                         return Ok(());
                     }
                 }
             } else {
-                let cancel = TurnCancellation::new();
-                let (generation, replaced) = self
-                    .install_active_turn(&session_key, executor_name.clone(), cancel.clone())
-                    .await;
-                (generation, cancel, replaced)
+                let begun = self.turns.begin(&session_key, executor_name.clone()).await;
+                (begun.guard, begun.interrupted)
             };
             (
-                generation,
-                cancel,
+                turn,
                 replaced,
                 state,
                 executor_name,
@@ -1031,14 +908,13 @@ where
         };
 
         if let Some(replaced) = replaced {
-            self.interrupt_turn(
-                &session_key,
-                replaced,
-                InterruptReason::ReplacedByNewMessage,
-            )
-            .await;
+            self.interrupt_turn(replaced).await;
         }
 
+        debug_assert_eq!(turn.session_key(), session_key);
+        debug_assert_eq!(turn.executor(), executor_name);
+        let generation = turn.generation();
+        let cancel = turn.cancellation();
         tracing::info!(
             session_key = %session_key,
             executor = %executor_name,
@@ -1067,9 +943,7 @@ where
             Ok(prepared) => prepared,
             Err(err) => {
                 if cancel.is_cancelled().await {
-                    let _ = self
-                        .take_active_turn_if_current(&session_key, generation)
-                        .await;
+                    let _ = turn.finish_if_current().await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -1082,10 +956,7 @@ where
                 let committed_failure = {
                     let lock = self.session_lock(&session_key).await;
                     let _guard = lock.lock().await;
-                    if !self
-                        .take_active_turn_if_current(&session_key, generation)
-                        .await
-                    {
+                    if !turn.finish_if_current().await {
                         false
                     } else {
                         let mut latest = self
@@ -1119,9 +990,7 @@ where
             }
         };
         if cancel.is_cancelled().await {
-            let _ = self
-                .take_active_turn_if_current(&session_key, generation)
-                .await;
+            let _ = turn.finish_if_current().await;
             tracing::info!(
                 session_key = %session_key,
                 executor = %executor_name,
@@ -1141,13 +1010,8 @@ where
         });
 
         let (response, updates) = {
-            let mut executor_events = RouterExecutorEventSink::new(
-                self,
-                &session_key,
-                generation,
-                &executor_name,
-                output,
-            );
+            let mut executor_events =
+                RouterExecutorEventSink::new(turn.clone(), &executor_name, output);
             let response = self
                 .executor
                 .prompt(
@@ -1190,10 +1054,7 @@ where
                 let committed = {
                     let lock = self.session_lock(&session_key).await;
                     let _guard = lock.lock().await;
-                    if !self
-                        .take_active_turn_if_current(&session_key, generation)
-                        .await
-                    {
+                    if !turn.finish_if_current().await {
                         false
                     } else {
                         let mut latest = self
@@ -1237,9 +1098,7 @@ where
                 output.send_final_reply(response.final_text).await
             }
             ExecutorPromptOutcome::Cancelled => {
-                let current = self
-                    .take_active_turn_if_current(&session_key, generation)
-                    .await;
+                let current = turn.finish_if_current().await;
                 tracing::info!(
                     session_key = %session_key,
                     executor = %executor_name,
@@ -1253,10 +1112,7 @@ where
                 let committed_failure = {
                     let lock = self.session_lock(&session_key).await;
                     let _guard = lock.lock().await;
-                    if !self
-                        .take_active_turn_if_current(&session_key, generation)
-                        .await
-                    {
+                    if !turn.finish_if_current().await {
                         false
                     } else {
                         let mut latest = self
@@ -1549,35 +1405,17 @@ where
     }
 }
 
-struct RouterExecutorEventSink<'a, S, E>
-where
-    S: SessionStore,
-    E: ExecutorBackend,
-{
-    router: &'a AgentRouter<S, E>,
-    session_key: &'a str,
-    generation: u64,
+struct RouterExecutorEventSink<'a> {
+    turn: TurnGuard,
     executor: &'a str,
     output: &'a mut dyn RouterOutputSink,
     updates: Vec<ExecutorUpdate>,
 }
 
-impl<'a, S, E> RouterExecutorEventSink<'a, S, E>
-where
-    S: SessionStore,
-    E: ExecutorBackend,
-{
-    fn new(
-        router: &'a AgentRouter<S, E>,
-        session_key: &'a str,
-        generation: u64,
-        executor: &'a str,
-        output: &'a mut dyn RouterOutputSink,
-    ) -> Self {
+impl<'a> RouterExecutorEventSink<'a> {
+    fn new(turn: TurnGuard, executor: &'a str, output: &'a mut dyn RouterOutputSink) -> Self {
         Self {
-            router,
-            session_key,
-            generation,
+            turn,
             executor,
             output,
             updates: Vec::new(),
@@ -1590,17 +1428,10 @@ where
 }
 
 #[async_trait]
-impl<S, E> ExecutorEventSink for RouterExecutorEventSink<'_, S, E>
-where
-    S: SessionStore,
-    E: ExecutorBackend,
-{
+impl ExecutorEventSink for RouterExecutorEventSink<'_> {
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
         if let Some(event) = channel_event_from_executor_update(self.executor, &update)
-            && self
-                .router
-                .active_turn_is_current(self.session_key, self.generation)
-                .await
+            && self.turn.is_current().await
         {
             self.output.send_channel_event(event);
         }
@@ -3616,7 +3447,7 @@ mod tests {
                 .is_err()
         );
         assert!(executor.interrupts.lock().await.is_empty());
-        assert!(router.active_turns.lock().await.contains_key("slack:C1:T1"));
+        assert!(router.turns.has_current("slack:C1:T1").await);
 
         let mut stop_output = CollectingRouterOutputSink::default();
         router
@@ -3787,7 +3618,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("context path is not a file"));
-        assert!(!router.active_turns.lock().await.contains_key(session_key));
+        assert!(!router.turns.has_current(session_key).await);
     }
 
     #[tokio::test]

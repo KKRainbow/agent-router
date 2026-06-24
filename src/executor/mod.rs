@@ -90,6 +90,9 @@ impl TurnCancellation {
 
     pub async fn cancelled(&self) -> InterruptReason {
         let mut changed = self.inner.changed.subscribe();
+        if let Some(reason) = *self.inner.reason.lock().await {
+            return reason;
+        }
         if let Some(reason) = *changed.borrow() {
             return reason;
         }
@@ -414,6 +417,15 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_wait_observes_reason_after_prior_cancel() {
+        let cancel = TurnCancellation::new();
+
+        assert!(cancel.cancel(InterruptReason::UserStop).await);
+
+        assert_eq!(cancel.cancelled().await, InterruptReason::UserStop);
+    }
 
     #[test]
     fn update_summary_truncates_on_char_boundary() {
