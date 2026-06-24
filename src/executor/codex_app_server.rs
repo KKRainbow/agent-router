@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, broadcast, mpsc, oneshot, watch},
+    task::JoinHandle,
     time::{Duration, Instant, sleep, timeout},
 };
 
@@ -34,6 +35,38 @@ type SessionMap = HashMap<SessionKey, SharedCodexSession>;
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
+
+struct CodexTurnScope {
+    cancelled: watch::Sender<bool>,
+}
+
+impl CodexTurnScope {
+    fn new() -> Self {
+        let (cancelled, _) = watch::channel(false);
+        Self { cancelled }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.cancelled.subscribe()
+    }
+
+    fn cancel(&self) {
+        let _ = self.cancelled.send(true);
+    }
+}
+
+impl Drop for CodexTurnScope {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+async fn wait_turn_cancelled(mut cancelled: watch::Receiver<bool>) {
+    if *cancelled.borrow() {
+        return;
+    }
+    let _ = cancelled.changed().await;
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CodexRuntimeLimits {
@@ -364,6 +397,9 @@ impl CodexAppServerSession {
         let mut notifications = self.client.subscribe_notifications();
         let mut server_requests = self.client.subscribe_server_requests();
         let mut closed = self.client.subscribe_closed();
+        let turn_scope = CodexTurnScope::new();
+        let mut server_request_handlers = Vec::new();
+        let (server_response_tx, mut server_responses) = mpsc::channel(64);
         let mut turn_start = self
             .client
             .request_started(
@@ -375,15 +411,16 @@ impl CodexAppServerSession {
             )
             .await?;
 
-        let mut final_text = String::new();
-        let mut turn_start_acknowledged = false;
-        let mut turn_completed = false;
-        let turn_start_timeout = sleep(self.limits.rpc_timeout);
-        let idle_timeout = sleep(self.limits.idle_timeout);
-        tokio::pin!(turn_start_timeout);
-        tokio::pin!(idle_timeout);
-        loop {
-            tokio::select! {
+        let result: anyhow::Result<ExecutorResponse> = async {
+            let mut final_text = String::new();
+            let mut turn_start_acknowledged = false;
+            let mut turn_completed = false;
+            let turn_start_timeout = sleep(self.limits.rpc_timeout);
+            let idle_timeout = sleep(self.limits.idle_timeout);
+            tokio::pin!(turn_start_timeout);
+            tokio::pin!(idle_timeout);
+            loop {
+                tokio::select! {
                 response = &mut turn_start.response, if !turn_start_acknowledged => {
                     idle_timeout
                         .as_mut()
@@ -406,12 +443,40 @@ impl CodexAppServerSession {
                                 events,
                                 &mut turn_completed,
                             ).await?;
-                            self.spawn_server_request_handler(request, user_id.clone());
+                            if turn_completed {
+                                if turn_start_acknowledged {
+                                    break;
+                                }
+                                continue;
+                            }
+                            server_request_handlers.push(self.spawn_server_request_handler(
+                                request,
+                                user_id.clone(),
+                                server_response_tx.clone(),
+                                turn_scope.subscribe(),
+                            ));
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => {
                             anyhow::bail!("codex app-server request stream closed")
                         }
+                    }
+                }
+                response = server_responses.recv() => {
+                    if let Some(response) = response {
+                        self.drain_ready_notifications(
+                            &mut notifications,
+                            &mut final_text,
+                            events,
+                            &mut turn_completed,
+                        ).await?;
+                        if turn_completed {
+                            if turn_start_acknowledged {
+                                break;
+                            }
+                            continue;
+                        }
+                        write_json(&self.client.stdin, response).await?;
                     }
                 }
                 notification = notifications.recv() => {
@@ -456,10 +521,18 @@ impl CodexAppServerSession {
                         self.limits.idle_timeout.as_secs()
                     );
                 }
+                }
             }
-        }
 
-        Ok(ExecutorResponse { final_text })
+            Ok(ExecutorResponse { final_text })
+        }
+        .await;
+
+        turn_scope.cancel();
+        for handler in server_request_handlers {
+            let _ = handler.await;
+        }
+        result
     }
 
     async fn drain_ready_notifications(
@@ -504,40 +577,59 @@ impl CodexAppServerSession {
         Ok(())
     }
 
-    fn spawn_server_request_handler(&self, message: Value, user_id: Option<String>) {
-        let stdin = self.client.stdin.clone();
+    fn spawn_server_request_handler(
+        &self,
+        message: Value,
+        user_id: Option<String>,
+        responses: mpsc::Sender<Value>,
+        turn_cancelled: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
         let approvals = self.approvals.clone();
         let session_key = self.session_key.clone();
         let executor = self.executor.clone();
         let pending_file_change =
             self.pending_file_change_summary(message.get("params").unwrap_or(&Value::Null));
+        let response_cancelled = turn_cancelled.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = Self::handle_server_request(
-                stdin,
+            match Self::handle_server_request(
                 approvals,
                 session_key,
                 executor,
                 user_id,
                 message,
                 pending_file_change,
+                turn_cancelled,
             )
             .await
             {
-                tracing::warn!(error = %err, "failed to handle Codex app-server request");
+                Ok(Some(response)) => {
+                    tokio::select! {
+                        result = responses.send(response) => {
+                            if result.is_err() {
+                                tracing::debug!("dropping Codex app-server response for closed turn");
+                            }
+                        }
+                        _ = wait_turn_cancelled(response_cancelled) => {}
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to handle Codex app-server request");
+                }
             }
-        });
+        })
     }
 
     async fn handle_server_request(
-        stdin: SharedStdin,
         approvals: SharedApprovalBroker,
         session_key: String,
         executor: String,
         user_id: Option<String>,
         message: Value,
         pending_file_change: Option<String>,
-    ) -> anyhow::Result<()> {
+        turn_cancelled: watch::Receiver<bool>,
+    ) -> anyhow::Result<Option<Value>> {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let params = message.get("params").unwrap_or(&Value::Null);
@@ -551,60 +643,35 @@ impl CodexAppServerSession {
                     params,
                     pending_file_change,
                 );
-                let decision = match approvals.request(request).await {
+                let Some(selection) = approvals
+                    .request_until_cancelled(request, wait_turn_cancelled(turn_cancelled))
+                    .await
+                else {
+                    return Ok(None);
+                };
+                let decision = match selection {
                     ApprovalSelection::Selected(option_id) if option_id == "accept" => "accept",
                     _ => "decline",
                 };
-                write_json(
-                    &stdin,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": { "decision": decision },
-                    }),
-                )
-                .await?;
+                Ok(Some(codex_result_response(
+                    id,
+                    json!({ "decision": decision }),
+                )))
             }
-            "item/permissions/requestApproval" => {
-                write_json(
-                    &stdin,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": { "decision": "decline" },
-                    }),
-                )
-                .await?;
-            }
-            "mcpServer/elicitation/request" => {
-                write_json(
-                    &stdin,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": { "action": "decline" },
-                    }),
-                )
-                .await?;
-            }
-            _ => {
-                write_json(
-                    &stdin,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32601,
-                            "message": format!(
-                                "agent-router does not support codex client method `{method}`"
-                            ),
-                        },
-                    }),
-                )
-                .await?;
-            }
+            "item/permissions/requestApproval" => Ok(Some(codex_result_response(
+                id,
+                json!({ "decision": "decline" }),
+            ))),
+            "mcpServer/elicitation/request" => Ok(Some(codex_result_response(
+                id,
+                json!({ "action": "decline" }),
+            ))),
+            _ => Ok(Some(codex_error_response(
+                id,
+                -32601,
+                format!("agent-router does not support codex client method `{method}`"),
+            ))),
         }
-        Ok(())
     }
 
     fn track_pending_file_change(&mut self, notification: &Value) {
@@ -973,6 +1040,25 @@ fn json_rpc_result(method: &str, response: Value) -> anyhow::Result<Value> {
         );
     }
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn codex_result_response(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn codex_error_response(id: Value, code: i64, message: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
 }
 
 async fn read_codex_stdout<R>(
@@ -1750,6 +1836,102 @@ for line in sys.stdin:
 
         let response = prompt_task.await.unwrap().unwrap();
         assert_eq!(response.final_text, "approved");
+    }
+
+    #[tokio::test]
+    async fn codex_pending_approval_is_cancelled_when_turn_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("completed_with_pending_approval.py");
+        let stale_response_marker = tmp.path().join("stale_response.json");
+        let marker_literal = serde_json::to_string(&stale_response_marker.display().to_string())
+            .expect("marker path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "turn/start":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "id": 903,
+            "method": "item/commandExecution/requestApproval",
+            "params": {{"command": "sleep 10", "cwd": "/tmp", "reason": "test"}},
+        }})
+        time.sleep(0.05)
+        send({{
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {{"item": {{"type": "agentMessage", "text": "done"}}}},
+        }})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {{"turn": {{"id": "turn-1", "status": "completed"}}}},
+        }})
+    elif request_id == 903:
+        with open({marker_literal}, "w") as f:
+            f.write(json.dumps(msg))
+"#
+            ),
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(CodexAppServerManager::with_approvals(
+            executor_config(&script, tmp.path()),
+            approvals.clone(),
+        ));
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                cwd: None,
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        session_key: "session-1".to_string(),
+                        executor: "codex".to_string(),
+                        prompt: "finish with pending approval".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                )
+                .await
+        });
+
+        let approval_prompt = timeout(Duration::from_secs(5), prompts.recv())
+            .await
+            .expect("approval prompt timed out")
+            .unwrap();
+        let response = timeout(Duration::from_secs(5), prompt_task)
+            .await
+            .expect("prompt task timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.final_text, "done");
+
+        assert!(!approvals.has_pending_for_session("session-1").await);
+        let reply = approvals
+            .resolve_command(
+                "session-1",
+                &format!("/approve {}", approval_prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.text,
+            format!("Approval {} is not pending.", approval_prompt.id)
+        );
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!stale_response_marker.exists());
     }
 
     #[tokio::test]

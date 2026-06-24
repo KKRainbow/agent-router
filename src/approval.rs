@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -211,7 +212,22 @@ impl ApprovalBroker {
     }
 
     pub async fn request(&self, request: ApprovalRequest) -> ApprovalSelection {
-        if let Some(selection) = self.policy.auto_selection(&request).await {
+        self.request_until_cancelled(request, std::future::pending())
+            .await
+            .unwrap_or(ApprovalSelection::Cancelled)
+    }
+
+    pub async fn request_until_cancelled(
+        &self,
+        request: ApprovalRequest,
+        cancel: impl Future<Output = ()> + Send,
+    ) -> Option<ApprovalSelection> {
+        tokio::pin!(cancel);
+        let auto_selection = tokio::select! {
+            selection = self.policy.auto_selection(&request) => selection,
+            _ = &mut cancel => return None,
+        };
+        if let Some(selection) = auto_selection {
             if let ApprovalSelection::Selected(option_id) = &selection {
                 let _ = self.auto_selections.send(ApprovalAutoSelection {
                     session_key: request.session_key.clone(),
@@ -220,7 +236,7 @@ impl ApprovalBroker {
                     option_id: option_id.clone(),
                 });
             }
-            return selection;
+            return Some(selection);
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
@@ -250,9 +266,14 @@ impl ApprovalBroker {
         }
         let _ = self.prompts.send(prompt);
 
-        let selection = match time::timeout(self.timeout, rx).await {
-            Ok(Ok(selection)) => selection,
-            Ok(Err(_)) | Err(_) => ApprovalSelection::Cancelled,
+        let selection = tokio::select! {
+            selection = time::timeout(self.timeout, rx) => {
+                Some(match selection {
+                    Ok(Ok(selection)) => selection,
+                    Ok(Err(_)) | Err(_) => ApprovalSelection::Cancelled,
+                })
+            }
+            _ = &mut cancel => None,
         };
         self.remove_pending(&id).await;
         selection
@@ -481,6 +502,37 @@ mod tests {
             ApprovalSelection::Selected("deny".to_string())
         );
         assert!(!broker.has_pending_for_session("s1").await);
+    }
+
+    #[tokio::test]
+    async fn cancelable_request_removes_pending_without_resolution() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let pending = tokio::spawn(async move {
+            request_broker
+                .request_until_cancelled(request("s1"), async {
+                    let _ = cancel_rx.await;
+                })
+                .await
+        });
+
+        let prompt = prompts.recv().await.unwrap();
+        assert!(broker.has_pending_for_session("s1").await);
+
+        cancel_tx.send(()).unwrap();
+
+        assert_eq!(pending.await.unwrap(), None);
+        assert!(!broker.has_pending_for_session("s1").await);
+        let reply = broker
+            .resolve_command("s1", &format!("/approve {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.text,
+            format!("Approval {} is not pending.", prompt.id)
+        );
     }
 
     #[tokio::test]
