@@ -9,7 +9,10 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
@@ -228,12 +231,8 @@ impl SlackSocketModeChannel {
                 "routing Slack approval command"
             );
             let reply_target = event.reply_target();
-            let mut output = SlackRouterOutputSink {
-                channel: self.clone(),
-                target: reply_target,
-                channel_events: self.cfg.channel_events,
-                compact_activity: SlackCompactActivity::default(),
-            };
+            let mut output =
+                SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
             router
                 .handle_with_context(
                     RouterInput {
@@ -279,12 +278,8 @@ impl SlackSocketModeChannel {
             .map(|context| context.failed_file_sync_keys.clone())
             .unwrap_or_default();
         let reply_target = event.reply_target();
-        let mut output = SlackRouterOutputSink {
-            channel: self.clone(),
-            target: reply_target,
-            channel_events: self.cfg.channel_events,
-            compact_activity: SlackCompactActivity::default(),
-        };
+        let mut output =
+            SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
         router
             .handle_with_context(
                 RouterInput {
@@ -336,12 +331,8 @@ impl SlackSocketModeChannel {
             text_len = text.len(),
             "routing Slack slash command"
         );
-        let mut output = SlackRouterOutputSink {
-            channel: self.clone(),
-            target: reply_target,
-            channel_events: self.cfg.channel_events,
-            compact_activity: SlackCompactActivity::default(),
-        };
+        let mut output =
+            SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
         router
             .handle(
                 RouterInput {
@@ -729,8 +720,10 @@ impl SlackSocketModeChannel {
             &self.file_sync_state(session_key, existing_context).await,
             self.cfg.context_sync.max_files_per_turn,
         );
+        let mut retained_file_artifact_ids = BTreeSet::new();
         skipped_cached_files += file_selection.skipped_synced_files.len();
         for file in &file_selection.skipped_synced_files {
+            retained_file_artifact_ids.insert(slack_file_artifact_id(&file.id));
             tracing::info!(
                 file_id = %file.id,
                 file_name = %file.name,
@@ -767,6 +760,7 @@ impl SlackSocketModeChannel {
                         extracted_text = downloaded.extracted_text.is_some(),
                         "downloaded Slack file context"
                     );
+                    retained_file_artifact_ids.insert(slack_file_artifact_id(&downloaded.file.id));
                     succeeded_file_sync_keys.push(file_cache_key);
                     downloaded_files.push(downloaded);
                 }
@@ -809,6 +803,7 @@ impl SlackSocketModeChannel {
                 },
                 &linked_threads,
                 &downloaded_files,
+                retained_file_artifact_ids,
                 remove_artifacts,
                 unresolved,
             ),
@@ -1132,13 +1127,107 @@ struct SlackRouterOutputSink {
     channel: SlackSocketModeChannel,
     target: SlackReplyTarget,
     channel_events: ChannelEventMode,
+    verbose_activity: SlackVerboseActivity,
     compact_activity: SlackCompactActivity,
+}
+
+impl SlackRouterOutputSink {
+    fn new(
+        channel: SlackSocketModeChannel,
+        target: SlackReplyTarget,
+        channel_events: ChannelEventMode,
+    ) -> Self {
+        Self {
+            channel,
+            target,
+            channel_events,
+            verbose_activity: SlackVerboseActivity::default(),
+            compact_activity: SlackCompactActivity::default(),
+        }
+    }
+
+    async fn flush_channel_events(&mut self) {
+        match self.channel_events {
+            ChannelEventMode::Off => {}
+            ChannelEventMode::Compact => self.compact_activity.flush().await,
+            ChannelEventMode::Verbose => self.verbose_activity.flush().await,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SlackVerboseActivity {
+    poster: Option<SlackVerboseActivityPoster>,
+}
+
+struct SlackVerboseActivityPoster {
+    events: mpsc::UnboundedSender<RouterChannelEvent>,
+    handle: JoinHandle<()>,
 }
 
 #[derive(Default)]
 struct SlackCompactActivity {
     events: Vec<RouterChannelEvent>,
-    updates: Option<mpsc::UnboundedSender<String>>,
+    updater: Option<SlackCompactActivityUpdater>,
+}
+
+struct SlackCompactActivityUpdater {
+    updates: mpsc::UnboundedSender<String>,
+    handle: JoinHandle<()>,
+}
+
+impl SlackVerboseActivity {
+    fn send(
+        &mut self,
+        channel: SlackSocketModeChannel,
+        target: SlackReplyTarget,
+        event: RouterChannelEvent,
+    ) {
+        if self.poster.is_none() {
+            self.poster = Some(spawn_slack_verbose_activity_poster(channel, target));
+        }
+        if let Some(poster) = &self.poster
+            && poster.events.send(event).is_err()
+        {
+            tracing::warn!("verbose Slack activity poster stopped before receiving event");
+        }
+    }
+
+    async fn flush(&mut self) {
+        if let Some(poster) = self.poster.take() {
+            drop(poster.events);
+            await_slack_activity_worker(poster.handle, "verbose").await;
+        }
+    }
+}
+
+impl SlackCompactActivity {
+    fn send(
+        &mut self,
+        channel: SlackSocketModeChannel,
+        target: SlackReplyTarget,
+        event: RouterChannelEvent,
+    ) {
+        self.events.push(event);
+        let Some(summary) = render_live_compact_channel_events(&self.events) else {
+            return;
+        };
+        if self.updater.is_none() {
+            self.updater = Some(spawn_slack_compact_activity_updater(channel, target));
+        }
+        if let Some(updater) = &self.updater
+            && updater.updates.send(summary).is_err()
+        {
+            tracing::warn!("compact Slack activity updater stopped before receiving update");
+        }
+    }
+
+    async fn flush(&mut self) {
+        if let Some(updater) = self.updater.take() {
+            drop(updater.updates);
+            await_slack_activity_worker(updater.handle, "compact").await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1147,49 +1236,43 @@ impl RouterOutputSink for SlackRouterOutputSink {
         match self.channel_events {
             ChannelEventMode::Off => {}
             ChannelEventMode::Compact => {
-                self.compact_activity.events.push(event);
-                let Some(summary) =
-                    render_live_compact_channel_events(&self.compact_activity.events)
-                else {
-                    return;
-                };
-                if self.compact_activity.updates.is_none() {
-                    self.compact_activity.updates = Some(spawn_slack_compact_activity_updater(
-                        self.channel.clone(),
-                        self.target.clone(),
-                    ));
-                }
-                if let Some(updates) = &self.compact_activity.updates
-                    && updates.send(summary).is_err()
-                {
-                    tracing::warn!(
-                        "compact Slack activity updater stopped before receiving update"
-                    );
-                }
+                self.compact_activity
+                    .send(self.channel.clone(), self.target.clone(), event);
             }
             ChannelEventMode::Verbose => {
-                let channel = self.channel.clone();
-                let target = self.target.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = channel.post_message(&target, &event.render_text()).await {
-                        tracing::warn!(error = %err, "failed to post Slack channel event");
-                    }
-                });
+                self.verbose_activity
+                    .send(self.channel.clone(), self.target.clone(), event);
             }
         }
     }
 
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+        self.flush_channel_events().await;
         self.channel.post_message(&self.target, &text).await
     }
+}
+
+fn spawn_slack_verbose_activity_poster(
+    channel: SlackSocketModeChannel,
+    target: SlackReplyTarget,
+) -> SlackVerboseActivityPoster {
+    let (tx, mut rx) = mpsc::unbounded_channel::<RouterChannelEvent>();
+    let handle = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let Err(err) = channel.post_message(&target, &event.render_text()).await {
+                tracing::warn!(error = %err, "failed to post Slack channel event");
+            }
+        }
+    });
+    SlackVerboseActivityPoster { events: tx, handle }
 }
 
 fn spawn_slack_compact_activity_updater(
     channel: SlackSocketModeChannel,
     target: SlackReplyTarget,
-) -> mpsc::UnboundedSender<String> {
+) -> SlackCompactActivityUpdater {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut message_ts = None;
         while let Some(mut summary) = rx.recv().await {
             while let Ok(next) = rx.try_recv() {
@@ -1212,7 +1295,16 @@ fn spawn_slack_compact_activity_updater(
             }
         }
     });
-    tx
+    SlackCompactActivityUpdater {
+        updates: tx,
+        handle,
+    }
+}
+
+async fn await_slack_activity_worker(handle: JoinHandle<()>, mode: &'static str) {
+    if let Err(err) = handle.await {
+        tracing::warn!(error = %err, mode, "Slack activity worker failed");
+    }
 }
 
 #[derive(Debug, Deserialize)]
