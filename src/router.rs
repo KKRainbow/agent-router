@@ -19,7 +19,7 @@ use crate::{
     session::{
         ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding, ExecutorHealth,
         SessionState, TranscriptMessage,
-        context::write_context_sync,
+        context::{read_context_artifacts_from_manifest, write_context_sync},
         projection::{
             ProjectionInput, build_context_projection, merge_seen_context,
             projected_assistant_content, visible_message_fingerprints,
@@ -849,7 +849,7 @@ where
     ) -> anyhow::Result<Vec<ContextArtifactRecord>> {
         let lock = self.session_lock(session_key).await;
         let _guard = lock.lock().await;
-        Ok(self
+        let records: Vec<ContextArtifactRecord> = self
             .store
             .load(session_key)
             .await
@@ -860,7 +860,15 @@ where
                     .filter(|record| record.source == source)
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if !records.is_empty() {
+            return Ok(records);
+        }
+        let Some(root) = &self.workspace_root else {
+            return Ok(Vec::new());
+        };
+        let cwd = root.join(session_workspace_dir_name(session_key));
+        read_context_artifacts_from_manifest(&cwd, source, Path::new(source))
     }
 
     async fn sync_context(&self, request: ContextSyncRequest) -> anyhow::Result<()> {

@@ -75,6 +75,11 @@ struct ContextManifest<'a> {
 
 #[derive(Debug, Deserialize)]
 struct ContextManifestSnapshot {
+    source: String,
+    session_key: String,
+    synced_at_ms: u64,
+    #[serde(default)]
+    artifacts: Vec<ContextArtifactRecord>,
     #[serde(default)]
     unresolved: Vec<ContextSyncIssueInput>,
 }
@@ -179,20 +184,6 @@ pub fn write_context_sync(
     std::fs::write(&manifest_path, &manifest_bytes)
         .with_context(|| format!("write context manifest {}", manifest_path.display()))?;
 
-    let mut manifest_metadata = BTreeMap::new();
-    manifest_metadata.insert("unresolved_count".to_string(), json!(unresolved.len()));
-    manifest_metadata.insert(
-        "unresolved".to_string(),
-        json!(
-            unresolved
-                .iter()
-                .map(|issue| json!({
-                    "kind": &issue.kind,
-                    "reference": &issue.reference,
-                }))
-                .collect::<Vec<_>>()
-        ),
-    );
     let manifest_record = ContextArtifactRecord {
         id: format!("{}:manifest", request.source),
         source: request.source,
@@ -202,7 +193,7 @@ pub fn write_context_sync(
         paths: vec![manifest_rel.display().to_string()],
         fingerprint: manifest_fingerprint,
         updated_at_ms: synced_at_ms,
-        metadata: manifest_metadata,
+        metadata: context_manifest_metadata(&unresolved),
     };
     let mut records = existing
         .iter()
@@ -218,6 +209,56 @@ pub fn write_context_sync(
             .then_with(|| left.id.cmp(&right.id))
     });
 
+    Ok(records)
+}
+
+pub fn read_context_artifacts_from_manifest(
+    cwd: &Path,
+    source: &str,
+    base_path: &Path,
+) -> anyhow::Result<Vec<ContextArtifactRecord>> {
+    validate_relative_path(base_path)?;
+    let manifest_rel = base_path.join("manifest.json");
+    validate_relative_path(&manifest_rel)?;
+    let manifest_path = cwd.join(&manifest_rel);
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("read context manifest {}", manifest_path.display()));
+        }
+    };
+    let snapshot = serde_json::from_slice::<ContextManifestSnapshot>(&bytes)
+        .with_context(|| format!("parse context manifest {}", manifest_path.display()))?;
+    if snapshot.source != source {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::with_capacity(snapshot.artifacts.len() + 1);
+    let manifest_fingerprint = context_manifest_fingerprint(
+        &snapshot.source,
+        &snapshot.session_key,
+        &snapshot.artifacts,
+        &snapshot.unresolved,
+    );
+    records.push(ContextArtifactRecord {
+        id: format!("{}:manifest", snapshot.source),
+        source: snapshot.source,
+        kind: "manifest".to_string(),
+        title: "Synced context manifest".to_string(),
+        source_locator: None,
+        paths: vec![manifest_rel.display().to_string()],
+        fingerprint: manifest_fingerprint,
+        updated_at_ms: snapshot.synced_at_ms,
+        metadata: context_manifest_metadata(&snapshot.unresolved),
+    });
+    records.extend(snapshot.artifacts);
+    records.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     Ok(records)
 }
 
@@ -283,6 +324,24 @@ fn merge_context_unresolved(
 
 fn context_issue_key(issue: &ContextSyncIssueInput) -> (String, String) {
     (issue.kind.clone(), issue.reference.clone())
+}
+
+fn context_manifest_metadata(unresolved: &[ContextSyncIssueInput]) -> BTreeMap<String, Value> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("unresolved_count".to_string(), json!(unresolved.len()));
+    metadata.insert(
+        "unresolved".to_string(),
+        json!(
+            unresolved
+                .iter()
+                .map(|issue| json!({
+                    "kind": &issue.kind,
+                    "reference": &issue.reference,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+    metadata
 }
 
 fn context_resolved_issue_keys(artifact: &ContextArtifactInput) -> Vec<(String, String)> {
