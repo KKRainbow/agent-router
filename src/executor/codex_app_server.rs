@@ -14,7 +14,7 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::{Mutex, broadcast, mpsc, oneshot},
     task::JoinHandle,
-    time::{Duration, Instant, sleep, timeout},
+    time::{Duration, sleep, timeout},
 };
 
 use crate::{
@@ -193,14 +193,12 @@ async fn wait_turn_cancelled(cancelled: ApprovalCancellation) {
 #[derive(Debug, Clone, Copy)]
 struct CodexRuntimeLimits {
     rpc_timeout: Duration,
-    idle_timeout: Duration,
 }
 
 impl Default for CodexRuntimeLimits {
     fn default() -> Self {
         Self {
             rpc_timeout: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -549,15 +547,10 @@ impl CodexAppServerSession {
             let mut turn_start_acknowledged = false;
             let mut turn_completed = false;
             let turn_start_timeout = sleep(self.limits.rpc_timeout);
-            let idle_timeout = sleep(self.limits.idle_timeout);
             tokio::pin!(turn_start_timeout);
-            tokio::pin!(idle_timeout);
             loop {
                 tokio::select! {
                 response = &mut turn_start.response, if !turn_start_acknowledged => {
-                    idle_timeout
-                        .as_mut()
-                        .reset(Instant::now() + self.limits.idle_timeout);
                     turn_start_acknowledged = true;
                     let result = json_rpc_result(&turn_start.method, response??)?;
                     if let Some(turn_id) = turn_id_from_turn_start_result(&result) {
@@ -572,15 +565,11 @@ impl CodexAppServerSession {
                 request = server_requests.recv() => {
                     match request {
                         Some(request) => {
-                            idle_timeout
-                                .as_mut()
-                                .reset(Instant::now() + self.limits.idle_timeout);
                             self.drain_ready_notifications(
                                 &mut notifications,
                                 &mut final_text,
                                 events,
                                 &mut turn_completed,
-                                &mut idle_timeout,
                             ).await?;
                             if turn_completed {
                                 if turn_start_acknowledged {
@@ -611,7 +600,6 @@ impl CodexAppServerSession {
                             &mut final_text,
                             events,
                             &mut turn_completed,
-                            &mut idle_timeout,
                         ).await?;
                         if turn_completed {
                             if turn_start_acknowledged {
@@ -627,23 +615,12 @@ impl CodexAppServerSession {
                                 self.limits.rpc_timeout.as_secs()
                             );
                         }
-                        if idle_timeout.as_ref().is_elapsed() {
-                            self.client.cancel_pending(turn_start.id).await;
-                            self.client.close("codex app-server idle timed out").await;
-                            anyhow::bail!(
-                                "codex app-server idle timed out after {}s without activity",
-                                self.limits.idle_timeout.as_secs()
-                            );
-                        }
                         write_json(&self.client.stdin, response).await?;
                     }
                 }
                 notification = notifications.recv() => {
                     match notification {
                         Some(notification) => {
-                            idle_timeout
-                                .as_mut()
-                                .reset(Instant::now() + self.limits.idle_timeout);
                             self.handle_notification(
                                 notification,
                                 &mut final_text,
@@ -671,14 +648,6 @@ impl CodexAppServerSession {
                         self.limits.rpc_timeout.as_secs()
                     );
                 }
-                _ = &mut idle_timeout => {
-                    self.client.cancel_pending(turn_start.id).await;
-                    self.client.close("codex app-server idle timed out").await;
-                    anyhow::bail!(
-                        "codex app-server idle timed out after {}s without activity",
-                        self.limits.idle_timeout.as_secs()
-                    );
-                }
                 }
             }
 
@@ -704,14 +673,10 @@ impl CodexAppServerSession {
         final_text: &mut String,
         events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
-        idle_timeout: &mut std::pin::Pin<&mut tokio::time::Sleep>,
     ) -> anyhow::Result<()> {
         for _ in 0..MAX_READY_NOTIFICATIONS_BEFORE_REQUEST {
             match notifications.try_recv() {
                 Ok(notification) => {
-                    idle_timeout
-                        .as_mut()
-                        .reset(Instant::now() + self.limits.idle_timeout);
                     self.handle_notification(notification, final_text, events, turn_completed)
                         .await?;
                 }
@@ -2452,7 +2417,6 @@ for line in sys.stdin:
             Arc::new(ApprovalBroker::default()),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_millis(50),
-                idle_timeout: Duration::from_secs(1),
             },
         );
         manager
@@ -2503,7 +2467,6 @@ for line in sys.stdin:
             Arc::new(ApprovalBroker::new(Duration::from_secs(5))),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_millis(100),
-                idle_timeout: Duration::from_secs(1),
             },
         );
         manager
@@ -2558,7 +2521,6 @@ for line in sys.stdin:
             Arc::new(ApprovalBroker::new(Duration::from_secs(5))),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_millis(100),
-                idle_timeout: Duration::from_secs(1),
             },
         );
         manager
@@ -2634,7 +2596,6 @@ for line in sys.stdin:
             approvals.clone(),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_secs(5),
-                idle_timeout: Duration::from_secs(5),
             },
         ));
         manager
@@ -2684,70 +2645,18 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn codex_turn_idle_timeout_returns_error_without_activity() {
+    async fn codex_turn_allows_silent_work_after_start() {
         let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("idle_codex.py");
+        let script = tmp.path().join("silent_codex.py");
         write_fake_codex_script(
             &script,
             r#"    elif method == "turn/start":
         send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-1"}}})
-"#,
-        );
-        let manager = CodexAppServerManager::with_limits(
-            executor_config(&script, tmp.path()),
-            Arc::new(ApprovalBroker::default()),
-            CodexRuntimeLimits {
-                rpc_timeout: Duration::from_secs(1),
-                idle_timeout: Duration::from_millis(50),
-            },
-        );
-        manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
-            .await
-            .unwrap();
-
-        let mut events = CollectingExecutorEventSink::default();
-        let err = manager
-            .prompt(
-                ExecutorPromptRequest {
-                    session_key: "session-1".to_string(),
-                    executor: "codex".to_string(),
-                    prompt: "idle".to_string(),
-                    user_id: Some("U1".to_string()),
-                },
-                &mut events,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("idle timed out"));
-        assert!(err.to_string().contains("without activity"));
-    }
-
-    #[tokio::test]
-    async fn codex_turn_idle_timeout_resets_on_notifications() {
-        let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("active_codex.py");
-        write_fake_codex_script(
-            &script,
-            r#"    elif method == "turn/start":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-1"}}})
-        for index in range(4):
-            time.sleep(0.08)
-            send({
-                "jsonrpc": "2.0",
-                "method": "item/completed",
-                "params": {"item": {"type": "reasoning", "summary": [{"text": f"still working {index}"}]}},
-            })
+        time.sleep(0.15)
         send({
             "jsonrpc": "2.0",
             "method": "item/completed",
-            "params": {"item": {"type": "agentMessage", "text": "done"}},
+            "params": {"item": {"type": "agentMessage", "text": "silent done"}},
         })
         send({
             "jsonrpc": "2.0",
@@ -2760,8 +2669,7 @@ for line in sys.stdin:
             executor_config(&script, tmp.path()),
             Arc::new(ApprovalBroker::default()),
             CodexRuntimeLimits {
-                rpc_timeout: Duration::from_secs(1),
-                idle_timeout: Duration::from_millis(200),
+                rpc_timeout: Duration::from_millis(50),
             },
         );
         manager
@@ -2780,7 +2688,7 @@ for line in sys.stdin:
                 ExecutorPromptRequest {
                     session_key: "session-1".to_string(),
                     executor: "codex".to_string(),
-                    prompt: "work slowly".to_string(),
+                    prompt: "work silently".to_string(),
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
@@ -2788,11 +2696,11 @@ for line in sys.stdin:
             .await
             .unwrap();
 
-        assert_eq!(response.final_text, "done");
+        assert_eq!(response.final_text, "silent done");
     }
 
     #[tokio::test]
-    async fn codex_drain_ready_notifications_resets_idle_timeout() {
+    async fn codex_drain_ready_notifications_collects_ready_updates() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fake_codex.py");
         write_fake_codex_script(&script, "");
@@ -2801,7 +2709,6 @@ for line in sys.stdin:
             Arc::new(ApprovalBroker::default()),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_secs(1),
-                idle_timeout: Duration::from_secs(5),
             },
         );
         manager
@@ -2823,8 +2730,6 @@ for line in sys.stdin:
         let mut events = CollectingExecutorEventSink::default();
         let mut final_text = String::new();
         let mut turn_completed = false;
-        let idle_timeout = sleep(Duration::from_millis(1));
-        tokio::pin!(idle_timeout);
 
         tx.send(json!({
             "method": "item/completed",
@@ -2838,13 +2743,12 @@ for line in sys.stdin:
                 &mut final_text,
                 &mut events,
                 &mut turn_completed,
-                &mut idle_timeout,
             )
             .await
             .unwrap();
 
         assert!(!turn_completed);
-        assert!(idle_timeout.deadline() > Instant::now() + Duration::from_secs(4));
+        assert_eq!(events.updates.len(), 1);
     }
 
     #[tokio::test]
