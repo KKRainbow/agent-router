@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -835,7 +835,7 @@ where
                 cwd
             }
         };
-        std::fs::create_dir_all(&cwd)?;
+        ensure_dir_path_without_symlinks(&cwd)?;
         let cwd = cwd.canonicalize().unwrap_or(cwd);
         state.cwd = Some(cwd.clone());
         Ok(Some(cwd))
@@ -1165,6 +1165,67 @@ fn session_workspace_dir_name(session_key: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("{prefix}-{hash}")
+}
+
+fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                anyhow::bail!(
+                    "session cwd must not contain parent components: {}",
+                    path.display()
+                );
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        anyhow::bail!("session cwd component is a symlink: {}", current.display());
+                    }
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        anyhow::bail!(
+                            "session cwd component is not a directory: {}",
+                            current.display()
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current).map_err(|err| {
+                            anyhow::anyhow!(
+                                "create session cwd directory {}: {}",
+                                current.display(),
+                                err
+                            )
+                        })?;
+                        let metadata = std::fs::symlink_metadata(&current).map_err(|err| {
+                            anyhow::anyhow!(
+                                "stat session cwd directory {}: {}",
+                                current.display(),
+                                err
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            metadata.is_dir() && !metadata.file_type().is_symlink(),
+                            "session cwd component is invalid after create: {}",
+                            current.display()
+                        );
+                    }
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "stat session cwd component {}: {}",
+                            current.display(),
+                            err
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1676,6 +1737,44 @@ mod tests {
             saved.executor_bindings["kimi"].cwd.as_deref(),
             Some(first_cwd_text.as_str())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_root_rejects_symlink_session_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let session_key = "slack:dm:D1:111.000";
+        symlink(
+            &outside,
+            workspace_root.join(session_workspace_dir_name(session_key)),
+        )
+        .unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router =
+            AgentRouter::new("kimi", store, executor).with_workspace_root(Some(workspace_root));
+        let mut output = CollectingRouterOutputSink::default();
+
+        let err = router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "hello".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        assert!(!outside.join("slack").exists());
     }
 
     #[test]
