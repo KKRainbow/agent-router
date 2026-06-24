@@ -2,6 +2,7 @@ mod turns;
 
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -437,6 +438,12 @@ struct PreparedContextSync {
     session_cwd: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextCommitCheckpoint {
+    AfterInstall,
+    AfterStateSave,
+}
+
 impl PreparedContextSync {
     async fn commit<S>(mut self, store: &S) -> anyhow::Result<()>
     where
@@ -456,15 +463,31 @@ impl PreparedContextSync {
         Ok(())
     }
 
-    async fn commit_if_current<S>(mut self, turn: &TurnGuard, store: &S) -> anyhow::Result<bool>
+    async fn commit_if_current<S>(self, turn: &TurnGuard, store: &S) -> anyhow::Result<bool>
     where
         S: SessionStore + ?Sized,
+    {
+        self.commit_if_current_with_hook(turn, store, |_| async {})
+            .await
+    }
+
+    async fn commit_if_current_with_hook<S, F, Fut>(
+        mut self,
+        turn: &TurnGuard,
+        store: &S,
+        mut hook: F,
+    ) -> anyhow::Result<bool>
+    where
+        S: SessionStore + ?Sized,
+        F: FnMut(ContextCommitCheckpoint) -> Fut,
+        Fut: Future<Output = ()>,
     {
         let cancel = turn.cancellation();
         if cancel.is_cancelled().await || !turn.is_current().await {
             return Ok(false);
         }
         let installed = self.plan.install()?;
+        hook(ContextCommitCheckpoint::AfterInstall).await;
         if cancel.is_cancelled().await || !turn.is_current().await {
             drop(installed);
             return Ok(false);
@@ -473,6 +496,7 @@ impl PreparedContextSync {
         let records = installed.records().to_vec();
         self.state.context_artifacts = records;
         store.save(self.state).await;
+        hook(ContextCommitCheckpoint::AfterStateSave).await;
         if cancel.is_cancelled().await || !turn.is_current().await {
             drop(installed);
             store.save(old_state).await;
@@ -1631,14 +1655,18 @@ mod tests {
         session::{
             TranscriptMessage,
             context::{
-                ContextArtifactInput, ContextFileContent, ContextFileInput, ContextSyncIssueInput,
+                ContextArtifactInput, ContextArtifactRemovalInput, ContextFileContent,
+                ContextFileInput, ContextSyncIssueInput,
             },
             projection::message_fingerprint,
             store::InMemorySessionStore,
         },
     };
     use serde_json::json;
-    use std::{collections::BTreeMap, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
+    };
 
     #[derive(Debug, Default)]
     struct CollectingRouterOutputSink {
@@ -1664,6 +1692,73 @@ mod tests {
                 RouterOutputEvent::Channel(_) => panic!("last router event was not final reply"),
             }
         }
+    }
+
+    fn slack_thread_context_request(session_key: &str, content: &str) -> ContextSyncRequest {
+        ContextSyncRequest {
+            session_key: session_key.to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "thread".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text(content.to_string()),
+                }],
+                metadata: Default::default(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        }
+    }
+
+    fn slack_thread_and_extra_context_request(
+        session_key: &str,
+        content: &str,
+    ) -> ContextSyncRequest {
+        let mut request = slack_thread_context_request(session_key, content);
+        request.artifacts.push(ContextArtifactInput {
+            id: "old-extra".to_string(),
+            kind: "slack_current_thread".to_string(),
+            title: "Old Extra".to_string(),
+            source_locator: None,
+            files: vec![ContextFileInput {
+                relative_path: PathBuf::from("slack/old-extra.md"),
+                content: ContextFileContent::Text("old extra context".to_string()),
+            }],
+            metadata: Default::default(),
+        });
+        request
+    }
+
+    fn slack_thread_replacement_context_request(
+        session_key: &str,
+        content: &str,
+    ) -> ContextSyncRequest {
+        let mut request = slack_thread_context_request(session_key, content);
+        request
+            .remove_artifacts
+            .push(ContextArtifactRemovalInput::ExceptKind {
+                kind: "slack_current_thread".to_string(),
+                retain_ids: BTreeSet::from(["thread".to_string()]),
+            });
+        request
+    }
+
+    fn assert_context_record_restored(saved: &SessionState, id: &str, path: &str) {
+        let record = saved
+            .context_artifacts
+            .iter()
+            .find(|record| {
+                record.source == "slack" && record.kind == "slack_current_thread" && record.id == id
+            })
+            .unwrap_or_else(|| panic!("missing restored context record {id}"));
+        assert_eq!(record.source, "slack");
+        assert_eq!(record.kind, "slack_current_thread");
+        assert_eq!(record.paths, vec![path.to_string()]);
     }
 
     #[tokio::test]
@@ -4054,6 +4149,128 @@ mod tests {
         let saved = store.load(session_key).await.unwrap();
         assert!(saved.context_artifacts.is_empty());
         assert_eq!(saved.transcript[0].content, "newer");
+    }
+
+    #[tokio::test]
+    async fn context_commit_rolls_back_files_when_turn_stale_after_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:C1:T1";
+        let cwd = workspace_root.join(session_workspace_dir_name(session_key));
+        let old_records = write_context_sync(
+            &cwd,
+            slack_thread_and_extra_context_request(session_key, "old context"),
+            &[],
+        )
+        .unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor)
+            .with_workspace_root(Some(workspace_root));
+        let mut state = SessionState::new(session_key, "kimi");
+        state.cwd = Some(cwd.clone());
+        state.context_artifacts = old_records;
+        store.save(state.clone()).await;
+        let turn = router
+            .turns
+            .begin(session_key, "kimi".to_string())
+            .await
+            .guard;
+        let prepared = router
+            .prepare_context_sync_locked(slack_thread_replacement_context_request(
+                session_key,
+                "new context",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_turn = turn.clone();
+
+        let committed = prepared
+            .commit_if_current_with_hook(&turn, store.as_ref(), move |checkpoint| {
+                let stale_turn = stale_turn.clone();
+                async move {
+                    if checkpoint == ContextCommitCheckpoint::AfterInstall {
+                        let _ = stale_turn.finish_if_current().await;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(!committed);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("slack/current-thread.md")).unwrap(),
+            "old context"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("slack/old-extra.md")).unwrap(),
+            "old extra context"
+        );
+        let saved = store.load(session_key).await.unwrap();
+        assert_context_record_restored(&saved, "thread", "slack/current-thread.md");
+        assert_context_record_restored(&saved, "old-extra", "slack/old-extra.md");
+    }
+
+    #[tokio::test]
+    async fn context_commit_restores_state_when_turn_stale_after_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:C1:T1";
+        let cwd = workspace_root.join(session_workspace_dir_name(session_key));
+        let old_records = write_context_sync(
+            &cwd,
+            slack_thread_and_extra_context_request(session_key, "old context"),
+            &[],
+        )
+        .unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor)
+            .with_workspace_root(Some(workspace_root));
+        let mut state = SessionState::new(session_key, "kimi");
+        state.cwd = Some(cwd.clone());
+        state.context_artifacts = old_records;
+        store.save(state.clone()).await;
+        let turn = router
+            .turns
+            .begin(session_key, "kimi".to_string())
+            .await
+            .guard;
+        let prepared = router
+            .prepare_context_sync_locked(slack_thread_replacement_context_request(
+                session_key,
+                "new context",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_turn = turn.clone();
+
+        let committed = prepared
+            .commit_if_current_with_hook(&turn, store.as_ref(), move |checkpoint| {
+                let stale_turn = stale_turn.clone();
+                async move {
+                    if checkpoint == ContextCommitCheckpoint::AfterStateSave {
+                        let _ = stale_turn.finish_if_current().await;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(!committed);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("slack/current-thread.md")).unwrap(),
+            "old context"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("slack/old-extra.md")).unwrap(),
+            "old extra context"
+        );
+        let saved = store.load(session_key).await.unwrap();
+        assert_context_record_restored(&saved, "thread", "slack/current-thread.md");
+        assert_context_record_restored(&saved, "old-extra", "slack/old-extra.md");
     }
 
     #[tokio::test]
