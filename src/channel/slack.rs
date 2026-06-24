@@ -839,11 +839,11 @@ impl SlackSocketModeChannel {
                 },
                 &linked_threads,
                 &downloaded_files,
-                SlackDerivedArtifactRetention {
-                    linked_thread_ids: retained_linked_thread_artifact_ids,
-                    file_ids: retained_file_artifact_ids,
-                    prune: prune_derived_artifacts,
-                },
+                SlackDerivedArtifactRetention::new(
+                    retained_linked_thread_artifact_ids,
+                    retained_file_artifact_ids,
+                    prune_derived_artifacts,
+                ),
                 remove_artifacts,
                 unresolved,
             ),
@@ -2055,11 +2055,11 @@ struct SlackDerivedArtifactRetention {
 }
 
 impl SlackDerivedArtifactRetention {
-    fn pruning(linked_thread_ids: BTreeSet<String>, file_ids: BTreeSet<String>) -> Self {
+    fn new(linked_thread_ids: BTreeSet<String>, file_ids: BTreeSet<String>, prune: bool) -> Self {
         Self {
             linked_thread_ids,
             file_ids,
-            prune: true,
+            prune,
         }
     }
 }
@@ -2128,13 +2128,15 @@ fn build_slack_context_request(
         retention
             .linked_thread_ids
             .insert(slack_linked_thread_artifact_id(
-            &linked_thread.link.channel,
-            &linked_thread.link.thread_ts,
-        ));
+                &linked_thread.link.channel,
+                &linked_thread.link.thread_ts,
+            ));
         artifacts.push(linked_thread_artifact(linked_thread));
     }
     if retention.prune {
-        remove_artifacts.push(slack_retained_linked_threads_removal(retention.linked_thread_ids));
+        remove_artifacts.push(slack_retained_linked_threads_removal(
+            retention.linked_thread_ids,
+        ));
     }
 
     for downloaded in downloaded_files {
@@ -2587,9 +2589,7 @@ mod tests {
             },
             &[],
             &[downloaded],
-            BTreeSet::new(),
-            BTreeSet::new(),
-            true,
+            SlackDerivedArtifactRetention::new(BTreeSet::new(), BTreeSet::new(), true),
             Vec::new(),
             Vec::new(),
         );
@@ -2650,9 +2650,7 @@ mod tests {
             },
             &[linked],
             &[downloaded],
-            BTreeSet::new(),
-            retained_files,
-            true,
+            SlackDerivedArtifactRetention::new(BTreeSet::new(), retained_files, true),
             Vec::new(),
             Vec::new(),
         );
@@ -2723,9 +2721,7 @@ mod tests {
             },
             &[linked],
             &[],
-            retained_linked_threads,
-            BTreeSet::new(),
-            true,
+            SlackDerivedArtifactRetention::new(retained_linked_threads, BTreeSet::new(), true),
             Vec::new(),
             Vec::new(),
         );
@@ -2757,9 +2753,7 @@ mod tests {
             },
             &[],
             &[],
-            BTreeSet::new(),
-            BTreeSet::new(),
-            false,
+            SlackDerivedArtifactRetention::new(BTreeSet::new(), BTreeSet::new(), false),
             Vec::new(),
             vec![ContextSyncIssueInput {
                 kind: "current_thread".to_string(),
@@ -3370,9 +3364,7 @@ mod tests {
             },
             &[linked],
             &[],
-            BTreeSet::new(),
-            BTreeSet::new(),
-            true,
+            SlackDerivedArtifactRetention::new(BTreeSet::new(), BTreeSet::new(), true),
             Vec::new(),
             Vec::new(),
         );
@@ -3436,9 +3428,7 @@ mod tests {
             },
             &[linked],
             &[],
-            BTreeSet::new(),
-            BTreeSet::new(),
-            true,
+            SlackDerivedArtifactRetention::new(BTreeSet::new(), BTreeSet::new(), true),
             Vec::new(),
             Vec::new(),
         );
