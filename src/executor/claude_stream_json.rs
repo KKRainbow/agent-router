@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -425,8 +425,12 @@ impl ClaudeStreamJsonManager {
     ) -> anyhow::Result<(SharedClaudeSession, bool)> {
         let key = (session_key.to_string(), executor.to_string());
         let existing = self.sessions.lock().await.get(&key).cloned();
-        if let Some(existing) = existing && existing.lock().await.is_alive() {
-            return Ok((existing, false));
+        if let Some(existing) = existing {
+            let guard = existing.lock().await;
+            if guard.is_alive() && guard.matches(cfg, &cwd) {
+                drop(guard);
+                return Ok((existing, false));
+            }
         }
         let session = Arc::new(Mutex::new(
             ClaudeSession::start(
@@ -582,9 +586,43 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
             Err(err) => return ExecutorPromptOutcome::Failed(err),
         };
         let session = session.lock().await;
-        session
+        let session_key = request.turn.session_key.clone();
+        let executor = request.turn.executor.clone();
+        let generation = request.turn.generation;
+        let prompt_len = request.prompt.len();
+        tracing::info!(
+            executor = %executor,
+            session_key = %session_key,
+            generation,
+            prompt_len,
+            "starting Claude stream-json turn"
+        );
+        let result = session
             .run_turn(&request.prompt, request.user_id, events, cancel)
-            .await
+            .await;
+        match &result {
+            ExecutorPromptOutcome::Completed(response) => tracing::info!(
+                executor = %executor,
+                session_key = %session_key,
+                generation,
+                final_text_len = response.final_text.len(),
+                "completed Claude stream-json turn"
+            ),
+            ExecutorPromptOutcome::Cancelled => tracing::info!(
+                executor = %executor,
+                session_key = %session_key,
+                generation,
+                "cancelled Claude stream-json turn"
+            ),
+            ExecutorPromptOutcome::Failed(err) => tracing::warn!(
+                error = %err,
+                executor = %executor,
+                session_key = %session_key,
+                generation,
+                "failed Claude stream-json turn"
+            ),
+        }
+        result
     }
 
     async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
@@ -709,6 +747,13 @@ impl ClaudeSession {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    pub fn matches(&self, cfg: &ExecutorConfig, cwd: &Path) -> bool {
+        self.cfg.command == cfg.command
+            && self.cfg.args == cfg.args
+            && self.cfg.env == cfg.env
+            && self.cwd == cwd
     }
 
     pub async fn send_prompt(&self, prompt: &str) -> anyhow::Result<()> {
@@ -956,6 +1001,7 @@ fn event_to_updates(event: ClaudeEvent) -> Vec<ExecutorUpdate> {
                 updates.push(ExecutorUpdate::new("result", "Result", text, ""));
             }
         }
+        // TODO(Task 8): wire up permission bridge for ControlRequest / ControlCancelRequest.
         ClaudeEvent::ControlRequest { .. } | ClaudeEvent::ControlCancelRequest { .. } => {}
     }
     updates
