@@ -38,8 +38,17 @@ pub struct ContextFileInput {
 
 #[derive(Debug, Clone)]
 pub enum ContextArtifactRemovalInput {
-    Exact { kind: String, id: String },
-    Kind { kind: String },
+    Exact {
+        kind: String,
+        id: String,
+    },
+    ExceptKind {
+        kind: String,
+        retain_ids: BTreeSet<String>,
+    },
+    Kind {
+        kind: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -127,11 +136,15 @@ pub fn write_context_sync(
         .cloned()
         .collect::<Vec<_>>();
     let mut removed_artifacts = BTreeSet::new();
+    let mut retained_artifacts_by_kind = BTreeMap::new();
     let mut removed_kinds = BTreeSet::new();
     for removal in request.remove_artifacts {
         match removal {
             ContextArtifactRemovalInput::Exact { kind, id } => {
                 removed_artifacts.insert((kind, id));
+            }
+            ContextArtifactRemovalInput::ExceptKind { kind, retain_ids } => {
+                retained_artifacts_by_kind.insert(kind, retain_ids);
             }
             ContextArtifactRemovalInput::Kind { kind } => {
                 removed_kinds.insert(kind);
@@ -139,8 +152,15 @@ pub fn write_context_sync(
         }
     }
     source_records.retain(|record| {
-        !removed_kinds.contains(&record.kind)
-            && !removed_artifacts.contains(&(record.kind.clone(), record.id.clone()))
+        if removed_kinds.contains(&record.kind)
+            || removed_artifacts.contains(&(record.kind.clone(), record.id.clone()))
+        {
+            return false;
+        }
+        if let Some(retain_ids) = retained_artifacts_by_kind.get(&record.kind) {
+            return retain_ids.contains(&record.id);
+        }
+        true
     });
     for record in &source_records {
         for path in &record.paths {
@@ -276,15 +296,30 @@ pub fn read_context_artifacts_from_manifest(
             snapshot.source,
             artifact.source
         );
+        let mut file_manifest = Vec::new();
         for path in &artifact.paths {
             validate_source_context_path(base_path, Path::new(path))?;
             let artifact_path = cwd.join(path);
-            anyhow::ensure!(
-                artifact_path.is_file(),
-                "context manifest artifact file is missing: {}",
-                artifact_path.display()
-            );
+            let bytes = std::fs::read(&artifact_path)
+                .with_context(|| format!("read context artifact {}", artifact_path.display()))?;
+            file_manifest.push(ContextFileManifest {
+                path: path.clone(),
+                size_bytes: bytes.len(),
+                sha256: sha256_hex(&bytes),
+            });
         }
+        let fingerprint = artifact_fingerprint(
+            &artifact.source,
+            &artifact.id,
+            &artifact.kind,
+            &file_manifest,
+            &artifact.metadata,
+        );
+        anyhow::ensure!(
+            fingerprint == artifact.fingerprint,
+            "context manifest artifact fingerprint mismatch: {}",
+            artifact.id
+        );
     }
     let mut records = Vec::with_capacity(snapshot.artifacts.len() + 1);
     let manifest_fingerprint = context_manifest_fingerprint(
@@ -770,6 +805,74 @@ mod tests {
     }
 
     #[test]
+    fn write_context_sync_removes_requested_kind_except_retained_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = vec![
+            ContextArtifactRecord {
+                id: "slack:linked-thread:C2:222.000".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_linked_thread".to_string(),
+                title: "Linked Slack thread".to_string(),
+                source_locator: None,
+                paths: vec!["slack/linked-threads/C2-222.000.md".to_string()],
+                fingerprint: "artifact:linked-retained".to_string(),
+                updated_at_ms: 1,
+                metadata: BTreeMap::new(),
+            },
+            ContextArtifactRecord {
+                id: "slack:linked-thread:C3:333.000".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_linked_thread".to_string(),
+                title: "Stale linked Slack thread".to_string(),
+                source_locator: None,
+                paths: vec!["slack/linked-threads/C3-333.000.md".to_string()],
+                fingerprint: "artifact:linked-stale".to_string(),
+                updated_at_ms: 1,
+                metadata: BTreeMap::new(),
+            },
+            ContextArtifactRecord {
+                id: "slack:file:F1".to_string(),
+                source: "slack".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Slack file F1".to_string(),
+                source_locator: None,
+                paths: vec!["slack/files/F1/metadata.json".to_string()],
+                fingerprint: "artifact:file".to_string(),
+                updated_at_ms: 1,
+                metadata: BTreeMap::new(),
+            },
+        ];
+        let retained = ["slack:linked-thread:C2:222.000".to_string()]
+            .into_iter()
+            .collect();
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: Vec::new(),
+            remove_artifacts: vec![ContextArtifactRemovalInput::ExceptKind {
+                kind: "slack_linked_thread".to_string(),
+                retain_ids: retained,
+            }],
+            unresolved: Vec::new(),
+        };
+
+        let records = write_context_sync(tmp.path(), request, &existing).unwrap();
+
+        assert!(
+            records
+                .iter()
+                .any(|record| record.id == "slack:linked-thread:C2:222.000")
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.id == "slack:linked-thread:C3:333.000")
+        );
+        assert!(records.iter().any(|record| record.id == "slack:file:F1"));
+    }
+
+    #[test]
     fn write_context_sync_preserves_and_resolves_unresolved_issues() {
         let tmp = tempfile::tempdir().unwrap();
         let failed = ContextSyncRequest {
@@ -1026,6 +1129,46 @@ mod tests {
                 "unresolved": []
             }))
             .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            read_context_artifacts_from_manifest(tmp.path(), "slack", "s1", Path::new("slack"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn read_context_artifacts_from_manifest_rejects_modified_artifact_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:file:F1".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Slack file F1".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/files/F1/metadata.json"),
+                    content: ContextFileContent::Text("{\"name\":\"one\"}".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        write_context_sync(tmp.path(), request, &[]).unwrap();
+
+        let records =
+            read_context_artifacts_from_manifest(tmp.path(), "slack", "s1", Path::new("slack"))
+                .unwrap();
+        assert!(records.iter().any(|record| record.id == "slack:file:F1"));
+
+        std::fs::write(
+            tmp.path().join("slack/files/F1/metadata.json"),
+            "{\"name\":\"two\"}",
         )
         .unwrap();
 

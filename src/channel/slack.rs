@@ -56,8 +56,8 @@ impl SlackSocketModeChannel {
 
     pub async fn run(self, router: Arc<dyn RouterService>) -> anyhow::Result<()> {
         self.validate_tokens()?;
-        let bot_user_id = self.auth_test().await?;
         let channel = Arc::new(self);
+        let bot_user_id = channel.auth_test_until_ready().await?;
         channel.clone().spawn_approval_notifier();
 
         loop {
@@ -118,6 +118,19 @@ impl SlackSocketModeChannel {
             }
         }
         Ok(())
+    }
+
+    async fn auth_test_until_ready(&self) -> anyhow::Result<String> {
+        loop {
+            match self.auth_test().await {
+                Ok(bot_user_id) => return Ok(bot_user_id),
+                Err(err) if slack_socket_error_is_fatal(&err) => return Err(err),
+                Err(err) => {
+                    tracing::warn!(error = %err, "Slack auth.test failed; retrying");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
+            }
+        }
     }
 
     fn spawn_approval_notifier(self: Arc<Self>) {
@@ -1951,9 +1964,13 @@ fn slack_current_thread_removal(channel: &str, thread_ts: &str) -> ContextArtifa
     }
 }
 
+fn slack_linked_thread_artifact_id(channel: &str, thread_ts: &str) -> String {
+    format!("slack:linked-thread:{channel}:{thread_ts}")
+}
+
 fn slack_linked_thread_removal(channel: &str, thread_ts: &str) -> ContextArtifactRemovalInput {
     ContextArtifactRemovalInput::Exact {
-        id: format!("slack:linked-thread:{channel}:{thread_ts}"),
+        id: slack_linked_thread_artifact_id(channel, thread_ts),
         kind: "slack_linked_thread".to_string(),
     }
 }
@@ -1961,6 +1978,26 @@ fn slack_linked_thread_removal(channel: &str, thread_ts: &str) -> ContextArtifac
 fn slack_all_linked_threads_removal() -> ContextArtifactRemovalInput {
     ContextArtifactRemovalInput::Kind {
         kind: "slack_linked_thread".to_string(),
+    }
+}
+
+fn slack_retained_linked_threads_removal(
+    retain_ids: BTreeSet<String>,
+) -> ContextArtifactRemovalInput {
+    ContextArtifactRemovalInput::ExceptKind {
+        kind: "slack_linked_thread".to_string(),
+        retain_ids,
+    }
+}
+
+fn slack_file_artifact_id(file_id: &str) -> String {
+    format!("slack:file:{file_id}")
+}
+
+fn slack_retained_files_removal(retain_ids: BTreeSet<String>) -> ContextArtifactRemovalInput {
+    ContextArtifactRemovalInput::ExceptKind {
+        kind: "slack_file".to_string(),
+        retain_ids,
     }
 }
 
@@ -1985,10 +2022,12 @@ fn build_slack_context_request(
     current_thread: CurrentSlackThreadContext<'_>,
     linked_threads: &[LinkedSlackThread],
     downloaded_files: &[DownloadedSlackFile],
+    mut retained_file_artifact_ids: BTreeSet<String>,
     remove_artifacts: Vec<ContextArtifactRemovalInput>,
     unresolved: Vec<ContextSyncIssueInput>,
 ) -> ContextSyncRequest {
     let mut artifacts = Vec::new();
+    let mut remove_artifacts = remove_artifacts;
     if !current_thread.messages.is_empty() {
         let mut metadata = BTreeMap::new();
         let channel = current_thread.channel;
@@ -2041,10 +2080,24 @@ fn build_slack_context_request(
         }
         artifacts.push(linked_thread_artifact(linked_thread));
     }
+    remove_artifacts.push(slack_retained_linked_threads_removal(
+        linked_threads
+            .iter()
+            .filter(|linked_thread| !linked_thread.messages.is_empty())
+            .map(|linked_thread| {
+                slack_linked_thread_artifact_id(
+                    &linked_thread.link.channel,
+                    &linked_thread.link.thread_ts,
+                )
+            })
+            .collect(),
+    ));
 
     for downloaded in downloaded_files {
+        retained_file_artifact_ids.insert(slack_file_artifact_id(&downloaded.file.id));
         artifacts.push(slack_file_artifact(downloaded));
     }
+    remove_artifacts.push(slack_retained_files_removal(retained_file_artifact_ids));
 
     ContextSyncRequest {
         session_key: session_key.to_string(),
@@ -2085,7 +2138,7 @@ fn linked_thread_artifact(linked_thread: &LinkedSlackThread) -> ContextArtifactI
         json!(linked_thread.messages.len()),
     );
     ContextArtifactInput {
-        id: format!("slack:linked-thread:{channel}:{thread_ts}"),
+        id: slack_linked_thread_artifact_id(channel, thread_ts),
         kind: "slack_linked_thread".to_string(),
         title: format!("Linked Slack thread {channel} {thread_ts}"),
         source_locator: Some(format!("slack://{channel}/{thread_ts}")),
@@ -2151,7 +2204,7 @@ fn slack_file_artifact(downloaded: &DownloadedSlackFile) -> ContextArtifactInput
     }
 
     ContextArtifactInput {
-        id: format!("slack:file:{}", downloaded.file.id),
+        id: slack_file_artifact_id(&downloaded.file.id),
         kind: "slack_file".to_string(),
         title: format!("Slack file {}", downloaded.file.name),
         source_locator: None,
@@ -2378,9 +2431,13 @@ mod tests {
             assert!(!slack_socket_error_is_fatal(&err), "{code}");
         }
 
+        let auth_invalid = anyhow::Error::new(SlackApiError::new("auth.test", "invalid_auth"));
+        let auth_rate_limited = anyhow::Error::new(SlackApiError::new("auth.test", "rate_limited"));
         let socket_reset =
             anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
 
+        assert!(slack_socket_error_is_fatal(&auth_invalid));
+        assert!(!slack_socket_error_is_fatal(&auth_rate_limited));
         assert!(!slack_socket_error_is_fatal(&socket_reset));
     }
 
@@ -2465,6 +2522,7 @@ mod tests {
             },
             &[],
             &[downloaded],
+            BTreeSet::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -2809,20 +2867,23 @@ mod tests {
                 assert_eq!(id, "slack:thread:C1:111.000");
                 assert_eq!(kind, "slack_current_thread");
             }
-            ContextArtifactRemovalInput::Kind { .. } => panic!("expected exact removal"),
+            ContextArtifactRemovalInput::ExceptKind { .. }
+            | ContextArtifactRemovalInput::Kind { .. } => panic!("expected exact removal"),
         }
         match linked {
             ContextArtifactRemovalInput::Exact { kind, id } => {
                 assert_eq!(id, "slack:linked-thread:C2:222.000");
                 assert_eq!(kind, "slack_linked_thread");
             }
-            ContextArtifactRemovalInput::Kind { .. } => panic!("expected exact removal"),
+            ContextArtifactRemovalInput::ExceptKind { .. }
+            | ContextArtifactRemovalInput::Kind { .. } => panic!("expected exact removal"),
         }
         match all_linked {
             ContextArtifactRemovalInput::Kind { kind } => {
                 assert_eq!(kind, "slack_linked_thread");
             }
-            ContextArtifactRemovalInput::Exact { .. } => panic!("expected kind removal"),
+            ContextArtifactRemovalInput::Exact { .. }
+            | ContextArtifactRemovalInput::ExceptKind { .. } => panic!("expected kind removal"),
         }
     }
 
@@ -3039,6 +3100,7 @@ mod tests {
             },
             &[linked],
             &[],
+            BTreeSet::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -3102,6 +3164,7 @@ mod tests {
             },
             &[linked],
             &[],
+            BTreeSet::new(),
             Vec::new(),
             Vec::new(),
         );

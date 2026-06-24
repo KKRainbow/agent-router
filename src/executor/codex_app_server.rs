@@ -139,7 +139,9 @@ impl CodexActiveEventStream {
             return false;
         }
         let Some(message_turn_id) = codex_message_turn_id(message) else {
-            return true;
+            return !codex_message_requires_turn_id(message)
+                && self.turn_id.is_none()
+                && completed_turn_ids.is_empty();
         };
         if completed_turn_ids
             .iter()
@@ -1549,6 +1551,17 @@ fn codex_message_turn_id(message: &Value) -> Option<&str> {
         })
 }
 
+fn codex_message_requires_turn_id(message: &Value) -> bool {
+    matches!(
+        message.get("method").and_then(Value::as_str).unwrap_or(""),
+        "item/started"
+            | "item/completed"
+            | "turn/completed"
+            | "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+    )
+}
+
 fn command_execution_summary(item: &Value) -> String {
     let command = item
         .get("command")
@@ -1913,7 +1926,33 @@ import json
 import sys
 import time
 
+THREAD_ID = "thread-1"
+TURN_ID = "turn-1"
+TURN_SCOPED_METHODS = {{
+    "item/started",
+    "item/completed",
+    "turn/completed",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "mcpServer/elicitation/request",
+}}
+
+def attach_turn_scope(payload):
+    method = payload.get("method")
+    params = payload.get("params")
+    if method not in TURN_SCOPED_METHODS or not isinstance(params, dict):
+        return payload
+    params.setdefault("threadId", THREAD_ID)
+    if method == "turn/completed":
+        turn = params.setdefault("turn", {{}})
+        if isinstance(turn, dict):
+            turn.setdefault("id", TURN_ID)
+    else:
+        params.setdefault("turnId", TURN_ID)
+    return payload
+
 def send(payload):
+    payload = attach_turn_scope(payload)
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
 
@@ -1930,7 +1969,7 @@ for line in sys.stdin:
     elif method == "initialized":
         pass
     elif method == "thread/start":
-        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"thread": {{"id": "thread-1"}}}}}})
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"thread": {{"id": THREAD_ID}}}}}})
 {behavior}
 "#
             ),
@@ -2871,6 +2910,19 @@ for line in sys.stdin:
                 "params": {
                     "threadId": "thread-1",
                     "turn": {"id": "turn-1", "status": "completed"},
+                },
+            }),
+            &state,
+            &event_streams,
+        )
+        .await;
+        dispatch_codex_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {"type": "agentMessage", "text": "unscoped stale"},
                 },
             }),
             &state,
