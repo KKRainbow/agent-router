@@ -331,11 +331,15 @@ impl QqBotChannel {
                 if !prompt_channel.approvals.has_pending(&prompt.id).await {
                     continue;
                 }
-                if let Err(err) = prompt_channel
-                    .send_session_message(&prompt.session_key, &prompt.render_text())
-                    .await
-                {
-                    tracing::warn!(error = %err, "failed to post QQ approval prompt");
+                let text = prompt.render_text();
+                tokio::select! {
+                    biased;
+                    _ = prompt.cancelled() => continue,
+                    result = prompt_channel.send_session_message(&prompt.session_key, &text) => {
+                        if let Err(err) = result {
+                            tracing::warn!(error = %err, "failed to post QQ approval prompt");
+                        }
+                    }
                 }
             }
         });

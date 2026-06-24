@@ -149,11 +149,15 @@ impl SlackSocketModeChannel {
                 if !prompt_channel.approvals.has_pending(&prompt.id).await {
                     continue;
                 }
-                if let Err(err) = prompt_channel
-                    .post_message(&target, &prompt.render_text())
-                    .await
-                {
-                    tracing::warn!(error = %err, "failed to post Slack approval prompt");
+                let text = prompt.render_text();
+                tokio::select! {
+                    biased;
+                    _ = prompt.cancelled() => continue,
+                    result = prompt_channel.post_message(&target, &text) => {
+                        if let Err(err) = result {
+                            tracing::warn!(error = %err, "failed to post Slack approval prompt");
+                        }
+                    }
                 }
             }
         });

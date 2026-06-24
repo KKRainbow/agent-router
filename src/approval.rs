@@ -79,9 +79,14 @@ pub struct ApprovalPrompt {
     pub requester_user_id: Option<String>,
     pub title: String,
     pub body: String,
+    cancellation: ApprovalCancellation,
 }
 
 impl ApprovalPrompt {
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
     pub fn render_text(&self) -> String {
         let mut lines = vec![
             format!("Approval required: {}", self.title),
@@ -297,6 +302,7 @@ impl ApprovalBroker {
             requester_user_id: request.requester_user_id.clone(),
             title: request.title.clone(),
             body: request.body.clone(),
+            cancellation: cancel.clone(),
         };
         {
             let mut state = self.state.lock().await;
