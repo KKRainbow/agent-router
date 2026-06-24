@@ -2541,6 +2541,82 @@ mod tests {
     }
 
     #[test]
+    fn slack_context_request_prunes_unretained_linked_threads_and_files() {
+        let current = SlackThreadMessage {
+            ts: "111.000".to_string(),
+            user: Some("U1".to_string()),
+            bot_id: None,
+            text: "root".to_string(),
+            files: Vec::new(),
+        };
+        let linked = LinkedSlackThread {
+            link: SlackThreadLink {
+                channel: "C2".to_string(),
+                thread_ts: "222.000".to_string(),
+                url: "https://example.slack.com/archives/C2/p222000000".to_string(),
+                source_message_ts: "111.000".to_string(),
+            },
+            fresh: true,
+            messages: vec![SlackThreadMessage {
+                ts: "222.000".to_string(),
+                user: Some("U2".to_string()),
+                bot_id: None,
+                text: "linked".to_string(),
+                files: Vec::new(),
+            }],
+        };
+        let downloaded = DownloadedSlackFile {
+            file: file_ref("F1"),
+            bytes: b"one".to_vec(),
+            extracted_text: Some("one".to_string()),
+        };
+        let mut retained_files = BTreeSet::new();
+        retained_files.insert(slack_file_artifact_id("F2"));
+
+        let request = build_slack_context_request(
+            "slack:channel:C1:111.000",
+            CurrentSlackThreadContext {
+                channel: "C1",
+                thread_ts: "111.000",
+                fresh: true,
+                messages: &[current],
+            },
+            &[linked],
+            &[downloaded],
+            retained_files,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let linked_retain_ids = request
+            .remove_artifacts
+            .iter()
+            .find_map(|removal| match removal {
+                ContextArtifactRemovalInput::ExceptKind { kind, retain_ids } => {
+                    (kind == "slack_linked_thread").then_some(retain_ids)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(linked_retain_ids.contains(&slack_linked_thread_artifact_id("C2", "222.000")));
+        assert!(!linked_retain_ids.contains(&slack_linked_thread_artifact_id("C3", "333.000")));
+
+        let file_retain_ids = request
+            .remove_artifacts
+            .iter()
+            .find_map(|removal| match removal {
+                ContextArtifactRemovalInput::ExceptKind { kind, retain_ids } => {
+                    (kind == "slack_file").then_some(retain_ids)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(file_retain_ids.contains(&slack_file_artifact_id("F1")));
+        assert!(file_retain_ids.contains(&slack_file_artifact_id("F2")));
+        assert!(!file_retain_ids.contains(&slack_file_artifact_id("F3")));
+    }
+
+    #[test]
     fn collect_context_file_refs_deduplicates_by_file_id() {
         let first = parse_slack_thread_message(json!({
             "ts": "111.000",
