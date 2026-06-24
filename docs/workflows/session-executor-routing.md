@@ -190,4 +190,4 @@ skill or model may provide routing hints later, but it should not own the
 routing state machine.
 
 The draft implementation plan is documented separately in
-`docs/workflows/default-executor-auto-routing.md`.
+`docs/workflows/orchestrator-initial-routing.md`.
