@@ -19,7 +19,7 @@ use crate::{
     session::{
         ApprovalMode, ContextSyncRequest, ExecutorBinding, ExecutorHealth, SessionState,
         TranscriptMessage,
-        context::{merge_context_artifacts, write_context_sync},
+        context::write_context_sync,
         projection::{
             ProjectionInput, build_context_projection, merge_seen_context,
             projected_assistant_content, visible_message_fingerprints,
@@ -209,6 +209,18 @@ pub trait RouterOutputSink: Send {
 pub trait RouterService: Send + Sync + 'static {
     async fn sync_context(&self, _request: ContextSyncRequest) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn handle_with_context(
+        &self,
+        input: RouterInput,
+        context: Option<ContextSyncRequest>,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        if let Some(context) = context {
+            self.sync_context(context).await?;
+        }
+        self.handle(input, output).await
     }
 
     async fn handle(
@@ -404,14 +416,17 @@ where
         };
         let session_key = request.session_key.clone();
         let source = request.source.clone();
-        let records = write_context_sync(&session_cwd, request)?;
+        let unresolved_count = request.unresolved.len();
+        let records = write_context_sync(&session_cwd, request, &state.context_artifacts)?;
         let record_count = records.len();
-        merge_context_artifacts(&mut state.context_artifacts, records);
+        state.context_artifacts = records;
         self.store.save(state).await;
         tracing::info!(
             session_key = %session_key,
             source = %source,
             context_records = record_count,
+            unresolved_count,
+            cwd = %session_cwd.display(),
             "synced session context artifacts"
         );
         Ok(())
@@ -743,6 +758,27 @@ where
         let lock = self.session_lock(&request.session_key).await;
         let _guard = lock.lock().await;
         self.sync_context_locked(request).await
+    }
+
+    async fn handle_with_context(
+        &self,
+        input: RouterInput,
+        context: Option<ContextSyncRequest>,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        if let Some(reply) = self
+            .approvals
+            .resolve_command(&input.session_key, &input.text, input.user_id.as_deref())
+            .await
+        {
+            return output.send_final_reply(reply.text).await;
+        }
+        let lock = self.session_lock(&input.session_key).await;
+        let _guard = lock.lock().await;
+        if let Some(context) = context {
+            self.sync_context_locked(context).await?;
+        }
+        self.handle_locked(input, output).await
     }
 
     async fn handle(
@@ -1429,24 +1465,33 @@ mod tests {
         let router = AgentRouter::new("kimi", store.clone(), executor.clone())
             .with_workspace_root(Some(workspace_root));
 
+        let mut output = CollectingRouterOutputSink::default();
         router
-            .sync_context(ContextSyncRequest {
-                session_key: "slack:channel:C1:111.000".to_string(),
-                source: "slack".to_string(),
-                base_path: PathBuf::from("slack"),
-                artifacts: vec![ContextArtifactInput {
-                    id: "slack:thread:C1:111.000".to_string(),
-                    kind: "slack_current_thread".to_string(),
-                    title: "Current Slack thread".to_string(),
-                    source_locator: Some("slack://C1/111.000".to_string()),
-                    files: vec![ContextFileInput {
-                        relative_path: PathBuf::from("slack/current-thread.md"),
-                        content: ContextFileContent::Text("thread history".to_string()),
+            .handle_with_context(
+                RouterInput {
+                    session_key: "slack:channel:C1:111.000".to_string(),
+                    text: "use the thread".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                Some(ContextSyncRequest {
+                    session_key: "slack:channel:C1:111.000".to_string(),
+                    source: "slack".to_string(),
+                    base_path: PathBuf::from("slack"),
+                    artifacts: vec![ContextArtifactInput {
+                        id: "slack:thread:C1:111.000".to_string(),
+                        kind: "slack_current_thread".to_string(),
+                        title: "Current Slack thread".to_string(),
+                        source_locator: Some("slack://C1/111.000".to_string()),
+                        files: vec![ContextFileInput {
+                            relative_path: PathBuf::from("slack/current-thread.md"),
+                            content: ContextFileContent::Text("thread history".to_string()),
+                        }],
+                        metadata: Default::default(),
                     }],
-                    metadata: Default::default(),
-                }],
-                unresolved: Vec::new(),
-            })
+                    unresolved: Vec::new(),
+                }),
+                &mut output,
+            )
             .await
             .unwrap();
 
@@ -1455,19 +1500,6 @@ mod tests {
         assert!(cwd.join("slack/current-thread.md").is_file());
         assert!(cwd.join("slack/manifest.json").is_file());
         assert_eq!(saved.context_artifacts.len(), 2);
-
-        let mut output = CollectingRouterOutputSink::default();
-        router
-            .handle(
-                RouterInput {
-                    session_key: "slack:channel:C1:111.000".to_string(),
-                    text: "use the thread".to_string(),
-                    user_id: Some("U1".to_string()),
-                },
-                &mut output,
-            )
-            .await
-            .unwrap();
 
         let prompts = executor.prompts.lock().await;
         assert!(prompts[0].prompt.contains("Synced session context files"));

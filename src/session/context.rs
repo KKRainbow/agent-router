@@ -83,10 +83,16 @@ struct ContextFileManifest {
 pub fn write_context_sync(
     cwd: &Path,
     request: ContextSyncRequest,
+    existing: &[ContextArtifactRecord],
 ) -> anyhow::Result<Vec<ContextArtifactRecord>> {
     let synced_at_ms = now_ms();
     validate_relative_path(&request.base_path)?;
-    let mut records = Vec::new();
+    let mut source_records = existing
+        .iter()
+        .filter(|record| record.source == request.source && record.kind != "manifest")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut updates = Vec::new();
 
     for artifact in request.artifacts {
         let mut path_records = Vec::new();
@@ -118,7 +124,7 @@ pub fn write_context_sync(
             &file_manifest,
             &artifact.metadata,
         );
-        records.push(ContextArtifactRecord {
+        updates.push(ContextArtifactRecord {
             id: artifact.id,
             source: request.source.clone(),
             kind: artifact.kind,
@@ -131,19 +137,21 @@ pub fn write_context_sync(
         });
     }
 
+    merge_context_artifacts(&mut source_records, updates);
+
     let manifest = ContextManifest {
         version: 1,
         source: &request.source,
         session_key: &request.session_key,
         synced_at_ms,
-        artifacts: &records,
+        artifacts: &source_records,
         unresolved: &request.unresolved,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     let manifest_fingerprint = context_manifest_fingerprint(
         &request.source,
         &request.session_key,
-        &records,
+        &source_records,
         &request.unresolved,
     );
     let manifest_rel = request.base_path.join("manifest.json");
@@ -160,20 +168,30 @@ pub fn write_context_sync(
         "unresolved_count".to_string(),
         json!(request.unresolved.len()),
     );
-    records.insert(
-        0,
-        ContextArtifactRecord {
-            id: format!("{}:manifest", request.source),
-            source: request.source,
-            kind: "manifest".to_string(),
-            title: "Synced context manifest".to_string(),
-            source_locator: None,
-            paths: vec![manifest_rel.display().to_string()],
-            fingerprint: manifest_fingerprint,
-            updated_at_ms: synced_at_ms,
-            metadata: manifest_metadata,
-        },
-    );
+    let manifest_record = ContextArtifactRecord {
+        id: format!("{}:manifest", request.source),
+        source: request.source,
+        kind: "manifest".to_string(),
+        title: "Synced context manifest".to_string(),
+        source_locator: None,
+        paths: vec![manifest_rel.display().to_string()],
+        fingerprint: manifest_fingerprint,
+        updated_at_ms: synced_at_ms,
+        metadata: manifest_metadata,
+    };
+    let mut records = existing
+        .iter()
+        .filter(|record| record.source != manifest_record.source)
+        .cloned()
+        .collect::<Vec<_>>();
+    records.push(manifest_record);
+    records.extend(source_records);
+    records.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 
     Ok(records)
 }
@@ -319,6 +337,56 @@ mod tests {
             unresolved: Vec::new(),
         };
 
-        assert!(write_context_sync(tmp.path(), request).is_err());
+        assert!(write_context_sync(tmp.path(), request, &[]).is_err());
+    }
+
+    #[test]
+    fn write_context_sync_manifest_includes_existing_source_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("thread".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            unresolved: Vec::new(),
+        };
+        let records = write_context_sync(tmp.path(), first, &[]).unwrap();
+        let second = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: Vec::new(),
+            unresolved: vec![ContextSyncIssueInput {
+                kind: "current_thread_cache".to_string(),
+                reference: "C1:111.000".to_string(),
+                reason: "rate_limited".to_string(),
+            }],
+        };
+
+        let records = write_context_sync(tmp.path(), second, &records).unwrap();
+        let manifest = std::fs::read_to_string(tmp.path().join("slack/manifest.json")).unwrap();
+        let manifest = serde_json::from_str::<Value>(&manifest).unwrap();
+
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == "slack_current_thread")
+        );
+        assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            manifest["artifacts"][0]["kind"].as_str(),
+            Some("slack_current_thread")
+        );
+        assert_eq!(manifest["unresolved"].as_array().unwrap().len(), 1);
     }
 }

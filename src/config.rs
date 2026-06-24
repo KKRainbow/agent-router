@@ -48,7 +48,13 @@ pub struct SlackConfig {
 #[derive(Debug, Clone)]
 pub struct SlackContextSyncConfig {
     pub enabled: bool,
+    pub current_thread: bool,
+    pub linked_threads: bool,
+    pub files: bool,
+    pub linked_thread_depth: usize,
     pub max_file_bytes: usize,
+    pub max_files_per_turn: usize,
+    pub max_linked_threads_per_turn: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +132,13 @@ struct FileSlackConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileSlackContextSyncConfig {
     enabled: Option<bool>,
+    current_thread: Option<bool>,
+    linked_threads: Option<bool>,
+    files: Option<bool>,
+    linked_thread_depth: Option<usize>,
     max_file_bytes: Option<usize>,
+    max_files_per_turn: Option<usize>,
+    max_linked_threads_per_turn: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -243,10 +255,18 @@ impl AppConfig {
                     .slack_context_sync_enabled
                     .or(slack_context_file.enabled)
                     .unwrap_or(workspace.root.is_some()),
+                current_thread: slack_context_file.current_thread.unwrap_or(true),
+                linked_threads: slack_context_file.linked_threads.unwrap_or(true),
+                files: slack_context_file.files.unwrap_or(true),
+                linked_thread_depth: slack_context_file.linked_thread_depth.unwrap_or(1),
                 max_file_bytes: env_cfg
                     .slack_context_sync_max_file_bytes
                     .or(slack_context_file.max_file_bytes)
                     .unwrap_or(10 * 1024 * 1024),
+                max_files_per_turn: slack_context_file.max_files_per_turn.unwrap_or(20),
+                max_linked_threads_per_turn: slack_context_file
+                    .max_linked_threads_per_turn
+                    .unwrap_or(10),
             },
             allowed_channels: env_cfg
                 .slack_allowed_channels
@@ -526,7 +546,13 @@ mod tests {
         assert!(!cfg.qq.enabled);
         assert_eq!(cfg.slack.channel_events, ChannelEventMode::Compact);
         assert!(!cfg.slack.context_sync.enabled);
+        assert!(cfg.slack.context_sync.current_thread);
+        assert!(cfg.slack.context_sync.linked_threads);
+        assert!(cfg.slack.context_sync.files);
+        assert_eq!(cfg.slack.context_sync.linked_thread_depth, 1);
         assert_eq!(cfg.slack.context_sync.max_file_bytes, 10 * 1024 * 1024);
+        assert_eq!(cfg.slack.context_sync.max_files_per_turn, 20);
+        assert_eq!(cfg.slack.context_sync.max_linked_threads_per_turn, 10);
         assert_eq!(cfg.qq.channel_events, ChannelEventMode::Compact);
     }
 
@@ -540,7 +566,13 @@ slack:
   channel_events: verbose
   context_sync:
     enabled: false
+    current_thread: true
+    linked_threads: false
+    files: true
+    linked_thread_depth: 0
     max_file_bytes: 4096
+    max_files_per_turn: 3
+    max_linked_threads_per_turn: 2
   allowed_channels: "C1,C2"
   free_response_channels: ["C3", "C4,C5"]
 executors:
@@ -555,7 +587,13 @@ executors:
         assert!(!cfg.slack.require_mention);
         assert_eq!(cfg.slack.channel_events, ChannelEventMode::Verbose);
         assert!(!cfg.slack.context_sync.enabled);
+        assert!(cfg.slack.context_sync.current_thread);
+        assert!(!cfg.slack.context_sync.linked_threads);
+        assert!(cfg.slack.context_sync.files);
+        assert_eq!(cfg.slack.context_sync.linked_thread_depth, 0);
         assert_eq!(cfg.slack.context_sync.max_file_bytes, 4096);
+        assert_eq!(cfg.slack.context_sync.max_files_per_turn, 3);
+        assert_eq!(cfg.slack.context_sync.max_linked_threads_per_turn, 2);
         assert_eq!(
             cfg.slack.allowed_channels,
             ["C1".to_string(), "C2".to_string()].into_iter().collect()
