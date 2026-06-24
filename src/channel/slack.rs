@@ -575,10 +575,8 @@ impl SlackSocketModeChannel {
         let mut linked_threads = Vec::new();
         if self.cfg.context_sync.linked_threads && self.cfg.context_sync.linked_thread_depth > 0 {
             let link_messages = context_link_messages(event, &messages);
-            for link in collect_slack_thread_links(&link_messages, &event.channel, &thread_ts)
-                .into_iter()
-                .take(self.cfg.context_sync.max_linked_threads_per_turn)
-            {
+            let mut linked_thread_fetches = 0usize;
+            for link in collect_slack_thread_links(&link_messages, &event.channel, &thread_ts) {
                 if !self.should_accept_channel(&link.channel) {
                     tracing::info!(
                         linked_channel = %link.channel,
@@ -593,6 +591,10 @@ impl SlackSocketModeChannel {
                     });
                     continue;
                 }
+                if linked_thread_fetches >= self.cfg.context_sync.max_linked_threads_per_turn {
+                    break;
+                }
+                linked_thread_fetches += 1;
                 tracing::info!(
                     linked_channel = %link.channel,
                     linked_thread_ts = %link.thread_ts,
@@ -606,6 +608,12 @@ impl SlackSocketModeChannel {
                     Ok(fetch) => {
                         let fresh = fetch.stale_reason.is_none();
                         if let Some(reason) = fetch.stale_reason {
+                            tracing::info!(
+                                linked_channel = %link.channel,
+                                linked_thread_ts = %link.thread_ts,
+                                reason = %reason,
+                                "using cached Slack linked thread context"
+                            );
                             unresolved.push(ContextSyncIssueInput {
                                 kind: "linked_thread_cache".to_string(),
                                 reference: link.url.clone(),
