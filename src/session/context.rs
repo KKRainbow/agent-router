@@ -125,29 +125,53 @@ impl ContextSyncPlan {
         self.records.len()
     }
 
-    pub fn commit(mut self) -> anyhow::Result<Vec<ContextArtifactRecord>> {
-        let mut installed = Vec::new();
+    pub fn commit(self) -> anyhow::Result<Vec<ContextArtifactRecord>> {
+        let installed = self.install()?;
+        let records = installed.records().to_vec();
+        installed.finish()?;
+        Ok(records)
+    }
+
+    pub fn install(mut self) -> anyhow::Result<InstalledContextSync> {
+        let mut removed_files = Vec::new();
+        if let Err(err) = stage_context_artifact_file_removals(
+            &self.cwd,
+            &self.base_path,
+            &self.removed_source_records,
+            &mut removed_files,
+        ) {
+            rollback_installed_context_files(&removed_files);
+            return Err(err);
+        }
+        if let Err(err) = stage_context_artifact_file_removals(
+            &self.cwd,
+            &self.base_path,
+            &self.replaced_source_records,
+            &mut removed_files,
+        ) {
+            rollback_installed_context_files(&removed_files);
+            return Err(err);
+        }
+
+        let mut installed_files = Vec::new();
         for staged in &self.staged_files {
             match staged.install() {
-                Ok(file) => installed.push(file),
+                Ok(file) => installed_files.push(file),
                 Err(err) => {
-                    rollback_installed_context_files(&installed);
+                    rollback_installed_context_files(&installed_files);
+                    rollback_installed_context_files(&removed_files);
                     return Err(err);
                 }
             }
         }
-        for file in &installed {
-            file.discard_backup();
-        }
-        let _ =
-            remove_context_artifact_files(&self.cwd, &self.base_path, &self.removed_source_records);
-        let _ = remove_context_artifact_files(
-            &self.cwd,
-            &self.base_path,
-            &self.replaced_source_records,
-        );
         self.committed = true;
-        Ok(std::mem::take(&mut self.records))
+        Ok(InstalledContextSync {
+            base_path_abs: self.cwd.join(&self.base_path),
+            records: std::mem::take(&mut self.records),
+            installed_files,
+            removed_files,
+            finalized: false,
+        })
     }
 }
 
@@ -159,6 +183,45 @@ impl Drop for ContextSyncPlan {
         for staged in &self.staged_files {
             staged.cleanup();
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct InstalledContextSync {
+    base_path_abs: PathBuf,
+    records: Vec<ContextArtifactRecord>,
+    installed_files: Vec<InstalledContextFile>,
+    removed_files: Vec<InstalledContextFile>,
+    finalized: bool,
+}
+
+impl InstalledContextSync {
+    pub fn records(&self) -> &[ContextArtifactRecord] {
+        &self.records
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        for file in &self.installed_files {
+            file.discard_backup();
+        }
+        for file in &self.removed_files {
+            file.discard_backup();
+        }
+        for file in self.installed_files.iter().chain(self.removed_files.iter()) {
+            prune_empty_context_dirs(file.target_path.parent(), &self.base_path_abs)?;
+        }
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for InstalledContextSync {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        rollback_installed_context_files(&self.installed_files);
+        rollback_installed_context_files(&self.removed_files);
     }
 }
 
@@ -735,12 +798,12 @@ fn context_dir_exists_without_symlink(cwd: &Path, relative_dir: &Path) -> std::i
     Ok(true)
 }
 
-fn remove_context_artifact_files(
+fn stage_context_artifact_file_removals(
     cwd: &Path,
     base_path: &Path,
     records: &[ContextArtifactRecord],
+    removed_files: &mut Vec<InstalledContextFile>,
 ) -> anyhow::Result<()> {
-    let base_abs = cwd.join(base_path);
     for record in records {
         for path in &record.paths {
             let relative_path = Path::new(path);
@@ -751,16 +814,27 @@ fn remove_context_artifact_files(
             if !context_dir_exists_without_symlink(cwd, parent_rel)? {
                 continue;
             }
-            let path = cwd.join(relative_path);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
+            let target_path = cwd.join(relative_path);
+            match std::fs::symlink_metadata(&target_path) {
+                Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                    let backup_path = unique_context_backup_path(&target_path)?;
+                    std::fs::rename(&target_path, &backup_path).with_context(|| {
+                        format!("stage removal of context file {}", target_path.display())
+                    })?;
+                    removed_files.push(InstalledContextFile {
+                        target_path,
+                        backup_path: Some(backup_path),
+                    });
+                }
+                Ok(_) => {
+                    anyhow::bail!("context path is not a file: {}", target_path.display());
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
                     return Err(err)
-                        .with_context(|| format!("remove context artifact {}", path.display()));
+                        .with_context(|| format!("stat context file {}", target_path.display()));
                 }
             }
-            prune_empty_context_dirs(path.parent(), &base_abs)?;
         }
     }
     Ok(())

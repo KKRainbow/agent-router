@@ -586,6 +586,19 @@ where
             .is_some_and(|turn| turn.generation == generation)
     }
 
+    async fn active_turn_cancel_if_current(
+        &self,
+        session_key: &str,
+        generation: u64,
+    ) -> Option<TurnCancellation> {
+        self.active_turns
+            .lock()
+            .await
+            .get(session_key)
+            .filter(|turn| turn.generation == generation)
+            .map(|turn| turn.cancel.clone())
+    }
+
     async fn adopt_preempted_turn(
         &self,
         session_key: &str,
@@ -724,18 +737,33 @@ where
         &self,
         session_key: &str,
         generation: u64,
+        cancel: &TurnCancellation,
         mut prepared: PreparedContextSync,
     ) -> anyhow::Result<bool> {
-        let active_turns = self.active_turns.lock().await;
-        let current = active_turns
-            .get(session_key)
-            .is_some_and(|turn| turn.generation == generation);
-        if !current {
+        if cancel.is_cancelled().await
+            || !self.active_turn_is_current(session_key, generation).await
+        {
             return Ok(false);
         }
-        let records = prepared.plan.commit()?;
+        let installed = prepared.plan.install()?;
+        if cancel.is_cancelled().await
+            || !self.active_turn_is_current(session_key, generation).await
+        {
+            drop(installed);
+            return Ok(false);
+        }
+        let old_state = prepared.state.clone();
+        let records = installed.records().to_vec();
         prepared.state.context_artifacts = records;
         self.store.save(prepared.state).await;
+        if cancel.is_cancelled().await
+            || !self.active_turn_is_current(session_key, generation).await
+        {
+            drop(installed);
+            self.store.save(old_state).await;
+            return Ok(false);
+        }
+        installed.finish()?;
         tracing::info!(
             session_key = %prepared.session_key,
             source = %prepared.source,
@@ -745,7 +773,6 @@ where
             generation,
             "synced session context artifacts"
         );
-        drop(active_turns);
         Ok(true)
     }
 
@@ -903,10 +930,44 @@ where
             }
             if let Some(context) = context {
                 if let Some(generation) = preempt_generation {
-                    if let Some(prepared) = self.prepare_context_sync_locked(context).await? {
-                        let committed = self
-                            .commit_context_sync_if_current(&session_key, generation, prepared)
-                            .await?;
+                    let Some(preempt_cancel) = self
+                        .active_turn_cancel_if_current(&session_key, generation)
+                        .await
+                    else {
+                        tracing::debug!(
+                            session_key = %session_key,
+                            generation,
+                            "discarded stale preempted router turn before context sync"
+                        );
+                        return Ok(());
+                    };
+                    let prepared = match self.prepare_context_sync_locked(context).await {
+                        Ok(prepared) => prepared,
+                        Err(err) => {
+                            let _ = self
+                                .take_active_turn_if_current(&session_key, generation)
+                                .await;
+                            return Err(err);
+                        }
+                    };
+                    if let Some(prepared) = prepared {
+                        let committed = match self
+                            .commit_context_sync_if_current(
+                                &session_key,
+                                generation,
+                                &preempt_cancel,
+                                prepared,
+                            )
+                            .await
+                        {
+                            Ok(committed) => committed,
+                            Err(err) => {
+                                let _ = self
+                                    .take_active_turn_if_current(&session_key, generation)
+                                    .await;
+                                return Err(err);
+                            }
+                        };
                         if !committed {
                             tracing::debug!(
                                 session_key = %session_key,
@@ -1080,7 +1141,13 @@ where
         });
 
         let (response, updates) = {
-            let mut executor_events = RouterExecutorEventSink::new(&executor_name, output);
+            let mut executor_events = RouterExecutorEventSink::new(
+                self,
+                &session_key,
+                generation,
+                &executor_name,
+                output,
+            );
             let response = self
                 .executor
                 .prompt(
@@ -1482,15 +1549,35 @@ where
     }
 }
 
-struct RouterExecutorEventSink<'a> {
+struct RouterExecutorEventSink<'a, S, E>
+where
+    S: SessionStore,
+    E: ExecutorBackend,
+{
+    router: &'a AgentRouter<S, E>,
+    session_key: &'a str,
+    generation: u64,
     executor: &'a str,
     output: &'a mut dyn RouterOutputSink,
     updates: Vec<ExecutorUpdate>,
 }
 
-impl<'a> RouterExecutorEventSink<'a> {
-    fn new(executor: &'a str, output: &'a mut dyn RouterOutputSink) -> Self {
+impl<'a, S, E> RouterExecutorEventSink<'a, S, E>
+where
+    S: SessionStore,
+    E: ExecutorBackend,
+{
+    fn new(
+        router: &'a AgentRouter<S, E>,
+        session_key: &'a str,
+        generation: u64,
+        executor: &'a str,
+        output: &'a mut dyn RouterOutputSink,
+    ) -> Self {
         Self {
+            router,
+            session_key,
+            generation,
             executor,
             output,
             updates: Vec::new(),
@@ -1503,9 +1590,18 @@ impl<'a> RouterExecutorEventSink<'a> {
 }
 
 #[async_trait]
-impl ExecutorEventSink for RouterExecutorEventSink<'_> {
+impl<S, E> ExecutorEventSink for RouterExecutorEventSink<'_, S, E>
+where
+    S: SessionStore,
+    E: ExecutorBackend,
+{
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
-        if let Some(event) = channel_event_from_executor_update(self.executor, &update) {
+        if let Some(event) = channel_event_from_executor_update(self.executor, &update)
+            && self
+                .router
+                .active_turn_is_current(self.session_key, self.generation)
+                .await
+        {
             self.output.send_channel_event(event);
         }
         self.updates.push(update);
@@ -3338,6 +3434,138 @@ mod tests {
         );
     }
 
+    struct EventAfterCancelExecutorBackend {
+        prompts: tokio::sync::Mutex<Vec<String>>,
+        first_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        first_cancelled: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl EventAfterCancelExecutorBackend {
+        fn new(
+            first_started: tokio::sync::oneshot::Sender<()>,
+            first_cancelled: tokio::sync::oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                prompts: tokio::sync::Mutex::new(Vec::new()),
+                first_started: tokio::sync::Mutex::new(Some(first_started)),
+                first_cancelled: tokio::sync::Mutex::new(Some(first_cancelled)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for EventAfterCancelExecutorBackend {
+        fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+            (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "fake".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+            Ok(crate::executor::PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.executor)),
+                started_new_session: request.previous_session_id.is_none(),
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            events: &mut dyn ExecutorEventSink,
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let prompt_index = {
+                let mut prompts = self.prompts.lock().await;
+                prompts.push(request.prompt);
+                prompts.len()
+            };
+            if prompt_index == 1 {
+                if let Some(started) = self.first_started.lock().await.take() {
+                    let _ = started.send(());
+                }
+                let _ = cancel.cancelled().await;
+                let _ = events
+                    .send(
+                        ExecutorUpdate::new("progress", "Progress", "stale progress", "")
+                            .with_channel_event(ExecutorChannelEvent::agent_progress(
+                                "stale progress",
+                            )),
+                    )
+                    .await;
+                if let Some(cancelled) = self.first_cancelled.lock().await.take() {
+                    let _ = cancelled.send(());
+                }
+                return ExecutorPromptOutcome::Cancelled;
+            }
+            ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
+                final_text: "response 2".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_turn_channel_events_are_suppressed_after_replacement() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(EventAfterCancelExecutorBackend::new(
+            started_tx,
+            cancelled_tx,
+        ));
+        let router = Arc::new(AgentRouter::new("kimi", store, executor));
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut second_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                &mut second_output,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = first.await.unwrap();
+
+        assert!(first_output.events.is_empty());
+        assert_eq!(second_output.final_reply(), "response 2");
+    }
+
     #[tokio::test]
     async fn unresolved_approval_command_does_not_interrupt_active_turn() {
         let store = Arc::new(InMemorySessionStore::default());
@@ -3511,6 +3739,55 @@ mod tests {
 
         assert_eq!(output.final_reply(), "No active turn for this session.");
         assert!(store.load("slack:C1:T1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn preempted_context_error_clears_placeholder_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:C1:T1";
+        let cwd = workspace_root.join(session_workspace_dir_name(session_key));
+        std::fs::create_dir_all(cwd.join("slack/current-thread.md")).unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router =
+            AgentRouter::new("kimi", store, executor).with_workspace_root(Some(workspace_root));
+        let generation = router.preempt(session_key).await.unwrap();
+        let mut output = CollectingRouterOutputSink::default();
+
+        let err = router
+            .handle_preempted_with_context(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                generation,
+                Some(ContextSyncRequest {
+                    session_key: session_key.to_string(),
+                    source: "slack".to_string(),
+                    base_path: PathBuf::from("slack"),
+                    artifacts: vec![ContextArtifactInput {
+                        id: "thread".to_string(),
+                        kind: "slack_current_thread".to_string(),
+                        title: "Thread".to_string(),
+                        source_locator: None,
+                        files: vec![ContextFileInput {
+                            relative_path: PathBuf::from("slack/current-thread.md"),
+                            content: ContextFileContent::Text("thread context".to_string()),
+                        }],
+                        metadata: Default::default(),
+                    }],
+                    remove_artifacts: Vec::new(),
+                    unresolved: Vec::new(),
+                }),
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("context path is not a file"));
+        assert!(!router.active_turns.lock().await.contains_key(session_key));
     }
 
     #[tokio::test]
