@@ -39,6 +39,9 @@ The repository already has part of this architecture:
   interface instead of passing raw generation values.
 - router context commit logic has started moving behind a guarded
   `PreparedContextSync` commit path.
+- Executor prepare, prompt, and interrupt requests now carry an
+  `ExecutorTurnRef` so backend adapters receive one Turn identity across the
+  per-Turn lifecycle.
 
 The remaining architectural work is still substantial:
 
@@ -48,8 +51,8 @@ The remaining architectural work is still substantial:
 - Executor adapters still need explicit Backend Session Manager boundaries;
 - ACP and Codex app-server still need protocol-level soft cancel semantics that
   do not destroy replacement-owned shared sessions;
-- stale context commit race coverage is incomplete until each transaction phase
-  has a targeted test.
+- context commit still lives in `src/router.rs` instead of a dedicated context
+  commit Module.
 
 That status matters because the right next step is not another local
 `is_current()` call. The right next step is to finish pushing ownership into the
@@ -836,36 +839,49 @@ Required tests:
 - ordinary text without pending approval does interrupt active Turn;
 - stale adapter cache updates cannot update router Session state.
 
-### Phase 4: Make Context Commit Turn-Guarded `[partial]`
+### Phase 4: Make Context Commit Turn-Guarded `[mostly implemented]`
 
 Already present:
 
 - context sync commit logic is localized in `PreparedContextSync`;
 - reserved context commit requires an adopted current `TurnGuard`;
 - route errors discard reserved placeholder Turns.
+- stale after file install rolls back files without saving new context state;
+- stale after Session state save rolls back files and restores old Session
+  state.
 
 Remaining work:
 
 - decide whether `PreparedContextSync` should move into a dedicated context
   commit Module instead of living in `src/router.rs`;
-- complete race tests for every transaction phase;
-- ensure old Session state is restored if the Turn becomes stale after state
-  save but before file finalization;
+- add any missing lower-level failed-install coverage that is not already
+  covered by `src/session/context.rs`;
 - keep context rollback semantics independent from Channel Adapter cache
   ordering.
 
 Required tests:
 
 - stale before install;
-- stale after install before state save;
-- stale after state save before finalization;
+- stale after install before state save `[covered]`;
+- stale after state save before finalization `[covered]`;
 - failed install restores replaced files and old state;
-- reserved context validation failure clears placeholder active Turns.
+- reserved context validation failure clears placeholder active Turns
+  `[covered]`.
 
-### Phase 5: Refactor Executor Backend Turn Interface `[pending]`
+### Phase 5: Refactor Executor Backend Turn Interface `[partial]`
 
-- Add `ExecutorTurnRef` or equivalent Turn reference to prepare, prompt, and
-  interrupt requests.
+Already present:
+
+- `ExecutorTurnRef` carries `session_key`, `executor`, and `generation`;
+- prepare, prompt, and interrupt request types carry `ExecutorTurnRef`;
+- router builds `ExecutorTurnRef` from `TurnGuard` and `InterruptedTurn`;
+- `ExecutorRegistry`, ACP, and Codex app-server route through
+  `request.turn.executor`;
+- router tests verify prepare and prompt share one Turn identity, and interrupt
+  carries the interrupted Turn identity.
+
+Remaining work:
+
 - Document prepare cancellation and Backend Session ownership contracts in
   `src/executor/mod.rs`.
 - Map cancelled prepare to a router cancellation outcome rather than generic
