@@ -279,9 +279,13 @@ impl ExecutorBackend for AcpExecutorManager {
         let Some(session) = session else {
             return Ok(());
         };
-        if let Ok(mut session) = session.try_lock() {
-            session.client.close("ACP turn interrupted").await;
-            session.session_id = None;
+        if let Ok(session) = session.try_lock()
+            && let Some(session_id) = session.session_id.as_deref()
+        {
+            session
+                .client
+                .notify("session/cancel", json!({ "sessionId": session_id }))
+                .await?;
         }
         Ok(())
     }
@@ -546,8 +550,6 @@ impl AcpSession {
             }
         }
         if acp_result_cancelled(&result) {
-            self.client.close("ACP turn returned cancelled").await;
-            self.session_id = None;
             return ExecutorPromptOutcome::Cancelled;
         }
         let final_text = if text_parts.is_empty() {
@@ -579,8 +581,6 @@ impl AcpSession {
             .notify("session/cancel", json!({ "sessionId": session_id }))
             .await;
         self.client.cancel_pending(request_id).await;
-        self.client.close("ACP turn cancelled").await;
-        self.session_id = None;
         if let Err(err) = notify_result {
             tracing::debug!(
                 target: "agent_router::acp",
@@ -1794,18 +1794,23 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn acp_prompt_cancellation_closes_session_boundary() {
+    async fn acp_prompt_cancellation_sends_soft_cancel_and_reuses_session() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("cancellable_acp.py");
         let prompt_marker = tmp.path().join("prompt_started");
+        let cancel_marker = tmp.path().join("cancel_received");
         let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
             .expect("prompt marker path serializes");
+        let cancel_marker_literal = serde_json::to_string(&cancel_marker.display().to_string())
+            .expect("cancel marker path serializes");
         fs::write(
             &script,
             format!(
                 r#"
 import json
 import sys
+
+cancelled = False
 
 def send(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
@@ -1822,11 +1827,18 @@ for line in sys.stdin:
     elif method == "session/new":
         send({{"jsonrpc": "2.0", "id": request_id, "result": {{"sessionId": "fake-session"}}}})
     elif method == "session/prompt":
-        with open({prompt_marker_literal}, "w") as f:
-            f.write("started")
-            f.flush()
+        prompt = "".join(item.get("text", "") for item in msg.get("params", {{}}).get("prompt", []))
+        if not cancelled:
+            with open({prompt_marker_literal}, "w") as f:
+                f.write("started")
+                f.flush()
+        else:
+            send({{"jsonrpc": "2.0", "id": request_id, "result": {{"stopReason": "end_turn", "content": [{{"type": "text", "text": "reply:" + prompt}}]}}}})
     elif method == "session/cancel":
-        pass
+        cancelled = True
+        with open({cancel_marker_literal}, "w") as f:
+            f.write("cancelled")
+            f.flush()
 "#
             ),
         )
@@ -1888,8 +1900,34 @@ for line in sys.stdin:
             prompt_task.await.unwrap(),
             ExecutorPromptOutcome::Cancelled
         ));
+        for _ in 0..50 {
+            if cancel_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(cancel_marker.exists());
         let session = manager.existing_session("session-1", "kimi").await.unwrap();
-        assert!(!session.lock().await.client.is_alive());
+        {
+            let session = session.lock().await;
+            assert!(session.client.is_alive());
+            assert_eq!(session.session_id.as_deref(), Some("fake-session"));
+        }
+
+        let mut events = CollectingExecutorEventSink::default();
+        let response = manager
+            .prompt(
+                ExecutorPromptRequest {
+                    turn: turn_ref("session-1", "kimi", 2),
+                    prompt: "after cancel".to_string(),
+                    user_id: None,
+                },
+                &mut events,
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.final_text, "reply:after cancel");
     }
 
     #[tokio::test]
