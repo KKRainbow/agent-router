@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod claude_stream_json;
 pub mod codex_app_server;
 pub mod registry;
 
