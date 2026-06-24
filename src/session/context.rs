@@ -128,7 +128,7 @@ impl ContextSyncPlan {
     pub fn commit(self) -> anyhow::Result<Vec<ContextArtifactRecord>> {
         let installed = self.install()?;
         let records = installed.records().to_vec();
-        installed.finish()?;
+        installed.finish();
         Ok(records)
     }
 
@@ -200,7 +200,8 @@ impl InstalledContextSync {
         &self.records
     }
 
-    pub fn finish(mut self) -> anyhow::Result<()> {
+    pub fn finish(mut self) {
+        self.finalized = true;
         for file in &self.installed_files {
             file.discard_backup();
         }
@@ -208,10 +209,8 @@ impl InstalledContextSync {
             file.discard_backup();
         }
         for file in self.installed_files.iter().chain(self.removed_files.iter()) {
-            prune_empty_context_dirs(file.target_path.parent(), &self.base_path_abs)?;
+            let _ = prune_empty_context_dirs(file.target_path.parent(), &self.base_path_abs);
         }
-        self.finalized = true;
-        Ok(())
     }
 }
 

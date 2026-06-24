@@ -763,7 +763,7 @@ where
             self.store.save(old_state).await;
             return Ok(false);
         }
-        installed.finish()?;
+        installed.finish();
         tracing::info!(
             session_key = %prepared.session_key,
             source = %prepared.source,
