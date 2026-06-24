@@ -1384,8 +1384,16 @@ where
             let _ = reservation.discard_if_current().await;
             return output.send_final_reply(reply.text).await;
         }
-        self.handle_input(input, Some(reservation), context, output)
+        match self
+            .handle_input(input, Some(reservation.clone()), context, output)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = reservation.discard_if_current().await;
+                Err(err)
+            }
+        }
     }
 
     async fn handle(
@@ -2239,6 +2247,122 @@ mod tests {
         let first_output = first.await.unwrap();
         assert_eq!(stop_output.final_reply(), "Stopped the active turn.");
         assert!(first_output.events.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reserved_cwd_validation_failure_clears_placeholder_turn() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let session_key = "slack:dm:D1:111.000";
+        let cwd = workspace_root.join(session_workspace_dir_name(session_key));
+        symlink(&outside, &cwd).unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router =
+            AgentRouter::new("kimi", store, executor).with_workspace_root(Some(workspace_root));
+        let reservation = router
+            .reserve_turn(session_key, TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut output = CollectingRouterOutputSink::default();
+
+        let err = router
+            .handle_reserved(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "hello".to_string(),
+                    user_id: None,
+                },
+                reservation,
+                None,
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        assert!(!router.turns.has_current(session_key).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reserved_cwd_validation_failure_does_not_leave_replacement_placeholder() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let session_key = "slack:dm:D1:111.000";
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(InterruptibleExecutorBackend::new(started_tx, cancelled_tx));
+        let router = Arc::new(
+            AgentRouter::new("kimi", store, executor)
+                .with_workspace_root(Some(workspace_root.clone())),
+        );
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let cwd = workspace_root.join(session_workspace_dir_name(session_key));
+        std::fs::remove_dir_all(&cwd).unwrap();
+        symlink(&outside, &cwd).unwrap();
+        let reservation = router
+            .reserve_turn(session_key, TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut output = CollectingRouterOutputSink::default();
+
+        let err = router
+            .handle_reserved(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                reservation,
+                None,
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        assert!(!router.turns.has_current(session_key).await);
+        assert!(first.await.unwrap().events.is_empty());
     }
 
     #[cfg(unix)]
