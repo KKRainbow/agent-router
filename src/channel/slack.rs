@@ -914,7 +914,7 @@ impl SlackSocketModeChannel {
                         cache
                             .threads
                             .get(&key)
-                            .map(|entry| entry.messages.clone())
+                            .and_then(|entry| entry.messages.clone())
                             .unwrap_or_default()
                     })
                 };
@@ -1124,7 +1124,7 @@ struct SlackContextCache {
 
 #[derive(Debug, Clone)]
 struct CachedSlackThreadMessages {
-    messages: Vec<SlackThreadMessage>,
+    messages: Option<Vec<SlackThreadMessage>>,
     generation: Option<u64>,
 }
 
@@ -1146,7 +1146,7 @@ fn upsert_thread_cache_if_current(
     cache.threads.insert(
         key,
         CachedSlackThreadMessages {
-            messages,
+            messages: Some(messages),
             generation,
         },
     );
@@ -1161,7 +1161,13 @@ fn remove_thread_cache_if_current(
     if thread_cache_entry_is_newer(cache.threads.get(key), generation) {
         return;
     }
-    cache.threads.remove(key);
+    cache.threads.insert(
+        key.to_string(),
+        CachedSlackThreadMessages {
+            messages: None,
+            generation,
+        },
+    );
 }
 
 fn thread_cache_entry_is_newer(
@@ -3194,13 +3200,13 @@ mod tests {
         channel.context_cache.lock().await.threads.insert(
             key.clone(),
             CachedSlackThreadMessages {
-                messages: vec![SlackThreadMessage {
+                messages: Some(vec![SlackThreadMessage {
                     ts: "111.000".to_string(),
                     user: Some("U1".to_string()),
                     bot_id: None,
                     text: "stale".to_string(),
                     files: Vec::new(),
-                }],
+                }]),
                 generation: None,
             },
         );
@@ -3245,13 +3251,13 @@ mod tests {
         channel.context_cache.lock().await.threads.insert(
             key.clone(),
             CachedSlackThreadMessages {
-                messages: vec![SlackThreadMessage {
+                messages: Some(vec![SlackThreadMessage {
                     ts: "111.000".to_string(),
                     user: Some("U1".to_string()),
                     bot_id: None,
                     text: "fresh context".to_string(),
                     files: Vec::new(),
-                }],
+                }]),
                 generation: Some(2),
             },
         );
@@ -3278,7 +3284,7 @@ mod tests {
         let cache = channel.context_cache.lock().await;
         let cached = cache.threads.get(&key).unwrap();
         assert_eq!(cached.generation, Some(2));
-        assert_eq!(cached.messages[0].text, "fresh context");
+        assert_eq!(cached.messages.as_ref().unwrap()[0].text, "fresh context");
     }
 
     #[tokio::test]
@@ -3291,13 +3297,13 @@ mod tests {
         channel.context_cache.lock().await.threads.insert(
             key.clone(),
             CachedSlackThreadMessages {
-                messages: vec![SlackThreadMessage {
+                messages: Some(vec![SlackThreadMessage {
                     ts: "111.000".to_string(),
                     user: Some("U1".to_string()),
                     bot_id: None,
                     text: "fresh context".to_string(),
                     files: Vec::new(),
-                }],
+                }]),
                 generation: Some(2),
             },
         );
@@ -3316,14 +3322,57 @@ mod tests {
                 .await;
 
         assert!(result.is_err());
-        assert!(
-            channel
-                .context_cache
-                .lock()
-                .await
-                .threads
-                .contains_key(&key)
+        let cache = channel.context_cache.lock().await;
+        let cached = cache.threads.get(&key).unwrap();
+        assert_eq!(cached.generation, Some(2));
+        assert!(cached.messages.is_some());
+    }
+
+    #[tokio::test]
+    async fn newer_context_cache_removal_blocks_older_successful_fetch() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
         );
+        let key = slack_thread_cache_key("C1", "111.000");
+        let newer_turn = SlackContextTurn { generation: 2 };
+        let stale_turn = SlackContextTurn { generation: 1 };
+
+        let removal =
+            channel
+                .fetch_thread_messages_cached_with(
+                    "C1",
+                    "111.000",
+                    async move {
+                        Err(SlackApiError::new("conversations.replies", "not_in_channel").into())
+                    },
+                    Some(&newer_turn),
+                )
+                .await;
+        assert!(removal.is_err());
+
+        let stale_message = SlackThreadMessage {
+            ts: "111.000".to_string(),
+            user: Some("U1".to_string()),
+            bot_id: None,
+            text: "stale context".to_string(),
+            files: Vec::new(),
+        };
+        let result = channel
+            .fetch_thread_messages_cached_with(
+                "C1",
+                "111.000",
+                async move { Ok(vec![stale_message]) },
+                Some(&stale_turn),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.messages.len(), 1);
+        let cache = channel.context_cache.lock().await;
+        let cached = cache.threads.get(&key).unwrap();
+        assert_eq!(cached.generation, Some(2));
+        assert!(cached.messages.is_none());
     }
 
     #[test]
