@@ -1,9 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    future::Future,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -11,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use tokio::{
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, broadcast, oneshot, watch},
     time,
 };
 
@@ -121,6 +120,52 @@ pub struct ApprovalCommandReply {
     pub text: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ApprovalCancellation {
+    inner: Arc<ApprovalCancellationInner>,
+}
+
+#[derive(Debug)]
+struct ApprovalCancellationInner {
+    cancelled: StdMutex<bool>,
+    changed: watch::Sender<bool>,
+}
+
+impl ApprovalCancellation {
+    pub fn new() -> Self {
+        let (changed, _) = watch::channel(false);
+        Self {
+            inner: Arc::new(ApprovalCancellationInner {
+                cancelled: StdMutex::new(false),
+                changed,
+            }),
+        }
+    }
+
+    pub fn cancel(&self) {
+        let mut cancelled = self.inner.cancelled.lock().unwrap();
+        if *cancelled {
+            return;
+        }
+        *cancelled = true;
+        let _ = self.inner.changed.send(true);
+    }
+
+    pub async fn cancelled(&self) {
+        let mut changed = self.inner.changed.subscribe();
+        if *changed.borrow() {
+            return;
+        }
+        let _ = changed.changed().await;
+    }
+}
+
+impl Default for ApprovalCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalDecision {
     Approve,
@@ -212,7 +257,7 @@ impl ApprovalBroker {
     }
 
     pub async fn request(&self, request: ApprovalRequest) -> ApprovalSelection {
-        self.request_until_cancelled(request, std::future::pending())
+        self.request_until_cancelled(request, ApprovalCancellation::new())
             .await
             .unwrap_or(ApprovalSelection::Cancelled)
     }
@@ -220,12 +265,11 @@ impl ApprovalBroker {
     pub async fn request_until_cancelled(
         &self,
         request: ApprovalRequest,
-        cancel: impl Future<Output = ()> + Send,
+        cancel: ApprovalCancellation,
     ) -> Option<ApprovalSelection> {
-        tokio::pin!(cancel);
         let auto_selection = tokio::select! {
             selection = self.policy.auto_selection(&request) => selection,
-            _ = &mut cancel => return None,
+            _ = cancel.cancelled() => return None,
         };
         if let Some(selection) = auto_selection {
             if let ApprovalSelection::Selected(option_id) = &selection {
@@ -237,12 +281,6 @@ impl ApprovalBroker {
                 });
             }
             return Some(selection);
-        }
-
-        tokio::select! {
-            biased;
-            _ = &mut cancel => return None,
-            _ = std::future::ready(()) => {}
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
@@ -257,6 +295,10 @@ impl ApprovalBroker {
         };
         {
             let mut state = self.state.lock().await;
+            let cancelled = cancel.inner.cancelled.lock().unwrap();
+            if *cancelled {
+                return None;
+            }
             state
                 .session_order
                 .entry(request.session_key.clone())
@@ -269,16 +311,9 @@ impl ApprovalBroker {
                     responder: tx,
                 },
             );
+            let _ = self.prompts.send(prompt);
+            drop(cancelled);
         }
-        tokio::select! {
-            biased;
-            _ = &mut cancel => {
-                self.remove_pending(&id).await;
-                return None;
-            }
-            _ = std::future::ready(()) => {}
-        }
-        let _ = self.prompts.send(prompt);
 
         let selection = tokio::select! {
             selection = time::timeout(self.timeout, rx) => {
@@ -287,7 +322,7 @@ impl ApprovalBroker {
                     Ok(Err(_)) | Err(_) => ApprovalSelection::Cancelled,
                 })
             }
-            _ = &mut cancel => None,
+            _ = cancel.cancelled() => None,
         };
         self.remove_pending(&id).await;
         selection
@@ -523,19 +558,18 @@ mod tests {
         let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
         let mut prompts = broker.subscribe();
         let request_broker = broker.clone();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let cancellation = ApprovalCancellation::new();
+        let request_cancellation = cancellation.clone();
         let pending = tokio::spawn(async move {
             request_broker
-                .request_until_cancelled(request("s1"), async {
-                    let _ = cancel_rx.await;
-                })
+                .request_until_cancelled(request("s1"), request_cancellation)
                 .await
         });
 
         let prompt = prompts.recv().await.unwrap();
         assert!(broker.has_pending_for_session("s1").await);
 
-        cancel_tx.send(()).unwrap();
+        cancellation.cancel();
 
         assert_eq!(pending.await.unwrap(), None);
         assert!(!broker.has_pending_for_session("s1").await);
@@ -555,7 +589,11 @@ mod tests {
         let mut prompts = broker.subscribe();
 
         let selection = broker
-            .request_until_cancelled(request("s1"), async {})
+            .request_until_cancelled(request("s1"), {
+                let cancellation = ApprovalCancellation::new();
+                cancellation.cancel();
+                cancellation
+            })
             .await;
 
         assert_eq!(selection, None);

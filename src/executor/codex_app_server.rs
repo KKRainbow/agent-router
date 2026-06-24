@@ -12,14 +12,15 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, broadcast, mpsc, oneshot, watch},
+    sync::{Mutex, broadcast, mpsc, oneshot},
     task::JoinHandle,
     time::{Duration, Instant, sleep, timeout},
 };
 
 use crate::{
     approval::{
-        ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection, SharedApprovalBroker,
+        ApprovalBroker, ApprovalCancellation, ApprovalOption, ApprovalRequest, ApprovalSelection,
+        SharedApprovalBroker,
     },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
@@ -37,21 +38,22 @@ type SharedStdin = Arc<Mutex<ChildStdin>>;
 const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
 
 struct CodexTurnScope {
-    cancelled: watch::Sender<bool>,
+    cancelled: ApprovalCancellation,
 }
 
 impl CodexTurnScope {
     fn new() -> Self {
-        let (cancelled, _) = watch::channel(false);
-        Self { cancelled }
+        Self {
+            cancelled: ApprovalCancellation::new(),
+        }
     }
 
-    fn subscribe(&self) -> watch::Receiver<bool> {
-        self.cancelled.subscribe()
+    fn subscribe(&self) -> ApprovalCancellation {
+        self.cancelled.clone()
     }
 
     fn cancel(&self) {
-        let _ = self.cancelled.send(true);
+        self.cancelled.cancel();
     }
 }
 
@@ -61,11 +63,8 @@ impl Drop for CodexTurnScope {
     }
 }
 
-async fn wait_turn_cancelled(mut cancelled: watch::Receiver<bool>) {
-    if *cancelled.borrow() {
-        return;
-    }
-    let _ = cancelled.changed().await;
+async fn wait_turn_cancelled(cancelled: ApprovalCancellation) {
+    cancelled.cancelled().await;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -588,7 +587,7 @@ impl CodexAppServerSession {
         message: Value,
         user_id: Option<String>,
         responses: mpsc::Sender<Value>,
-        turn_cancelled: watch::Receiver<bool>,
+        turn_cancelled: ApprovalCancellation,
     ) -> JoinHandle<()> {
         let approvals = self.approvals.clone();
         let session_key = self.session_key.clone();
@@ -634,7 +633,7 @@ impl CodexAppServerSession {
         user_id: Option<String>,
         message: Value,
         pending_file_change: Option<String>,
-        turn_cancelled: watch::Receiver<bool>,
+        turn_cancelled: ApprovalCancellation,
     ) -> anyhow::Result<Option<Value>> {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
@@ -650,7 +649,7 @@ impl CodexAppServerSession {
                     pending_file_change,
                 );
                 let Some(selection) = approvals
-                    .request_until_cancelled(request, wait_turn_cancelled(turn_cancelled))
+                    .request_until_cancelled(request, turn_cancelled)
                     .await
                 else {
                     return Ok(None);
