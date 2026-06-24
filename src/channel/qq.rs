@@ -866,10 +866,34 @@ impl std::error::Error for QqSendMessageError {}
 
 fn qq_error_allows_text_fallback(err: &anyhow::Error) -> bool {
     err.downcast_ref::<QqSendMessageError>().is_some_and(|err| {
-        let body = err.body.to_ascii_lowercase();
         err.status == StatusCode::BAD_REQUEST
-            && (body.contains("markdown") || body.contains("invalid") || body.contains("11255"))
+            && qq_error_body_is_markdown_payload_rejection(&err.body)
     })
+}
+
+fn qq_error_body_is_markdown_payload_rejection(body: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if value
+            .get("code")
+            .or_else(|| value.get("err_code"))
+            .and_then(value_as_u64)
+            == Some(11255)
+        {
+            return true;
+        }
+        let message = ["message", "msg", "error"]
+            .into_iter()
+            .filter_map(|key| value.get(key).and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        return message.contains("markdown")
+            || message.contains("msg_type")
+            || message.contains("body");
+    }
+
+    let body = body.to_ascii_lowercase();
+    body.contains("markdown") || body.contains("msg_type") || body.contains("\"code\":11255")
 }
 
 #[cfg(test)]
@@ -997,6 +1021,18 @@ mod tests {
             body: r#"{"message":"msg limit exceed"}"#.to_string(),
         });
         assert!(!qq_error_allows_text_fallback(&rate_limited));
+
+        let invalid_msg_seq = anyhow::Error::new(QqSendMessageError {
+            status: StatusCode::BAD_REQUEST,
+            body: r#"{"message":"invalid msg_seq"}"#.to_string(),
+        });
+        assert!(!qq_error_allows_text_fallback(&invalid_msg_seq));
+
+        let invalid_markdown_message = anyhow::Error::new(QqSendMessageError {
+            status: StatusCode::BAD_REQUEST,
+            body: r#"{"message":"invalid markdown body"}"#.to_string(),
+        });
+        assert!(qq_error_allows_text_fallback(&invalid_markdown_message));
     }
 
     #[tokio::test]
