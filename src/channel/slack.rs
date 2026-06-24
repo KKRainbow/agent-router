@@ -262,11 +262,12 @@ impl SlackSocketModeChannel {
             return Ok(());
         }
         let command = text.split_whitespace().next().unwrap_or("");
-        let preempt_generation = if matches!(command, "/stop" | "/agent" | "/yolo") {
-            None
-        } else {
-            Some(router.preempt(&session_key).await?)
-        };
+        let preempt_generation =
+            if approval_command || matches!(command, "/stop" | "/agent" | "/yolo") {
+                None
+            } else {
+                Some(router.preempt(&session_key).await?)
+            };
         tracing::info!(
             channel = %event.channel,
             user_id = %event.user,
@@ -2385,10 +2386,17 @@ mod tests {
     struct RecordingRouter {
         handled: Mutex<Vec<RouterInput>>,
         observed: Mutex<Vec<RouterInput>>,
+        preempted: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
     impl RouterService for RecordingRouter {
+        async fn preempt(&self, session_key: &str) -> anyhow::Result<u64> {
+            let mut preempted = self.preempted.lock().await;
+            preempted.push(session_key.to_string());
+            Ok(preempted.len() as u64)
+        }
+
         async fn handle(
             &self,
             input: RouterInput,
@@ -3549,6 +3557,35 @@ mod tests {
         let observed = router.observed.lock().await;
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].text, "/approve 1");
+    }
+
+    #[tokio::test]
+    async fn routed_approval_text_without_pending_does_not_preempt() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+        let event = SlackMessageEvent {
+            event_key: "Ev1".to_string(),
+            channel: "D1".to_string(),
+            user: "U1".to_string(),
+            text: "/approve 1".to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+            files: Vec::new(),
+        };
+
+        channel
+            .handle_message_event(event, router_service, "BOT")
+            .await
+            .unwrap();
+
+        assert!(router.preempted.lock().await.is_empty());
+        let handled = router.handled.lock().await;
+        assert_eq!(handled.len(), 1);
+        assert_eq!(handled[0].text, "/approve 1");
     }
 
     #[tokio::test]
