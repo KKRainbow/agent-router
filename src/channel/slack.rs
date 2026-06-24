@@ -812,8 +812,22 @@ impl SlackSocketModeChannel {
         channel: &str,
         thread_ts: &str,
     ) -> anyhow::Result<SlackThreadFetch> {
+        self.fetch_thread_messages_cached_with(
+            channel,
+            thread_ts,
+            self.fetch_thread_messages(channel, thread_ts),
+        )
+        .await
+    }
+
+    async fn fetch_thread_messages_cached_with(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        fetch: impl std::future::Future<Output = anyhow::Result<Vec<SlackThreadMessage>>>,
+    ) -> anyhow::Result<SlackThreadFetch> {
         let key = slack_thread_cache_key(channel, thread_ts);
-        match self.fetch_thread_messages(channel, thread_ts).await {
+        match fetch.await {
             Ok(messages) => {
                 self.context_cache
                     .lock()
@@ -1794,10 +1808,12 @@ fn is_router_noise_message(text: &str) -> bool {
     let Some((_, rest)) = rest.split_once("] ") else {
         return false;
     };
-    rest.starts_with("Activity")
-        || rest.starts_with("Tool call")
-        || rest.starts_with("Progress")
-        || rest.starts_with("Reasoning summary")
+    let title = rest.lines().next().unwrap_or("").trim();
+    title == "Activity"
+        || title == "Progress"
+        || title == "Reasoning summary"
+        || title == "Tool call"
+        || title.starts_with("Tool call: ")
 }
 
 fn slack_thread_cache_key(channel: &str, thread_ts: &str) -> String {
@@ -2588,6 +2604,49 @@ mod tests {
         assert!(!denied_cache_read);
     }
 
+    #[tokio::test]
+    async fn transient_thread_errors_do_not_use_cache_cleared_during_fetch() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let key = slack_thread_cache_key("C1", "111.000");
+        channel.context_cache.lock().await.threads.insert(
+            key.clone(),
+            vec![SlackThreadMessage {
+                ts: "111.000".to_string(),
+                user: Some("U1".to_string()),
+                bot_id: None,
+                text: "stale".to_string(),
+                files: Vec::new(),
+            }],
+        );
+        let channel_for_fetch = channel.clone();
+        let key_for_fetch = key.clone();
+
+        let result = channel
+            .fetch_thread_messages_cached_with("C1", "111.000", async move {
+                channel_for_fetch
+                    .context_cache
+                    .lock()
+                    .await
+                    .threads
+                    .remove(&key_for_fetch);
+                Err(SlackApiError::new("conversations.replies", "rate_limited").into())
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !channel
+                .context_cache
+                .lock()
+                .await
+                .threads
+                .contains_key(&key)
+        );
+    }
+
     #[test]
     fn access_denied_thread_removals_target_prior_artifacts() {
         let current = slack_current_thread_removal("C1", "111.000");
@@ -2719,12 +2778,20 @@ mod tests {
                 text: "[codex] Progress\nI will inspect the config first.".to_string(),
                 files: Vec::new(),
             },
+            SlackThreadMessage {
+                ts: "114.000".to_string(),
+                user: Some("BOT".to_string()),
+                bot_id: Some("B_SELF".to_string()),
+                text: "[codex] Progress report for the release".to_string(),
+                files: Vec::new(),
+            },
         ];
 
         let filtered = filter_context_messages(messages, "BOT");
 
-        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].text, "root from another bot");
+        assert_eq!(filtered[1].text, "[codex] Progress report for the release");
     }
 
     #[test]
