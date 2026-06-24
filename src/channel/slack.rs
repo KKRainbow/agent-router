@@ -1439,6 +1439,12 @@ impl SlackApiError {
                 | "invalid_auth"
                 | "account_inactive"
                 | "token_revoked"
+                | "not_allowed_token_type"
+                | "token_expired"
+                | "team_access_not_granted"
+                | "access_denied"
+                | "no_permission"
+                | "forbidden_team"
         )
     }
 
@@ -3005,15 +3011,29 @@ mod tests {
 
     #[test]
     fn access_denied_thread_errors_do_not_reuse_cached_context() {
-        let denied = anyhow::Error::new(SlackApiError::new(
-            "conversations.replies",
+        for code in [
             "not_in_channel",
-        ));
+            "channel_not_found",
+            "missing_scope",
+            "not_authed",
+            "invalid_auth",
+            "account_inactive",
+            "token_revoked",
+            "not_allowed_token_type",
+            "token_expired",
+            "team_access_not_granted",
+            "access_denied",
+            "no_permission",
+            "forbidden_team",
+        ] {
+            let denied = anyhow::Error::new(SlackApiError::new("conversations.replies", code));
+            assert!(!slack_error_allows_cached_context(&denied), "{code}");
+            assert!(slack_error_clears_thread_cache(&denied), "{code}");
+        }
+
         let rate_limited =
             anyhow::Error::new(SlackApiError::new("conversations.replies", "rate_limited"));
 
-        assert!(!slack_error_allows_cached_context(&denied));
-        assert!(slack_error_clears_thread_cache(&denied));
         assert!(slack_error_allows_cached_context(&rate_limited));
         assert!(!slack_error_clears_thread_cache(&rate_limited));
 
