@@ -40,8 +40,15 @@ pub struct SlackConfig {
     pub app_token: String,
     pub require_mention: bool,
     pub channel_events: ChannelEventMode,
+    pub context_sync: SlackContextSyncConfig,
     pub allowed_channels: BTreeSet<String>,
     pub free_response_channels: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlackContextSyncConfig {
+    pub enabled: bool,
+    pub max_file_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -111,8 +118,15 @@ struct FileSlackConfig {
     app_token: Option<String>,
     require_mention: Option<bool>,
     channel_events: Option<String>,
+    context_sync: Option<FileSlackContextSyncConfig>,
     allowed_channels: Option<StringList>,
     free_response_channels: Option<StringList>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSlackContextSyncConfig {
+    enabled: Option<bool>,
+    max_file_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -197,6 +211,7 @@ impl AppConfig {
         };
 
         let slack_file = file_cfg.slack.unwrap_or_default();
+        let slack_context_file = slack_file.context_sync.unwrap_or_default();
         let slack_bot_token = env_cfg
             .slack_bot_token
             .or(slack_file.bot_token)
@@ -223,6 +238,16 @@ impl AppConfig {
                 .map(|value| parse_channel_event_mode("slack.channel_events", &value))
                 .transpose()?
                 .unwrap_or(ChannelEventMode::Compact),
+            context_sync: SlackContextSyncConfig {
+                enabled: env_cfg
+                    .slack_context_sync_enabled
+                    .or(slack_context_file.enabled)
+                    .unwrap_or(workspace.root.is_some()),
+                max_file_bytes: env_cfg
+                    .slack_context_sync_max_file_bytes
+                    .or(slack_context_file.max_file_bytes)
+                    .unwrap_or(10 * 1024 * 1024),
+            },
             allowed_channels: env_cfg
                 .slack_allowed_channels
                 .or_else(|| slack_file.allowed_channels.map(StringList::into_set))
@@ -314,6 +339,8 @@ struct EnvConfig {
     slack_app_token: Option<String>,
     slack_require_mention: Option<bool>,
     slack_channel_events: Option<String>,
+    slack_context_sync_enabled: Option<bool>,
+    slack_context_sync_max_file_bytes: Option<usize>,
     slack_allowed_channels: Option<BTreeSet<String>>,
     slack_free_response_channels: Option<BTreeSet<String>>,
     qq_enabled: Option<bool>,
@@ -337,6 +364,8 @@ impl EnvConfig {
             slack_app_token: nonempty_env("SLACK_APP_TOKEN"),
             slack_require_mention: env_bool("SLACK_REQUIRE_MENTION"),
             slack_channel_events: nonempty_env("SLACK_CHANNEL_EVENTS"),
+            slack_context_sync_enabled: env_bool("SLACK_CONTEXT_SYNC_ENABLED"),
+            slack_context_sync_max_file_bytes: env_usize("SLACK_CONTEXT_SYNC_MAX_FILE_BYTES"),
             slack_allowed_channels: env_set("SLACK_ALLOWED_CHANNELS"),
             slack_free_response_channels: env_set("SLACK_FREE_RESPONSE_CHANNELS"),
             qq_enabled: env_bool("QQ_ENABLED").or_else(|| env_bool("QQBOT_ENABLED")),
@@ -461,6 +490,12 @@ fn env_u64(name: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+fn env_usize(name: &str) -> Option<usize> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
 fn env_set(name: &str) -> Option<BTreeSet<String>> {
     env::var(name).ok().map(|value| split_csv(&value))
 }
@@ -490,6 +525,8 @@ mod tests {
         assert!(!cfg.slack.enabled);
         assert!(!cfg.qq.enabled);
         assert_eq!(cfg.slack.channel_events, ChannelEventMode::Compact);
+        assert!(!cfg.slack.context_sync.enabled);
+        assert_eq!(cfg.slack.context_sync.max_file_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.qq.channel_events, ChannelEventMode::Compact);
     }
 
@@ -501,6 +538,9 @@ router:
 slack:
   require_mention: false
   channel_events: verbose
+  context_sync:
+    enabled: false
+    max_file_bytes: 4096
   allowed_channels: "C1,C2"
   free_response_channels: ["C3", "C4,C5"]
 executors:
@@ -514,6 +554,8 @@ executors:
 
         assert!(!cfg.slack.require_mention);
         assert_eq!(cfg.slack.channel_events, ChannelEventMode::Verbose);
+        assert!(!cfg.slack.context_sync.enabled);
+        assert_eq!(cfg.slack.context_sync.max_file_bytes, 4096);
         assert_eq!(
             cfg.slack.allowed_channels,
             ["C1".to_string(), "C2".to_string()].into_iter().collect()

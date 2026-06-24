@@ -17,7 +17,9 @@ use crate::{
         ExecutorPromptRequest, ExecutorUpdate,
     },
     session::{
-        ApprovalMode, ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage,
+        ApprovalMode, ContextSyncRequest, ExecutorBinding, ExecutorHealth, SessionState,
+        TranscriptMessage,
+        context::{merge_context_artifacts, write_context_sync},
         projection::{
             ProjectionInput, build_context_projection, merge_seen_context,
             projected_assistant_content, visible_message_fingerprints,
@@ -205,6 +207,10 @@ pub trait RouterOutputSink: Send {
 
 #[async_trait]
 pub trait RouterService: Send + Sync + 'static {
+    async fn sync_context(&self, _request: ContextSyncRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn handle(
         &self,
         input: RouterInput,
@@ -383,6 +389,34 @@ where
         Ok(())
     }
 
+    async fn sync_context_locked(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
+        let mut state = self
+            .store
+            .load_or_create(&request.session_key, &self.default_executor)
+            .await;
+        let Some(session_cwd) = self.ensure_session_cwd(&mut state)? else {
+            tracing::warn!(
+                session_key = %request.session_key,
+                source = %request.source,
+                "skipping context sync because no workspace root is configured"
+            );
+            return Ok(());
+        };
+        let session_key = request.session_key.clone();
+        let source = request.source.clone();
+        let records = write_context_sync(&session_cwd, request)?;
+        let record_count = records.len();
+        merge_context_artifacts(&mut state.context_artifacts, records);
+        self.store.save(state).await;
+        tracing::info!(
+            session_key = %session_key,
+            source = %source,
+            context_records = record_count,
+            "synced session context artifacts"
+        );
+        Ok(())
+    }
+
     async fn handle_agent_command(
         &self,
         session_key: &str,
@@ -543,6 +577,7 @@ where
         };
         let projection = build_context_projection(ProjectionInput {
             transcript: &state.transcript,
+            context_artifacts: &state.context_artifacts,
             seen_context: &binding.seen_context,
             current_message: &input.text,
             started_new_session: prepared.started_new_session,
@@ -704,6 +739,12 @@ where
     S: SessionStore,
     E: ExecutorBackend,
 {
+    async fn sync_context(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
+        let lock = self.session_lock(&request.session_key).await;
+        let _guard = lock.lock().await;
+        self.sync_context_locked(request).await
+    }
+
     async fn handle(
         &self,
         input: RouterInput,
@@ -867,7 +908,10 @@ mod tests {
         },
         executor::{ExecutorChannelEvent, test_support::FakeExecutorBackend},
         session::{
-            TranscriptMessage, projection::message_fingerprint, store::InMemorySessionStore,
+            TranscriptMessage,
+            context::{ContextArtifactInput, ContextFileContent, ContextFileInput},
+            projection::message_fingerprint,
+            store::InMemorySessionStore,
         },
     };
     use std::time::Duration;
@@ -1374,6 +1418,80 @@ mod tests {
         );
         assert_eq!(name, session_workspace_dir_name("slack:dm:D1:111.000"));
         assert_ne!(name, session_workspace_dir_name("slack:dm:D1:222.000"));
+    }
+
+    #[tokio::test]
+    async fn synced_context_artifacts_are_projected_and_marked_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_workspace_root(Some(workspace_root));
+
+        router
+            .sync_context(ContextSyncRequest {
+                session_key: "slack:channel:C1:111.000".to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:thread:C1:111.000".to_string(),
+                    kind: "slack_current_thread".to_string(),
+                    title: "Current Slack thread".to_string(),
+                    source_locator: Some("slack://C1/111.000".to_string()),
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/current-thread.md"),
+                        content: ContextFileContent::Text("thread history".to_string()),
+                    }],
+                    metadata: Default::default(),
+                }],
+                unresolved: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let saved = store.load("slack:channel:C1:111.000").await.unwrap();
+        let cwd = saved.cwd.clone().unwrap();
+        assert!(cwd.join("slack/current-thread.md").is_file());
+        assert!(cwd.join("slack/manifest.json").is_file());
+        assert_eq!(saved.context_artifacts.len(), 2);
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:channel:C1:111.000".to_string(),
+                    text: "use the thread".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        let prompts = executor.prompts.lock().await;
+        assert!(prompts[0].prompt.contains("Synced session context files"));
+        assert!(prompts[0].prompt.contains("slack/manifest.json"));
+        assert!(prompts[0].prompt.contains("slack/current-thread.md"));
+        drop(prompts);
+
+        let saved = store.load("slack:channel:C1:111.000").await.unwrap();
+        let seen = &saved.executor_bindings["kimi"].seen_context;
+        assert!(seen.iter().any(|item| item.starts_with("artifact:")));
+
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:channel:C1:111.000".to_string(),
+                    text: "next".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+        let prompts = executor.prompts.lock().await;
+        assert!(!prompts[1].prompt.contains("Synced session context files"));
     }
 
     #[test]

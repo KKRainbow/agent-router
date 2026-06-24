@@ -1,3 +1,4 @@
+pub mod context;
 pub mod projection;
 pub mod store;
 pub(crate) mod work_queue;
@@ -10,6 +11,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use context::{ContextArtifactRecord, ContextSyncRequest};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +108,8 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     pub transcript: Vec<TranscriptMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_artifacts: Vec<ContextArtifactRecord>,
     pub executor_bindings: BTreeMap<String, ExecutorBinding>,
 }
 
@@ -118,6 +123,7 @@ impl SessionState {
             approval_mode_override: None,
             cwd: None,
             transcript: Vec::new(),
+            context_artifacts: Vec::new(),
             executor_bindings: BTreeMap::new(),
         }
     }
