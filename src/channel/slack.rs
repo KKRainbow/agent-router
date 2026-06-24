@@ -472,11 +472,7 @@ fn parse_message_event(payload: &Value, bot_user_id: &str) -> Option<SlackMessag
         .unwrap_or("")
         .to_string();
     Some(SlackMessageEvent {
-        event_key: payload
-            .get("event_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("{channel}:{ts}")),
+        event_key: format!("slack-message:{channel}:{ts}:{user}"),
         channel,
         user,
         text,
@@ -532,9 +528,39 @@ mod tests {
 
         let event = parse_message_event(&payload, "BOT").unwrap();
 
-        assert_eq!(event.event_key, "Ev1");
+        assert_eq!(event.event_key, "slack-message:C1:123.456:U1");
         assert_eq!(event.channel, "C1");
         assert_eq!(event.text, "<@BOT> hello");
+    }
+
+    #[test]
+    fn app_mention_and_message_events_for_same_message_share_event_key() {
+        let app_mention = json!({
+            "event_id": "Ev-app-mention",
+            "event": {
+                "type": "app_mention",
+                "user": "U1",
+                "channel": "C1",
+                "ts": "123.456",
+                "text": "<@BOT> hello"
+            }
+        });
+        let message = json!({
+            "event_id": "Ev-message",
+            "event": {
+                "type": "message",
+                "user": "U1",
+                "channel": "C1",
+                "ts": "123.456",
+                "text": "<@BOT> hello"
+            }
+        });
+
+        let app_mention = parse_message_event(&app_mention, "BOT").unwrap();
+        let message = parse_message_event(&message, "BOT").unwrap();
+
+        assert_eq!(app_mention.event_key, message.event_key);
+        assert_eq!(app_mention.event_key, "slack-message:C1:123.456:U1");
     }
 
     #[test]
