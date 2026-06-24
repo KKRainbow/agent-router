@@ -1309,6 +1309,18 @@ impl SlackApiError {
                 | "token_revoked"
         )
     }
+
+    fn is_transient(&self) -> bool {
+        matches!(
+            self.code.as_str(),
+            "rate_limited"
+                | "ratelimited"
+                | "internal_error"
+                | "fatal_error"
+                | "service_unavailable"
+                | "team_added_to_org"
+        )
+    }
 }
 
 impl std::fmt::Display for SlackApiError {
@@ -1333,7 +1345,9 @@ fn slack_error_clears_thread_cache(err: &anyhow::Error) -> bool {
 }
 
 fn slack_socket_error_is_fatal(err: &anyhow::Error) -> bool {
-    slack_error_is_access_denied(err)
+    err.downcast_ref::<SlackApiError>().is_some_and(|err| {
+        matches!(err.method, "apps.connections.open" | "auth.test") && !err.is_transient()
+    })
 }
 
 fn cached_thread_fetch_after_error(
@@ -2249,15 +2263,32 @@ mod tests {
 
     #[test]
     fn slack_socket_lifecycle_treats_auth_errors_as_fatal() {
-        let invalid_auth =
-            anyhow::Error::new(SlackApiError::new("apps.connections.open", "invalid_auth"));
-        let rate_limited =
-            anyhow::Error::new(SlackApiError::new("apps.connections.open", "rate_limited"));
+        for code in [
+            "invalid_auth",
+            "not_allowed_token_type",
+            "token_expired",
+            "team_access_not_granted",
+            "access_denied",
+            "no_permission",
+            "forbidden_team",
+        ] {
+            let err = anyhow::Error::new(SlackApiError::new("apps.connections.open", code));
+            assert!(slack_socket_error_is_fatal(&err), "{code}");
+        }
+
+        for code in [
+            "rate_limited",
+            "ratelimited",
+            "internal_error",
+            "service_unavailable",
+        ] {
+            let err = anyhow::Error::new(SlackApiError::new("apps.connections.open", code));
+            assert!(!slack_socket_error_is_fatal(&err), "{code}");
+        }
+
         let socket_reset =
             anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
 
-        assert!(slack_socket_error_is_fatal(&invalid_auth));
-        assert!(!slack_socket_error_is_fatal(&rate_limited));
         assert!(!slack_socket_error_is_fatal(&socket_reset));
     }
 
