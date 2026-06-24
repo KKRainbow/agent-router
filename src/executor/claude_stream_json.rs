@@ -1199,6 +1199,47 @@ mod session_tests {
 
         assert_eq!(session.session_id().await, Some("sess-ext-123".to_string()));
     }
+
+    #[tokio::test]
+    async fn fake_claude_turn_completes() {
+        use crate::executor::test_support::CollectingExecutorEventSink;
+
+        let cfg = ExecutorConfig {
+            name: "fake-claude".to_string(),
+            protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+            command: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fake_claude.sh")
+                .to_string_lossy()
+                .to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let approvals = Arc::new(crate::approval::ApprovalBroker::default());
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let session = ClaudeSession::start(
+            cfg,
+            temp_dir.path().to_path_buf(),
+            "fake-session".to_string(),
+            "claude".to_string(),
+            approvals,
+            None,
+        )
+        .await
+        .expect("start session");
+
+        let mut sink = CollectingExecutorEventSink::default();
+        let outcome = session
+            .run_turn("hi", None, &mut sink, TurnCancellation::new())
+            .await;
+
+        match outcome {
+            ExecutorPromptOutcome::Completed(response) => {
+                assert_eq!(response.final_text, "Hello from fake Claude");
+            }
+            other => panic!("expected Completed outcome, got {:?}", other),
+        }
+    }
 }
 
 #[cfg(test)]
