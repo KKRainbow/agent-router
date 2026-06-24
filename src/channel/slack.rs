@@ -163,20 +163,37 @@ impl SlackSocketModeChannel {
         let is_dm = event.channel.starts_with('D');
         let mentioned = event.text.contains(&format!("<@{bot_user_id}>"));
         let text = strip_bot_mention(&event.text, bot_user_id);
-        let approval_command = is_approval_command(&text);
         if text.is_empty() {
             return Ok(());
         }
-        let reply_target = event.reply_target();
-        if !is_dm
-            && self.cfg.require_mention
-            && !mentioned
-            && !approval_command
-            && !self.cfg.free_response_channels.contains(&event.channel)
-        {
+        let session_key = event.session_key();
+        let approval_command = is_approval_command(&text);
+        let approval_trigger =
+            approval_command && self.approvals.has_pending_for_session(&session_key).await;
+        let should_route = is_dm
+            || !self.cfg.require_mention
+            || mentioned
+            || approval_trigger
+            || self.cfg.free_response_channels.contains(&event.channel);
+        if !should_route {
+            if event.is_thread_reply() {
+                tracing::info!(
+                    channel = %event.channel,
+                    user_id = %event.user,
+                    session_key = %session_key,
+                    text_len = text.len(),
+                    "observing Slack thread message"
+                );
+                router
+                    .observe(RouterInput {
+                        session_key,
+                        text,
+                        user_id: Some(event.user),
+                    })
+                    .await?;
+            }
             return Ok(());
         }
-        let session_key = event.session_key();
         tracing::info!(
             channel = %event.channel,
             user_id = %event.user,
@@ -184,6 +201,7 @@ impl SlackSocketModeChannel {
             text_len = text.len(),
             "routing Slack message"
         );
+        let reply_target = event.reply_target();
         let mut output = SlackRouterOutputSink {
             channel: self.clone(),
             target: reply_target,
@@ -411,6 +429,12 @@ impl SlackMessageEvent {
             thread_ts: Some(self.thread_ts.clone().unwrap_or_else(|| self.ts.clone())),
         }
     }
+
+    fn is_thread_reply(&self) -> bool {
+        self.thread_ts
+            .as_deref()
+            .is_some_and(|thread_ts| thread_ts != self.ts)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -509,9 +533,80 @@ fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::approval::{ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection};
+
     use serde_json::json;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingRouter {
+        handled: Mutex<Vec<RouterInput>>,
+        observed: Mutex<Vec<RouterInput>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouterService for RecordingRouter {
+        async fn handle(
+            &self,
+            input: RouterInput,
+            _output: &mut dyn RouterOutputSink,
+        ) -> anyhow::Result<()> {
+            self.handled.lock().await.push(input);
+            Ok(())
+        }
+
+        async fn observe(&self, input: RouterInput) -> anyhow::Result<()> {
+            self.observed.lock().await.push(input);
+            Ok(())
+        }
+    }
+
+    fn test_slack_config(require_mention: bool) -> SlackConfig {
+        SlackConfig {
+            enabled: true,
+            bot_token: String::new(),
+            app_token: String::new(),
+            require_mention,
+            allowed_channels: Default::default(),
+            free_response_channels: Default::default(),
+        }
+    }
+
+    fn thread_reply(text: impl Into<String>) -> SlackMessageEvent {
+        SlackMessageEvent {
+            event_key: "Ev1".to_string(),
+            channel: "C1".to_string(),
+            user: "U1".to_string(),
+            text: text.into(),
+            ts: "222.000".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        }
+    }
+
+    fn approval_request(session_key: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            session_key: session_key.to_string(),
+            executor: "kimi".to_string(),
+            requester_user_id: Some("U1".to_string()),
+            title: "Run command".to_string(),
+            body: "$ cargo test".to_string(),
+            options: vec![
+                ApprovalOption {
+                    id: "allow_once".to_string(),
+                    kind: "allow_once".to_string(),
+                    name: "Allow once".to_string(),
+                    auto_approvable: true,
+                },
+                ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                    auto_approvable: false,
+                },
+            ],
+        }
+    }
 
     #[test]
     fn parses_app_mention_events() {
@@ -561,6 +656,119 @@ mod tests {
 
         assert_eq!(app_mention.event_key, message.event_key);
         assert_eq!(app_mention.event_key, "slack-message:C1:123.456:U1");
+    }
+
+    #[tokio::test]
+    async fn unmentioned_thread_reply_is_observed_without_routing() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(thread_reply("middle context"), router_service, "BOT")
+            .await
+            .unwrap();
+
+        assert!(router.handled.lock().await.is_empty());
+        let observed = router.observed.lock().await;
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].session_key, "slack:channel:C1:111.000");
+        assert_eq!(observed[0].text, "middle context");
+        assert_eq!(observed[0].user_id.as_deref(), Some("U1"));
+    }
+
+    #[tokio::test]
+    async fn unmentioned_top_level_channel_message_is_ignored() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+        let event = SlackMessageEvent {
+            event_key: "Ev1".to_string(),
+            channel: "C1".to_string(),
+            user: "U1".to_string(),
+            text: "top level".to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+        };
+
+        channel
+            .handle_message_event(event, router_service, "BOT")
+            .await
+            .unwrap();
+
+        assert!(router.handled.lock().await.is_empty());
+        assert!(router.observed.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmentioned_approval_text_without_pending_is_observed_not_routed() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(thread_reply("/approve 1"), router_service, "BOT")
+            .await
+            .unwrap();
+
+        assert!(router.handled.lock().await.is_empty());
+        let observed = router.observed.lock().await;
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].text, "/approve 1");
+    }
+
+    #[tokio::test]
+    async fn unmentioned_approval_text_with_pending_routes() {
+        let approvals = Arc::new(ApprovalBroker::new(std::time::Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let request_broker = approvals.clone();
+        let pending = tokio::spawn(async move {
+            request_broker
+                .request(approval_request("slack:channel:C1:111.000"))
+                .await
+        });
+        let prompt = prompts.recv().await.unwrap();
+        let channel = SlackSocketModeChannel::new(test_slack_config(true), approvals.clone());
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(
+                thread_reply(format!("/approve {}", prompt.id)),
+                router_service,
+                "BOT",
+            )
+            .await
+            .unwrap();
+
+        assert!(router.observed.lock().await.is_empty());
+        let handled = router.handled.lock().await;
+        assert_eq!(handled.len(), 1);
+        assert_eq!(handled[0].session_key, "slack:channel:C1:111.000");
+        assert_eq!(handled[0].text, format!("/approve {}", prompt.id));
+        drop(handled);
+
+        approvals
+            .resolve_command(
+                "slack:channel:C1:111.000",
+                &format!("/deny {}", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
     }
 
     #[test]

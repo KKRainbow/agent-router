@@ -80,6 +80,8 @@ pub trait RouterService: Send + Sync + 'static {
         input: RouterInput,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()>;
+
+    async fn observe(&self, input: RouterInput) -> anyhow::Result<()>;
 }
 
 pub struct SessionApprovalPolicy<S>
@@ -225,6 +227,30 @@ where
                 .await;
         }
         self.route_to_active_executor(input, output).await
+    }
+
+    async fn observe_locked(&self, input: RouterInput) -> anyhow::Result<()> {
+        let text = input.text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let text_len = text.len();
+        let Some(mut state) = self.store.load(&input.session_key).await else {
+            tracing::debug!(
+                session_key = %input.session_key,
+                text_len,
+                "ignored observed message for unknown session"
+            );
+            return Ok(());
+        };
+        state.transcript.push(TranscriptMessage::user(input.text));
+        self.store.save(state).await;
+        tracing::info!(
+            session_key = %input.session_key,
+            text_len,
+            "recorded observed message"
+        );
+        Ok(())
     }
 
     async fn handle_agent_command(
@@ -563,6 +589,12 @@ where
         let lock = self.session_lock(&input.session_key).await;
         let _guard = lock.lock().await;
         self.handle_locked(input, output).await
+    }
+
+    async fn observe(&self, input: RouterInput) -> anyhow::Result<()> {
+        let lock = self.session_lock(&input.session_key).await;
+        let _guard = lock.lock().await;
+        self.observe_locked(input).await
     }
 }
 
@@ -1077,6 +1109,70 @@ mod tests {
                 .is_some()
         );
         assert_eq!(saved.executor_bindings["kimi"].protocol, "fake");
+    }
+
+    #[tokio::test]
+    async fn observe_records_existing_session_context_without_executor_turn() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let mut state = SessionState::new("slack:channel:C1:111.000", "kimi");
+        state.transcript.push(TranscriptMessage::user("root"));
+        store.save(state).await;
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone());
+
+        router
+            .observe(RouterInput {
+                session_key: "slack:channel:C1:111.000".to_string(),
+                text: "middle context".to_string(),
+                user_id: Some("U2".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert!(executor.prepared.lock().await.is_empty());
+        assert!(executor.prompts.lock().await.is_empty());
+        let saved = store.load("slack:channel:C1:111.000").await.unwrap();
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[1].content, "middle context");
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:channel:C1:111.000".to_string(),
+                    text: "next".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "fake response");
+        let prompts = executor.prompts.lock().await;
+        assert!(prompts[0].prompt.contains("user: root"));
+        assert!(prompts[0].prompt.contains("user: middle context"));
+        assert!(prompts[0].prompt.contains("Current user message:\nnext"));
+    }
+
+    #[tokio::test]
+    async fn observe_does_not_create_unknown_session() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone());
+
+        router
+            .observe(RouterInput {
+                session_key: "slack:channel:C1:111.000".to_string(),
+                text: "orphan context".to_string(),
+                user_id: Some("U2".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert!(store.load("slack:channel:C1:111.000").await.is_none());
+        assert!(executor.prepared.lock().await.is_empty());
+        assert!(executor.prompts.lock().await.is_empty());
     }
 
     #[tokio::test]

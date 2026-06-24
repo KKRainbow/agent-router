@@ -202,6 +202,14 @@ impl ApprovalBroker {
         self.auto_selections.subscribe()
     }
 
+    pub async fn has_pending_for_session(&self, session_key: &str) -> bool {
+        let state = self.state.lock().await;
+        state
+            .session_order
+            .get(session_key)
+            .is_some_and(|ids| ids.iter().any(|id| state.pending.contains_key(id)))
+    }
+
     pub async fn request(&self, request: ApprovalRequest) -> ApprovalSelection {
         if let Some(selection) = self.policy.auto_selection(&request).await {
             if let ApprovalSelection::Selected(option_id) = &selection {
@@ -449,6 +457,30 @@ mod tests {
             requester_user_id: None,
             ..request(session_key)
         }
+    }
+
+    #[tokio::test]
+    async fn has_pending_for_session_tracks_active_requests() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move { request_broker.request(request("s1")).await });
+
+        let prompt = prompts.recv().await.unwrap();
+        assert!(broker.has_pending_for_session("s1").await);
+        assert!(!broker.has_pending_for_session("s2").await);
+
+        let reply = broker
+            .resolve_command("s1", &format!("/deny {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+        assert!(!broker.has_pending_for_session("s1").await);
     }
 
     #[tokio::test]
