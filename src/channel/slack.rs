@@ -880,19 +880,24 @@ impl SlackSocketModeChannel {
     }
 
     async fn download_slack_file(&self, file: SlackFileRef) -> anyhow::Result<DownloadedSlackFile> {
-        tracing::info!(
-            file_id = %file.id,
-            file_name = %file.name,
-            "fetching Slack file metadata"
-        );
-        let file = self.fetch_slack_file_info(file).await?;
-        tracing::info!(
-            file_id = %file.id,
-            file_name = %file.name,
-            size_bytes = file.size_bytes,
-            has_private_download_url = file.url_private_download.is_some(),
-            "fetched Slack file metadata"
-        );
+        let file = if slack_file_ref_needs_info(&file) {
+            tracing::info!(
+                file_id = %file.id,
+                file_name = %file.name,
+                "fetching Slack file metadata"
+            );
+            let file = self.fetch_slack_file_info(file).await?;
+            tracing::info!(
+                file_id = %file.id,
+                file_name = %file.name,
+                size_bytes = file.size_bytes,
+                has_private_download_url = file.url_private_download.is_some(),
+                "fetched Slack file metadata"
+            );
+            file
+        } else {
+            file
+        };
         if file.size_bytes > self.cfg.context_sync.max_file_bytes {
             anyhow::bail!(
                 "file exceeds max_file_bytes ({} > {})",
@@ -1521,6 +1526,10 @@ fn merge_slack_file_info(original: SlackFileRef, info: SlackFileRef) -> SlackFil
     }
 }
 
+fn slack_file_ref_needs_info(file: &SlackFileRef) -> bool {
+    file.url_private_download.is_none() && file.url_private.is_none()
+}
+
 fn collect_context_file_refs(
     event_files: &[SlackFileRef],
     current_messages: &[SlackThreadMessage],
@@ -1751,6 +1760,7 @@ fn is_router_noise_message(text: &str) -> bool {
     };
     rest.starts_with("Activity")
         || rest.starts_with("Tool call")
+        || rest.starts_with("Progress")
         || rest.starts_with("Reasoning summary")
 }
 
@@ -2562,6 +2572,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_ref_with_private_url_does_not_require_files_info() {
+        let with_download_url = SlackFileRef {
+            id: "F1".to_string(),
+            name: "note.txt".to_string(),
+            mimetype: None,
+            size_bytes: 0,
+            url_private: None,
+            url_private_download: Some(
+                "https://files.slack.com/files-pri/T1/F1/note.txt".to_string(),
+            ),
+        };
+        let with_private_url = SlackFileRef {
+            id: "F2".to_string(),
+            name: "note.txt".to_string(),
+            mimetype: None,
+            size_bytes: 0,
+            url_private: Some("https://files.slack.com/files-pri/T1/F2/note.txt".to_string()),
+            url_private_download: None,
+        };
+        let without_url = SlackFileRef {
+            id: "F3".to_string(),
+            name: "note.txt".to_string(),
+            mimetype: None,
+            size_bytes: 0,
+            url_private: None,
+            url_private_download: None,
+        };
+
+        assert!(!slack_file_ref_needs_info(&with_download_url));
+        assert!(!slack_file_ref_needs_info(&with_private_url));
+        assert!(slack_file_ref_needs_info(&without_url));
+    }
+
     #[tokio::test]
     async fn slack_session_locks_are_scoped_by_session_key() {
         let channel = SlackSocketModeChannel::new(
@@ -2592,6 +2636,13 @@ mod tests {
                 user: Some("BOT".to_string()),
                 bot_id: Some("B_SELF".to_string()),
                 text: "[codex] Activity\nTools: 1 step: Bash".to_string(),
+                files: Vec::new(),
+            },
+            SlackThreadMessage {
+                ts: "113.000".to_string(),
+                user: Some("BOT".to_string()),
+                bot_id: Some("B_SELF".to_string()),
+                text: "[codex] Progress\nI will inspect the config first.".to_string(),
                 files: Vec::new(),
             },
         ];
