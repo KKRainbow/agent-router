@@ -239,6 +239,12 @@ impl ApprovalBroker {
             return Some(selection);
         }
 
+        tokio::select! {
+            biased;
+            _ = &mut cancel => return None,
+            _ = std::future::ready(()) => {}
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let (tx, rx) = oneshot::channel();
         let prompt = ApprovalPrompt {
@@ -263,6 +269,14 @@ impl ApprovalBroker {
                     responder: tx,
                 },
             );
+        }
+        tokio::select! {
+            biased;
+            _ = &mut cancel => {
+                self.remove_pending(&id).await;
+                return None;
+            }
+            _ = std::future::ready(()) => {}
         }
         let _ = self.prompts.send(prompt);
 
@@ -533,6 +547,20 @@ mod tests {
             reply.text,
             format!("Approval {} is not pending.", prompt.id)
         );
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_request_does_not_publish_prompt() {
+        let broker = ApprovalBroker::new(Duration::from_secs(5));
+        let mut prompts = broker.subscribe();
+
+        let selection = broker
+            .request_until_cancelled(request("s1"), async {})
+            .await;
+
+        assert_eq!(selection, None);
+        assert!(!broker.has_pending_for_session("s1").await);
+        assert!(prompts.try_recv().is_err());
     }
 
     #[tokio::test]
