@@ -42,7 +42,6 @@ pub struct SlackSocketModeChannel {
     http: Client,
     seen_events: Arc<Mutex<EventDeduper>>,
     context_cache: Arc<Mutex<SlackContextCache>>,
-    context_generations: Arc<Mutex<BTreeMap<String, u64>>>,
     next_context_generation: Arc<AtomicU64>,
 }
 
@@ -54,7 +53,6 @@ impl SlackSocketModeChannel {
             http: Client::new(),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(512))),
             context_cache: Arc::new(Mutex::new(SlackContextCache::default())),
-            context_generations: Arc::new(Mutex::new(BTreeMap::new())),
             next_context_generation: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -275,15 +273,10 @@ impl SlackSocketModeChannel {
                 None
             } else {
                 let generation = self.next_context_generation.fetch_add(1, Ordering::Relaxed);
-                self.remember_context_generation(&session_key, generation)
-                    .await;
                 context_generation = Some(generation);
                 Some(router.preempt(&session_key).await?)
             };
-        let context_turn = context_generation.map(|generation| SlackContextTurn {
-            session_key: session_key.clone(),
-            generation,
-        });
+        let context_turn = context_generation.map(|generation| SlackContextTurn { generation });
         tracing::info!(
             channel = %event.channel,
             user_id = %event.user,
@@ -579,24 +572,6 @@ impl SlackSocketModeChannel {
                 || self.cfg.context_sync.files)
             && !is_approval_command(text)
             && !matches!(command, "/stop" | "/agent" | "/yolo")
-    }
-
-    async fn remember_context_generation(&self, session_key: &str, generation: u64) {
-        self.context_generations
-            .lock()
-            .await
-            .insert(session_key.to_string(), generation);
-    }
-
-    async fn context_generation_is_current(&self, turn: Option<&SlackContextTurn>) -> bool {
-        let Some(turn) = turn else {
-            return true;
-        };
-        self.context_generations
-            .lock()
-            .await
-            .get(&turn.session_key)
-            .is_some_and(|generation| *generation == turn.generation)
     }
 
     async fn current_thread_context_request(
@@ -925,13 +900,8 @@ impl SlackSocketModeChannel {
         let key = slack_thread_cache_key(channel, thread_ts);
         match fetch.await {
             Ok(messages) => {
-                if self.context_generation_is_current(context_turn).await {
-                    self.context_cache
-                        .lock()
-                        .await
-                        .threads
-                        .insert(key, messages.clone());
-                }
+                let mut cache = self.context_cache.lock().await;
+                upsert_thread_cache_if_current(&mut cache, key, messages.clone(), context_turn);
                 Ok(SlackThreadFetch {
                     messages,
                     stale_reason: None,
@@ -941,7 +911,11 @@ impl SlackSocketModeChannel {
                 let fetch = {
                     let cache = self.context_cache.lock().await;
                     cached_thread_fetch_after_error(&err, || {
-                        cache.threads.get(&key).cloned().unwrap_or_default()
+                        cache
+                            .threads
+                            .get(&key)
+                            .map(|entry| entry.messages.clone())
+                            .unwrap_or_default()
                     })
                 };
                 if let Some(fetch) = fetch {
@@ -951,9 +925,8 @@ impl SlackSocketModeChannel {
                 }
             }
             Err(err) if slack_error_clears_thread_cache(&err) => {
-                if self.context_generation_is_current(context_turn).await {
-                    self.context_cache.lock().await.threads.remove(&key);
-                }
+                let mut cache = self.context_cache.lock().await;
+                remove_thread_cache_if_current(&mut cache, &key, context_turn);
                 Err(err)
             }
             Err(err) => Err(err),
@@ -1144,15 +1117,61 @@ impl SlackSocketModeChannel {
 
 #[derive(Debug, Default)]
 struct SlackContextCache {
-    threads: BTreeMap<String, Vec<SlackThreadMessage>>,
+    threads: BTreeMap<String, CachedSlackThreadMessages>,
     synced_files: BTreeSet<String>,
     failed_files: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
+struct CachedSlackThreadMessages {
+    messages: Vec<SlackThreadMessage>,
+    generation: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 struct SlackContextTurn {
-    session_key: String,
     generation: u64,
+}
+
+fn upsert_thread_cache_if_current(
+    cache: &mut SlackContextCache,
+    key: String,
+    messages: Vec<SlackThreadMessage>,
+    turn: Option<&SlackContextTurn>,
+) {
+    let generation = turn.map(|turn| turn.generation);
+    if thread_cache_entry_is_newer(cache.threads.get(&key), generation) {
+        return;
+    }
+    cache.threads.insert(
+        key,
+        CachedSlackThreadMessages {
+            messages,
+            generation,
+        },
+    );
+}
+
+fn remove_thread_cache_if_current(
+    cache: &mut SlackContextCache,
+    key: &str,
+    turn: Option<&SlackContextTurn>,
+) {
+    let generation = turn.map(|turn| turn.generation);
+    if thread_cache_entry_is_newer(cache.threads.get(key), generation) {
+        return;
+    }
+    cache.threads.remove(key);
+}
+
+fn thread_cache_entry_is_newer(
+    entry: Option<&CachedSlackThreadMessages>,
+    generation: Option<u64>,
+) -> bool {
+    match (entry.and_then(|entry| entry.generation), generation) {
+        (Some(existing), Some(incoming)) => existing > incoming,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3174,13 +3193,16 @@ mod tests {
         let key = slack_thread_cache_key("C1", "111.000");
         channel.context_cache.lock().await.threads.insert(
             key.clone(),
-            vec![SlackThreadMessage {
-                ts: "111.000".to_string(),
-                user: Some("U1".to_string()),
-                bot_id: None,
-                text: "stale".to_string(),
-                files: Vec::new(),
-            }],
+            CachedSlackThreadMessages {
+                messages: vec![SlackThreadMessage {
+                    ts: "111.000".to_string(),
+                    user: Some("U1".to_string()),
+                    bot_id: None,
+                    text: "stale".to_string(),
+                    files: Vec::new(),
+                }],
+                generation: None,
+            },
         );
         let channel_for_fetch = channel.clone();
         let key_for_fetch = key.clone();
@@ -3219,11 +3241,21 @@ mod tests {
             test_slack_config(true),
             Arc::new(ApprovalBroker::default()),
         );
-        channel.remember_context_generation("session", 2).await;
-        let stale_turn = SlackContextTurn {
-            session_key: "session".to_string(),
-            generation: 1,
-        };
+        let key = slack_thread_cache_key("C1", "111.000");
+        channel.context_cache.lock().await.threads.insert(
+            key.clone(),
+            CachedSlackThreadMessages {
+                messages: vec![SlackThreadMessage {
+                    ts: "111.000".to_string(),
+                    user: Some("U1".to_string()),
+                    bot_id: None,
+                    text: "fresh context".to_string(),
+                    files: Vec::new(),
+                }],
+                generation: Some(2),
+            },
+        );
+        let stale_turn = SlackContextTurn { generation: 1 };
         let message = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
@@ -3243,14 +3275,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.messages.len(), 1);
-        assert!(
-            !channel
-                .context_cache
-                .lock()
-                .await
-                .threads
-                .contains_key(&slack_thread_cache_key("C1", "111.000"))
-        );
+        let cache = channel.context_cache.lock().await;
+        let cached = cache.threads.get(&key).unwrap();
+        assert_eq!(cached.generation, Some(2));
+        assert_eq!(cached.messages[0].text, "fresh context");
     }
 
     #[tokio::test]
@@ -3262,19 +3290,18 @@ mod tests {
         let key = slack_thread_cache_key("C1", "111.000");
         channel.context_cache.lock().await.threads.insert(
             key.clone(),
-            vec![SlackThreadMessage {
-                ts: "111.000".to_string(),
-                user: Some("U1".to_string()),
-                bot_id: None,
-                text: "fresh context".to_string(),
-                files: Vec::new(),
-            }],
+            CachedSlackThreadMessages {
+                messages: vec![SlackThreadMessage {
+                    ts: "111.000".to_string(),
+                    user: Some("U1".to_string()),
+                    bot_id: None,
+                    text: "fresh context".to_string(),
+                    files: Vec::new(),
+                }],
+                generation: Some(2),
+            },
         );
-        channel.remember_context_generation("session", 2).await;
-        let stale_turn = SlackContextTurn {
-            session_key: "session".to_string(),
-            generation: 1,
-        };
+        let stale_turn = SlackContextTurn { generation: 1 };
 
         let result =
             channel
