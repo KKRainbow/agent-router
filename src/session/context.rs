@@ -113,13 +113,18 @@ pub fn write_context_sync(
         .filter(|record| record.source == request.source && record.kind != "manifest")
         .cloned()
         .collect::<Vec<_>>();
+    for record in &source_records {
+        for path in &record.paths {
+            validate_source_context_path(&request.base_path, Path::new(path))?;
+        }
+    }
     let mut updates = Vec::new();
 
     for artifact in request.artifacts {
         let mut path_records = Vec::new();
         let mut file_manifest = Vec::new();
         for file in artifact.files {
-            validate_relative_path(&file.relative_path)?;
+            validate_source_context_path(&request.base_path, &file.relative_path)?;
             let content = file.content.into_bytes();
             let hash = sha256_hex(&content);
             let path = cwd.join(&file.relative_path);
@@ -242,7 +247,7 @@ pub fn read_context_artifacts_from_manifest(
             artifact.source
         );
         for path in &artifact.paths {
-            validate_relative_path(Path::new(path))?;
+            validate_source_context_path(base_path, Path::new(path))?;
         }
     }
     let mut records = Vec::with_capacity(snapshot.artifacts.len() + 1);
@@ -412,6 +417,17 @@ fn validate_relative_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_source_context_path(base_path: &Path, path: &Path) -> anyhow::Result<()> {
+    validate_relative_path(path)?;
+    anyhow::ensure!(
+        path.starts_with(base_path),
+        "context path must be under base path {}: {}",
+        base_path.display(),
+        path.display()
+    );
+    Ok(())
+}
+
 fn artifact_fingerprint(
     source: &str,
     id: &str,
@@ -498,6 +514,55 @@ mod tests {
         };
 
         assert!(write_context_sync(tmp.path(), request, &[]).is_err());
+    }
+
+    #[test]
+    fn write_context_sync_rejects_paths_outside_base_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "bad".to_string(),
+                kind: "file".to_string(),
+                title: "bad".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("other/context.md"),
+                    content: ContextFileContent::Text("bad".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            unresolved: Vec::new(),
+        };
+
+        assert!(write_context_sync(tmp.path(), request, &[]).is_err());
+    }
+
+    #[test]
+    fn write_context_sync_rejects_existing_paths_outside_base_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        let existing = vec![ContextArtifactRecord {
+            id: "slack:file:F1".to_string(),
+            source: "slack".to_string(),
+            kind: "slack_file".to_string(),
+            title: "Slack file F1".to_string(),
+            source_locator: None,
+            paths: vec!["other/context.md".to_string()],
+            fingerprint: "artifact:file".to_string(),
+            updated_at_ms: 1,
+            metadata: BTreeMap::new(),
+        }];
+
+        assert!(write_context_sync(tmp.path(), request, &existing).is_err());
     }
 
     #[test]
@@ -637,6 +702,37 @@ mod tests {
                     "kind": "slack_file",
                     "title": "Slack file F1",
                     "paths": ["../secret.txt"],
+                    "fingerprint": "artifact:file",
+                    "updated_at_ms": 1
+                }],
+                "unresolved": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            read_context_artifacts_from_manifest(tmp.path(), "slack", Path::new("slack")).is_err()
+        );
+    }
+
+    #[test]
+    fn read_context_artifacts_from_manifest_rejects_paths_outside_base_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("slack")).unwrap();
+        std::fs::write(
+            tmp.path().join("slack/manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "source": "slack",
+                "session_key": "s1",
+                "synced_at_ms": 1,
+                "artifacts": [{
+                    "id": "slack:file:F1",
+                    "source": "slack",
+                    "kind": "slack_file",
+                    "title": "Slack file F1",
+                    "paths": ["other/context.md"],
                     "fingerprint": "artifact:file",
                     "updated_at_ms": 1
                 }],
