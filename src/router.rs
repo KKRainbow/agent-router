@@ -524,7 +524,13 @@ where
         {
             state.context_artifacts.clone()
         } else {
-            read_context_artifacts_from_manifest(&session_cwd, &source, Path::new(&source))?
+            let mut records = state.context_artifacts.clone();
+            records.extend(read_context_artifacts_from_manifest(
+                &session_cwd,
+                &source,
+                Path::new(&source),
+            )?);
+            records
         };
         let records = write_context_sync(&session_cwd, request, &existing_context)?;
         let record_count = records.len();
@@ -1669,7 +1675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_artifacts_can_be_recovered_from_workspace_manifest() {
+    async fn post_restart_context_sync_preserves_recovered_manifest_state() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_root = tmp.path().join("workspaces");
         let session_key = "slack:channel:C1:111.000";
@@ -1704,14 +1710,53 @@ mod tests {
             .unwrap();
 
         let restarted_store = Arc::new(InMemorySessionStore::default());
-        let restarted_router = AgentRouter::new("kimi", restarted_store, executor)
+        let mut restarted_state = SessionState::new(session_key, "kimi");
+        restarted_state
+            .context_artifacts
+            .push(ContextArtifactRecord {
+                id: "other:artifact".to_string(),
+                source: "other".to_string(),
+                kind: "other".to_string(),
+                title: "Other context".to_string(),
+                source_locator: None,
+                paths: vec!["other/context.md".to_string()],
+                fingerprint: "artifact:other".to_string(),
+                updated_at_ms: 1,
+                metadata: BTreeMap::new(),
+            });
+        restarted_store.save(restarted_state).await;
+        let restarted_router = AgentRouter::new("kimi", restarted_store.clone(), executor)
             .with_workspace_root(Some(workspace_root));
-        let artifacts = restarted_router
-            .context_artifacts(session_key, "slack")
+        restarted_router
+            .sync_context(ContextSyncRequest {
+                session_key: session_key.to_string(),
+                source: "slack".to_string(),
+                base_path: PathBuf::from("slack"),
+                artifacts: vec![ContextArtifactInput {
+                    id: "slack:thread:C1:111.000".to_string(),
+                    kind: "slack_current_thread".to_string(),
+                    title: "Current Slack thread".to_string(),
+                    source_locator: Some("slack://C1/111.000".to_string()),
+                    files: vec![ContextFileInput {
+                        relative_path: PathBuf::from("slack/current-thread.md"),
+                        content: ContextFileContent::Text("thread".to_string()),
+                    }],
+                    metadata: BTreeMap::new(),
+                }],
+                unresolved: Vec::new(),
+            })
             .await
             .unwrap();
+        let saved = restarted_store.load(session_key).await.unwrap();
+        let artifacts = saved.context_artifacts;
 
         assert!(artifacts.iter().any(|record| record.kind == "slack_file"));
+        assert!(
+            artifacts
+                .iter()
+                .any(|record| record.kind == "slack_current_thread")
+        );
+        assert!(artifacts.iter().any(|record| record.source == "other"));
         let manifest = artifacts
             .iter()
             .find(|record| record.kind == "manifest")
