@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -28,6 +28,8 @@ const QQ_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+const QQ_MSG_TYPE_TEXT: u8 = 0;
+const QQ_MSG_TYPE_MARKDOWN: u8 = 2;
 #[derive(Debug, Clone)]
 pub struct QqBotChannel {
     cfg: QqConfig,
@@ -392,6 +394,24 @@ impl QqBotChannel {
         self.post_text_message(target, msg_id, msg_seq, text).await
     }
 
+    async fn send_markdown_reply_message(
+        &self,
+        session_key: &str,
+        target: &QqReplyTarget,
+        msg_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let msg_seq = {
+            let mut contexts = self.reply_contexts.lock().await;
+            let context = contexts.get_mut(session_key).ok_or_else(|| {
+                anyhow::anyhow!("QQ reply context is missing for session `{session_key}`")
+            })?;
+            context.take_next_seq()
+        };
+        self.post_markdown_message(target, msg_id, msg_seq, text)
+            .await
+    }
+
     async fn post_text_message(
         &self,
         target: &QqReplyTarget,
@@ -399,11 +419,56 @@ impl QqBotChannel {
         msg_seq: u32,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.post_message_body(
+            target,
+            msg_seq,
+            text.len(),
+            qq_text_message_body(msg_id, msg_seq, text),
+            "text",
+        )
+        .await
+    }
+
+    async fn post_markdown_message(
+        &self,
+        target: &QqReplyTarget,
+        msg_id: &str,
+        msg_seq: u32,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let Some(body) = qq_markdown_message_body(msg_id, msg_seq, text) else {
+            return self.post_text_message(target, msg_id, msg_seq, text).await;
+        };
+        match self
+            .post_message_body(target, msg_seq, text.len(), body, "markdown")
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) if qq_error_allows_text_fallback(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "QQ markdown message was rejected; retrying final reply as plain text"
+                );
+                self.post_text_message(target, msg_id, msg_seq, text).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn post_message_body(
+        &self,
+        target: &QqReplyTarget,
+        msg_seq: u32,
+        text_len: usize,
+        body: Value,
+        message_kind: &'static str,
+    ) -> anyhow::Result<()> {
         tracing::info!(
             target_scope = target.scope(),
             target_id = %target.id(),
             msg_seq,
-            text_len = text.len(),
+            text_len,
+            message_kind,
             "sending QQ message"
         );
         let token = self.token().await?;
@@ -413,12 +478,6 @@ impl QqBotChannel {
             target.scope(),
             target.id()
         );
-        let body = json!({
-            "content": text,
-            "msg_type": 0,
-            "msg_id": msg_id,
-            "msg_seq": msg_seq,
-        });
         let resp = self
             .http
             .post(url)
@@ -429,13 +488,14 @@ impl QqBotChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = truncate_for_error(resp.text().await.unwrap_or_default());
-            anyhow::bail!("QQ send message failed ({status}): {body}");
+            return Err(QqSendMessageError { status, body }.into());
         }
         tracing::info!(
             target_scope = target.scope(),
             target_id = %target.id(),
             msg_seq,
-            text_len = text.len(),
+            text_len,
+            message_kind,
             "sent QQ message"
         );
         Ok(())
@@ -597,9 +657,32 @@ impl RouterOutputSink for QqRouterOutputSink {
             tracing::warn!(error = %err, "failed to post compact QQ channel event summary");
         }
         self.channel
-            .send_reply_message(&self.session_key, &self.target, &self.msg_id, &text)
+            .send_markdown_reply_message(&self.session_key, &self.target, &self.msg_id, &text)
             .await
     }
+}
+
+fn qq_text_message_body(msg_id: &str, msg_seq: u32, text: &str) -> Value {
+    json!({
+        "content": text,
+        "msg_type": QQ_MSG_TYPE_TEXT,
+        "msg_id": msg_id,
+        "msg_seq": msg_seq,
+    })
+}
+
+fn qq_markdown_message_body(msg_id: &str, msg_seq: u32, text: &str) -> Option<Value> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "markdown": {
+            "content": text,
+        },
+        "msg_type": QQ_MSG_TYPE_MARKDOWN,
+        "msg_id": msg_id,
+        "msg_seq": msg_seq,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -767,6 +850,28 @@ fn truncate_for_error(mut body: String) -> String {
     body
 }
 
+#[derive(Debug)]
+struct QqSendMessageError {
+    status: StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for QqSendMessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QQ send message failed ({}): {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for QqSendMessageError {}
+
+fn qq_error_allows_text_fallback(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<QqSendMessageError>().is_some_and(|err| {
+        let body = err.body.to_ascii_lowercase();
+        err.status == StatusCode::BAD_REQUEST
+            && (body.contains("markdown") || body.contains("invalid") || body.contains("11255"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -847,6 +952,51 @@ mod tests {
         assert_eq!(value_as_u64(&json!(12)), Some(12));
         assert_eq!(value_as_u64(&json!("34")), Some(34));
         assert_eq!(value_as_u64(&json!("bad")), None);
+    }
+
+    #[test]
+    fn qq_markdown_message_body_uses_markdown_payload() {
+        let text = "# Title\n\n**bold**\n\n- item";
+
+        let body = qq_markdown_message_body("msg-1", 7, text).unwrap();
+
+        assert_eq!(body["msg_type"], QQ_MSG_TYPE_MARKDOWN);
+        assert_eq!(body["msg_id"], "msg-1");
+        assert_eq!(body["msg_seq"], 7);
+        assert_eq!(body["markdown"]["content"], text);
+        assert!(body.get("content").is_none());
+    }
+
+    #[test]
+    fn qq_markdown_message_body_falls_back_for_empty_text() {
+        assert!(qq_markdown_message_body("msg-1", 1, "").is_none());
+        assert!(qq_markdown_message_body("msg-1", 1, "   ").is_none());
+    }
+
+    #[test]
+    fn qq_text_message_body_uses_text_payload() {
+        let body = qq_text_message_body("msg-1", 3, "**literal**");
+
+        assert_eq!(body["msg_type"], QQ_MSG_TYPE_TEXT);
+        assert_eq!(body["msg_id"], "msg-1");
+        assert_eq!(body["msg_seq"], 3);
+        assert_eq!(body["content"], "**literal**");
+        assert!(body.get("markdown").is_none());
+    }
+
+    #[test]
+    fn qq_markdown_errors_allow_text_fallback_only_for_invalid_payloads() {
+        let invalid_markdown = anyhow::Error::new(QqSendMessageError {
+            status: StatusCode::BAD_REQUEST,
+            body: r#"{"message":"invalid request","code":11255}"#.to_string(),
+        });
+        assert!(qq_error_allows_text_fallback(&invalid_markdown));
+
+        let rate_limited = anyhow::Error::new(QqSendMessageError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"message":"msg limit exceed"}"#.to_string(),
+        });
+        assert!(!qq_error_allows_text_fallback(&rate_limited));
     }
 
     #[tokio::test]
