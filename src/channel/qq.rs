@@ -18,7 +18,6 @@ use crate::{
         RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
         render_compact_channel_events,
     },
-    session::work_queue::{EnqueueResult, SessionWorkQueue},
 };
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
@@ -26,9 +25,6 @@ const QQ_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
-const SESSION_QUEUE_CAPACITY: usize = 16;
-const SESSION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 #[derive(Debug, Clone)]
 pub struct QqBotChannel {
     cfg: QqConfig,
@@ -38,7 +34,6 @@ pub struct QqBotChannel {
     gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
     reply_contexts: Arc<Mutex<HashMap<String, QqReplyContext>>>,
-    session_queue: SessionWorkQueue<QqInboundMessage>,
 }
 
 impl QqBotChannel {
@@ -51,10 +46,6 @@ impl QqBotChannel {
             gateway_session: Arc::new(Mutex::new(QqGatewaySession::default())),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(1024))),
             reply_contexts: Arc::new(Mutex::new(HashMap::new())),
-            session_queue: SessionWorkQueue::new(
-                SESSION_QUEUE_CAPACITY,
-                SESSION_WORKER_IDLE_TIMEOUT,
-            ),
         }
     }
 
@@ -241,45 +232,18 @@ impl QqBotChannel {
             return Ok(());
         }
 
-        self.enqueue_session_message(message, router).await
-    }
-
-    async fn enqueue_session_message(
-        &self,
-        message: QqInboundMessage,
-        router: Arc<dyn RouterService>,
-    ) -> anyhow::Result<()> {
-        let session_key = message.session_key.clone();
         let channel = self.clone();
-        let handler_session_key = session_key.clone();
-        match self
-            .session_queue
-            .enqueue(session_key.clone(), message, move |message| {
-                let channel = channel.clone();
-                let router = router.clone();
-                let session_key = handler_session_key.clone();
-                async move {
-                    if let Err(err) = channel.route_message(message, router).await {
-                        tracing::warn!(
-                            error = %err,
-                            session_key = %session_key,
-                            "failed to handle QQ session message"
-                        );
-                    }
-                }
-            })
-            .await
-        {
-            EnqueueResult::Queued => Ok(()),
-            EnqueueResult::Full { capacity } => {
+        tokio::spawn(async move {
+            let session_key = message.session_key.clone();
+            if let Err(err) = channel.route_message(message, router).await {
                 tracing::warn!(
+                    error = %err,
                     session_key = %session_key,
-                    capacity,
-                    "QQ session queue is full; dropping inbound message"
+                    "failed to handle QQ session message"
                 );
-                Ok(())
             }
-        }
+        });
+        Ok(())
     }
 
     async fn route_message(

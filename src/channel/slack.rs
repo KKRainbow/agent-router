@@ -39,7 +39,6 @@ pub struct SlackSocketModeChannel {
     http: Client,
     seen_events: Arc<Mutex<EventDeduper>>,
     context_cache: Arc<Mutex<SlackContextCache>>,
-    session_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl SlackSocketModeChannel {
@@ -50,7 +49,6 @@ impl SlackSocketModeChannel {
             http: Client::new(),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(512))),
             context_cache: Arc::new(Mutex::new(SlackContextCache::default())),
-            session_locks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -263,8 +261,6 @@ impl SlackSocketModeChannel {
                 .await?;
             return Ok(());
         }
-        let session_lock = self.session_lock(&session_key).await;
-        let _session_guard = session_lock.lock().await;
         tracing::info!(
             channel = %event.channel,
             user_id = %event.user,
@@ -315,14 +311,6 @@ impl SlackSocketModeChannel {
             self.mark_file_sync_failed(cache_key).await;
         }
         Ok(())
-    }
-
-    async fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
-        let mut locks = self.session_locks.lock().await;
-        locks
-            .entry(session_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
     }
 
     async fn handle_slash_command(
@@ -3233,21 +3221,6 @@ mod tests {
         assert!(!slack_file_ref_needs_info(&with_download_url));
         assert!(!slack_file_ref_needs_info(&with_private_url));
         assert!(slack_file_ref_needs_info(&without_url));
-    }
-
-    #[tokio::test]
-    async fn slack_session_locks_are_scoped_by_session_key() {
-        let channel = SlackSocketModeChannel::new(
-            test_slack_config(true),
-            Arc::new(ApprovalBroker::default()),
-        );
-
-        let first = channel.session_lock("slack:channel:C1:111.000").await;
-        let same = channel.session_lock("slack:channel:C1:111.000").await;
-        let other = channel.session_lock("slack:channel:C1:222.000").await;
-
-        assert!(Arc::ptr_eq(&first, &same));
-        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[test]

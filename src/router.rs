@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -13,8 +16,9 @@ use crate::{
         ApprovalBroker, ApprovalPolicy, ApprovalRequest, ApprovalSelection, SharedApprovalBroker,
     },
     executor::{
-        ExecutorBackend, ExecutorChannelEventKind, ExecutorEventSink, ExecutorPrepareRequest,
-        ExecutorPromptRequest, ExecutorUpdate,
+        ExecutorBackend, ExecutorChannelEventKind, ExecutorEventSink, ExecutorInterruptRequest,
+        ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorUpdate,
+        InterruptReason, TurnCancellation,
     },
     session::{
         ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding, ExecutorHealth,
@@ -395,6 +399,15 @@ where
     approvals: SharedApprovalBroker,
     workspace_root: Option<PathBuf>,
     session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    active_turns: Mutex<HashMap<String, ActiveRouterTurn>>,
+    next_turn_generation: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRouterTurn {
+    generation: u64,
+    executor: String,
+    cancel: TurnCancellation,
 }
 
 impl<S, E> AgentRouter<S, E>
@@ -441,6 +454,8 @@ where
             approvals,
             workspace_root: None,
             session_locks: Mutex::new(HashMap::new()),
+            active_turns: Mutex::new(HashMap::new()),
+            next_turn_generation: AtomicU64::new(1),
         }
     }
 
@@ -457,22 +472,93 @@ where
             .clone()
     }
 
-    async fn handle_locked(
+    async fn install_active_turn(
+        &self,
+        session_key: &str,
+        executor: String,
+        cancel: TurnCancellation,
+    ) -> (u64, Option<ActiveRouterTurn>) {
+        let generation = self.next_turn_generation.fetch_add(1, Ordering::Relaxed);
+        let mut active_turns = self.active_turns.lock().await;
+        let replaced = active_turns.insert(
+            session_key.to_string(),
+            ActiveRouterTurn {
+                generation,
+                executor,
+                cancel,
+            },
+        );
+        (generation, replaced)
+    }
+
+    async fn interrupt_turn(
+        &self,
+        session_key: &str,
+        turn: ActiveRouterTurn,
+        reason: InterruptReason,
+    ) {
+        let _ = turn.cancel.cancel(reason).await;
+        if let Err(err) = self
+            .executor
+            .interrupt(ExecutorInterruptRequest {
+                session_key: session_key.to_string(),
+                executor: turn.executor,
+                generation: turn.generation,
+                reason,
+            })
+            .await
+        {
+            tracing::debug!(
+                error = %err,
+                session_key,
+                generation = turn.generation,
+                "executor interrupt request failed"
+            );
+        }
+    }
+
+    async fn take_active_turn_if_current(&self, session_key: &str, generation: u64) -> bool {
+        let mut active_turns = self.active_turns.lock().await;
+        if active_turns
+            .get(session_key)
+            .is_some_and(|turn| turn.generation == generation)
+        {
+            active_turns.remove(session_key);
+            return true;
+        }
+        false
+    }
+
+    async fn handle_input(
         &self,
         input: RouterInput,
+        context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
+        if let Some(context) = context {
+            let lock = self.session_lock(&context.session_key).await;
+            let _guard = lock.lock().await;
+            self.sync_context_locked(context).await?;
+        }
+
         let text = input.text.trim();
         let command = text.split_whitespace().next().unwrap_or("");
         if command == "/agent" {
+            let lock = self.session_lock(&input.session_key).await;
+            let _guard = lock.lock().await;
             return self
                 .handle_agent_command(&input.session_key, text, output)
                 .await;
         }
         if command == "/yolo" {
+            let lock = self.session_lock(&input.session_key).await;
+            let _guard = lock.lock().await;
             return self
                 .handle_yolo_command(&input.session_key, text, output)
                 .await;
+        }
+        if command == "/stop" {
+            return self.handle_stop_command(&input.session_key, output).await;
         }
         self.route_to_active_executor(input, output).await
     }
@@ -654,26 +740,75 @@ where
         }
     }
 
+    async fn handle_stop_command(
+        &self,
+        session_key: &str,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        let active = self.active_turns.lock().await.remove(session_key);
+        if let Some(active) = active {
+            self.interrupt_turn(session_key, active, InterruptReason::UserStop)
+                .await;
+            output
+                .send_final_reply("Stopped the active turn.".to_string())
+                .await
+        } else {
+            output
+                .send_final_reply("No active turn for this session.".to_string())
+                .await
+        }
+    }
+
     async fn route_to_active_executor(
         &self,
         input: RouterInput,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
-        let mut state = self
-            .store
-            .load_or_create(&input.session_key, &self.default_executor)
+        let session_key = input.session_key.clone();
+        let cancel = TurnCancellation::new();
+        let (generation, replaced, state, executor_name, descriptor, binding, session_cwd) = {
+            let lock = self.session_lock(&session_key).await;
+            let _guard = lock.lock().await;
+            let mut state = self
+                .store
+                .load_or_create(&session_key, &self.default_executor)
+                .await;
+            let executor_name = state.active_executor.clone();
+            let descriptor = self.executor.get(&executor_name).ok_or_else(|| {
+                anyhow::anyhow!("active executor `{executor_name}` is not configured")
+            })?;
+            let session_cwd = self.ensure_session_cwd(&mut state)?;
+            if session_cwd.is_some() {
+                self.store.save(state.clone()).await;
+            }
+            let binding = state.binding_for(&executor_name);
+            let (generation, replaced) = self
+                .install_active_turn(&session_key, executor_name.clone(), cancel.clone())
+                .await;
+            (
+                generation,
+                replaced,
+                state,
+                executor_name,
+                descriptor,
+                binding,
+                session_cwd,
+            )
+        };
+
+        if let Some(replaced) = replaced {
+            self.interrupt_turn(
+                &session_key,
+                replaced,
+                InterruptReason::ReplacedByNewMessage,
+            )
             .await;
-        let executor_name = state.active_executor.clone();
-        let descriptor = self.executor.get(&executor_name).ok_or_else(|| {
-            anyhow::anyhow!("active executor `{executor_name}` is not configured")
-        })?;
-        let session_cwd = self.ensure_session_cwd(&mut state)?;
-        if session_cwd.is_some() {
-            self.store.save(state.clone()).await;
         }
+
         tracing::info!(
-            session_key = %input.session_key,
+            session_key = %session_key,
             executor = %executor_name,
+            generation,
             cwd = session_cwd
                 .as_deref()
                 .map(|cwd| cwd.display().to_string())
@@ -682,31 +817,86 @@ where
             "routing turn to active executor"
         );
 
-        let binding = state.binding_for(&executor_name);
         let prepared = self
             .executor
-            .prepare(ExecutorPrepareRequest {
-                session_key: input.session_key.clone(),
-                executor: executor_name.clone(),
-                cwd: session_cwd.clone(),
-                previous_session_id: binding.external_session_id.clone(),
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: session_key.clone(),
+                    executor: executor_name.clone(),
+                    cwd: session_cwd.clone(),
+                    previous_session_id: binding.external_session_id.clone(),
+                },
+                cancel.clone(),
+            )
             .await;
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
-                state.executor_bindings.insert(
-                    executor_name.clone(),
-                    ExecutorBinding {
-                        protocol: descriptor.protocol.clone(),
-                        health: ExecutorHealth::Unhealthy,
-                        ..binding_with_session_cwd(binding, session_cwd.as_deref())
-                    },
-                );
-                self.store.save(state).await;
+                if cancel.is_cancelled().await {
+                    let _ = self
+                        .take_active_turn_if_current(&session_key, generation)
+                        .await;
+                    tracing::debug!(
+                        session_key = %session_key,
+                        executor = %executor_name,
+                        generation,
+                        error = %err,
+                        "discarded stale or cancelled prepare failure"
+                    );
+                    return Ok(());
+                }
+                let committed_failure = {
+                    let lock = self.session_lock(&session_key).await;
+                    let _guard = lock.lock().await;
+                    if !self
+                        .take_active_turn_if_current(&session_key, generation)
+                        .await
+                    {
+                        false
+                    } else {
+                        let mut latest = self
+                            .store
+                            .load_or_create(&session_key, &self.default_executor)
+                            .await;
+                        let latest_binding = latest.binding_for(&executor_name);
+                        latest.executor_bindings.insert(
+                            executor_name.clone(),
+                            ExecutorBinding {
+                                protocol: descriptor.protocol.clone(),
+                                health: ExecutorHealth::Unhealthy,
+                                ..binding_with_session_cwd(latest_binding, session_cwd.as_deref())
+                            },
+                        );
+                        self.store.save(latest).await;
+                        true
+                    }
+                };
+                if !committed_failure {
+                    tracing::debug!(
+                        session_key = %session_key,
+                        executor = %executor_name,
+                        generation,
+                        error = %err,
+                        "discarded stale prepare failure"
+                    );
+                    return Ok(());
+                }
                 return Err(err);
             }
         };
+        if cancel.is_cancelled().await {
+            let _ = self
+                .take_active_turn_if_current(&session_key, generation)
+                .await;
+            tracing::info!(
+                session_key = %session_key,
+                executor = %executor_name,
+                generation,
+                "router turn cancelled before prompt"
+            );
+            return Ok(());
+        }
+
         let projection = build_context_projection(ProjectionInput {
             transcript: &state.transcript,
             context_artifacts: &state.context_artifacts,
@@ -722,19 +912,20 @@ where
                 .executor
                 .prompt(
                     ExecutorPromptRequest {
-                        session_key: input.session_key.clone(),
+                        session_key: session_key.clone(),
                         executor: executor_name.clone(),
                         prompt: projection.prompt,
                         user_id: input.user_id.clone(),
                     },
                     &mut executor_events,
+                    cancel.clone(),
                 )
                 .await;
             (response, executor_events.into_updates())
         };
 
         match response {
-            Ok(response) => {
+            ExecutorPromptOutcome::Completed(response) => {
                 let activity_summaries = updates
                     .iter()
                     .filter_map(|update| update.summary(700))
@@ -756,43 +947,111 @@ where
                         .map(|(_, fingerprint)| fingerprint)
                         .collect::<Vec<_>>();
 
-                state.transcript.push(user_entry);
-                state.transcript.push(assistant_entry);
-                state.executor_bindings.insert(
-                    executor_name.clone(),
-                    update_binding_after_success(
-                        binding,
-                        prepared.external_session_id,
-                        descriptor.protocol,
-                        session_cwd.as_deref(),
-                        projection.acknowledged_fingerprints,
-                        new_fingerprints,
-                    ),
-                );
-                self.store.save(state).await;
+                let committed = {
+                    let lock = self.session_lock(&session_key).await;
+                    let _guard = lock.lock().await;
+                    if !self
+                        .take_active_turn_if_current(&session_key, generation)
+                        .await
+                    {
+                        false
+                    } else {
+                        let mut latest = self
+                            .store
+                            .load_or_create(&session_key, &self.default_executor)
+                            .await;
+                        let latest_binding = latest.binding_for(&executor_name);
+                        latest.transcript.push(user_entry);
+                        latest.transcript.push(assistant_entry);
+                        latest.executor_bindings.insert(
+                            executor_name.clone(),
+                            update_binding_after_success(
+                                latest_binding,
+                                prepared.external_session_id,
+                                descriptor.protocol,
+                                session_cwd.as_deref(),
+                                projection.acknowledged_fingerprints,
+                                new_fingerprints,
+                            ),
+                        );
+                        self.store.save(latest).await;
+                        true
+                    }
+                };
+                if !committed {
+                    tracing::debug!(
+                        session_key = %session_key,
+                        executor = %executor_name,
+                        generation,
+                        "discarded stale successful router turn"
+                    );
+                    return Ok(());
+                }
                 tracing::info!(
-                    session_key = %input.session_key,
+                    session_key = %session_key,
                     executor = %executor_name,
+                    generation,
                     final_text_len = response.final_text.len(),
                     "committed successful router turn"
                 );
                 output.send_final_reply(response.final_text).await
             }
-            Err(err) => {
-                state.executor_bindings.insert(
-                    executor_name.clone(),
-                    update_binding_after_prompt_failure(
-                        binding,
-                        prepared.external_session_id,
-                        descriptor.protocol,
-                        session_cwd.as_deref(),
-                    ),
+            ExecutorPromptOutcome::Cancelled => {
+                let current = self
+                    .take_active_turn_if_current(&session_key, generation)
+                    .await;
+                tracing::info!(
+                    session_key = %session_key,
+                    executor = %executor_name,
+                    generation,
+                    current,
+                    "router turn cancelled"
                 );
-                self.store.save(state).await;
+                Ok(())
+            }
+            ExecutorPromptOutcome::Failed(err) => {
+                let committed_failure = {
+                    let lock = self.session_lock(&session_key).await;
+                    let _guard = lock.lock().await;
+                    if !self
+                        .take_active_turn_if_current(&session_key, generation)
+                        .await
+                    {
+                        false
+                    } else {
+                        let mut latest = self
+                            .store
+                            .load_or_create(&session_key, &self.default_executor)
+                            .await;
+                        let latest_binding = latest.binding_for(&executor_name);
+                        latest.executor_bindings.insert(
+                            executor_name.clone(),
+                            update_binding_after_prompt_failure(
+                                latest_binding,
+                                prepared.external_session_id,
+                                descriptor.protocol,
+                                session_cwd.as_deref(),
+                            ),
+                        );
+                        self.store.save(latest).await;
+                        true
+                    }
+                };
+                if !committed_failure {
+                    tracing::debug!(
+                        session_key = %session_key,
+                        executor = %executor_name,
+                        generation,
+                        error = %err,
+                        "discarded stale router turn failure"
+                    );
+                    return Ok(());
+                }
                 tracing::warn!(
                     error = %err,
-                    session_key = %input.session_key,
+                    session_key = %session_key,
                     executor = %executor_name,
+                    generation,
                     "router turn failed"
                 );
                 Err(err)
@@ -1003,12 +1262,7 @@ where
         {
             return output.send_final_reply(reply.text).await;
         }
-        let lock = self.session_lock(&input.session_key).await;
-        let _guard = lock.lock().await;
-        if let Some(context) = context {
-            self.sync_context_locked(context).await?;
-        }
-        self.handle_locked(input, output).await
+        self.handle_input(input, context, output).await
     }
 
     async fn handle(
@@ -1023,9 +1277,7 @@ where
         {
             return output.send_final_reply(reply.text).await;
         }
-        let lock = self.session_lock(&input.session_key).await;
-        let _guard = lock.lock().await;
-        self.handle_locked(input, output).await
+        self.handle_input(input, None, output).await
     }
 
     async fn observe(&self, input: RouterInput) -> anyhow::Result<()> {
@@ -2545,6 +2797,7 @@ mod tests {
             async fn prepare(
                 &self,
                 _request: ExecutorPrepareRequest,
+                _cancel: TurnCancellation,
             ) -> anyhow::Result<crate::executor::PreparedExecutor> {
                 Ok(crate::executor::PreparedExecutor {
                     external_session_id: Some("stream-session".to_string()),
@@ -2556,8 +2809,9 @@ mod tests {
                 &self,
                 _request: ExecutorPromptRequest,
                 events: &mut dyn ExecutorEventSink,
-            ) -> anyhow::Result<crate::executor::ExecutorResponse> {
-                events
+                _cancel: TurnCancellation,
+            ) -> ExecutorPromptOutcome {
+                if let Err(err) = events
                     .send(
                         ExecutorUpdate::new("tool_call", "Bash", "$ cargo test", "completed")
                             .with_transcript_summary("Bash: status: completed")
@@ -2566,15 +2820,24 @@ mod tests {
                                 "status: completed",
                             )),
                     )
-                    .await?;
-                let release = self
+                    .await
+                {
+                    return ExecutorPromptOutcome::Failed(err);
+                }
+                let release = match self
                     .release
                     .lock()
                     .await
                     .take()
-                    .ok_or_else(|| anyhow::anyhow!("release gate already consumed"))?;
-                release.await?;
-                Ok(crate::executor::ExecutorResponse {
+                    .ok_or_else(|| anyhow::anyhow!("release gate already consumed"))
+                {
+                    Ok(release) => release,
+                    Err(err) => return ExecutorPromptOutcome::Failed(err),
+                };
+                if let Err(err) = release.await {
+                    return ExecutorPromptOutcome::Failed(err.into());
+                }
+                ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
                     final_text: "done".to_string(),
                 })
             }
@@ -2656,6 +2919,7 @@ mod tests {
             async fn prepare(
                 &self,
                 _request: ExecutorPrepareRequest,
+                _cancel: TurnCancellation,
             ) -> anyhow::Result<crate::executor::PreparedExecutor> {
                 Ok(crate::executor::PreparedExecutor {
                     external_session_id: Some("tool-session".to_string()),
@@ -2667,8 +2931,9 @@ mod tests {
                 &self,
                 _request: ExecutorPromptRequest,
                 events: &mut dyn ExecutorEventSink,
-            ) -> anyhow::Result<crate::executor::ExecutorResponse> {
-                events
+                _cancel: TurnCancellation,
+            ) -> ExecutorPromptOutcome {
+                if let Err(err) = events
                     .send(
                         ExecutorUpdate::new("tool_call", "Bash", "$ cargo test", "completed")
                             .with_transcript_summary("Bash: status: completed")
@@ -2677,8 +2942,11 @@ mod tests {
                                 "status: completed",
                             )),
                     )
-                    .await?;
-                Ok(crate::executor::ExecutorResponse {
+                    .await
+                {
+                    return ExecutorPromptOutcome::Failed(err);
+                }
+                ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
                     final_text: "done".to_string(),
                 })
             }
@@ -2727,6 +2995,210 @@ mod tests {
             saved.executor_bindings["kimi"].health,
             ExecutorHealth::Healthy
         );
+    }
+
+    struct InterruptibleExecutorBackend {
+        prompts: tokio::sync::Mutex<Vec<String>>,
+        interrupts: tokio::sync::Mutex<Vec<ExecutorInterruptRequest>>,
+        first_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        first_cancelled: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl InterruptibleExecutorBackend {
+        fn new(
+            first_started: tokio::sync::oneshot::Sender<()>,
+            first_cancelled: tokio::sync::oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                prompts: tokio::sync::Mutex::new(Vec::new()),
+                interrupts: tokio::sync::Mutex::new(Vec::new()),
+                first_started: tokio::sync::Mutex::new(Some(first_started)),
+                first_cancelled: tokio::sync::Mutex::new(Some(first_cancelled)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for InterruptibleExecutorBackend {
+        fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+            (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "fake".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            cancel: TurnCancellation,
+        ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+            if cancel.is_cancelled().await {
+                anyhow::bail!("prepare cancelled");
+            }
+            Ok(crate::executor::PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.executor)),
+                started_new_session: request.previous_session_id.is_none(),
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let prompt_index = {
+                let mut prompts = self.prompts.lock().await;
+                prompts.push(request.prompt);
+                prompts.len()
+            };
+            if prompt_index == 1 {
+                if let Some(started) = self.first_started.lock().await.take() {
+                    let _ = started.send(());
+                }
+                let _ = cancel.cancelled().await;
+                if let Some(cancelled) = self.first_cancelled.lock().await.take() {
+                    let _ = cancelled.send(());
+                }
+                return ExecutorPromptOutcome::Cancelled;
+            }
+            ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
+                final_text: format!("response {prompt_index}"),
+            })
+        }
+
+        async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
+            self.interrupts.lock().await.push(request);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn new_message_interrupts_active_turn_and_commits_replacement_only() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(InterruptibleExecutorBackend::new(started_tx, cancelled_tx));
+        let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor.clone()));
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut second_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                &mut second_output,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = first.await.unwrap();
+
+        assert!(first_output.events.is_empty());
+        assert_eq!(second_output.final_reply(), "response 2");
+        let interrupts = executor.interrupts.lock().await;
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].reason, InterruptReason::ReplacedByNewMessage);
+        drop(interrupts);
+
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[0].content, "second");
+        assert!(saved.transcript[1].content.contains("response 2"));
+        assert!(
+            !saved
+                .transcript
+                .iter()
+                .any(|message| message.content == "first")
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_active_turn_without_committing_transcript() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(InterruptibleExecutorBackend::new(started_tx, cancelled_tx));
+        let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor.clone()));
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut stop_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "/stop".to_string(),
+                    user_id: None,
+                },
+                &mut stop_output,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = first.await.unwrap();
+
+        assert!(first_output.events.is_empty());
+        assert_eq!(stop_output.final_reply(), "Stopped the active turn.");
+        let interrupts = executor.interrupts.lock().await;
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].reason, InterruptReason::UserStop);
+        drop(interrupts);
+
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        assert!(saved.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -2833,6 +3305,7 @@ mod tests {
             async fn prepare(
                 &self,
                 request: ExecutorPrepareRequest,
+                _cancel: TurnCancellation,
             ) -> anyhow::Result<crate::executor::PreparedExecutor> {
                 self.prepared.lock().await.push(request);
                 Ok(crate::executor::PreparedExecutor {
@@ -2845,8 +3318,9 @@ mod tests {
                 &self,
                 _request: ExecutorPromptRequest,
                 _events: &mut dyn ExecutorEventSink,
-            ) -> anyhow::Result<crate::executor::ExecutorResponse> {
-                anyhow::bail!("prompt failed")
+                _cancel: TurnCancellation,
+            ) -> ExecutorPromptOutcome {
+                ExecutorPromptOutcome::Failed(anyhow::anyhow!("prompt failed"))
             }
         }
 

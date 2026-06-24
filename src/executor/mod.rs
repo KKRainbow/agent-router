@@ -4,7 +4,8 @@ pub mod registry;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
+use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::text::truncate_chars;
 
@@ -34,6 +35,79 @@ pub struct ExecutorPromptRequest {
     pub executor: String,
     pub prompt: String,
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptReason {
+    ReplacedByNewMessage,
+    UserStop,
+    Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutorInterruptRequest {
+    pub session_key: String,
+    pub executor: String,
+    pub generation: u64,
+    pub reason: InterruptReason,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnCancellation {
+    inner: Arc<TurnCancellationInner>,
+}
+
+#[derive(Debug)]
+struct TurnCancellationInner {
+    reason: TokioMutex<Option<InterruptReason>>,
+    changed: watch::Sender<Option<InterruptReason>>,
+}
+
+impl TurnCancellation {
+    pub fn new() -> Self {
+        let (changed, _) = watch::channel(None);
+        Self {
+            inner: Arc::new(TurnCancellationInner {
+                reason: TokioMutex::new(None),
+                changed,
+            }),
+        }
+    }
+
+    pub async fn cancel(&self, reason: InterruptReason) -> bool {
+        let mut guard = self.inner.reason.lock().await;
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(reason);
+        let _ = self.inner.changed.send(Some(reason));
+        true
+    }
+
+    pub async fn is_cancelled(&self) -> bool {
+        self.inner.reason.lock().await.is_some()
+    }
+
+    pub async fn cancelled(&self) -> InterruptReason {
+        let mut changed = self.inner.changed.subscribe();
+        if let Some(reason) = *changed.borrow() {
+            return reason;
+        }
+        loop {
+            if changed.changed().await.is_err() {
+                return InterruptReason::Shutdown;
+            }
+            if let Some(reason) = *changed.borrow() {
+                return reason;
+            }
+        }
+    }
+}
+
+impl Default for TurnCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +206,43 @@ pub struct ExecutorResponse {
     pub final_text: String,
 }
 
+#[derive(Debug)]
+pub enum ExecutorPromptOutcome {
+    Completed(ExecutorResponse),
+    Cancelled,
+    Failed(anyhow::Error),
+}
+
+impl ExecutorPromptOutcome {
+    pub fn into_result(self) -> anyhow::Result<ExecutorResponse> {
+        match self {
+            Self::Completed(response) => Ok(response),
+            Self::Cancelled => anyhow::bail!("executor turn cancelled"),
+            Self::Failed(err) => Err(err),
+        }
+    }
+
+    pub fn unwrap(self) -> ExecutorResponse {
+        match self {
+            Self::Completed(response) => response,
+            Self::Cancelled => panic!("called `ExecutorPromptOutcome::unwrap()` on `Cancelled`"),
+            Self::Failed(err) => {
+                panic!("called `ExecutorPromptOutcome::unwrap()` on failed turn: {err}")
+            }
+        }
+    }
+
+    pub fn unwrap_err(self) -> anyhow::Error {
+        match self {
+            Self::Completed(_) => {
+                panic!("called `ExecutorPromptOutcome::unwrap_err()` on completed turn")
+            }
+            Self::Cancelled => anyhow::anyhow!("executor turn cancelled"),
+            Self::Failed(err) => err,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ExecutorEventSink: Send {
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()>;
@@ -141,12 +252,21 @@ pub trait ExecutorEventSink: Send {
 pub trait ExecutorBackend: Send + Sync + 'static {
     fn get(&self, name: &str) -> Option<ExecutorDescriptor>;
     fn list(&self) -> Vec<ExecutorDescriptor>;
-    async fn prepare(&self, request: ExecutorPrepareRequest) -> anyhow::Result<PreparedExecutor>;
+    async fn prepare(
+        &self,
+        request: ExecutorPrepareRequest,
+        cancel: TurnCancellation,
+    ) -> anyhow::Result<PreparedExecutor>;
     async fn prompt(
         &self,
         request: ExecutorPromptRequest,
         events: &mut dyn ExecutorEventSink,
-    ) -> anyhow::Result<ExecutorResponse>;
+        cancel: TurnCancellation,
+    ) -> ExecutorPromptOutcome;
+
+    async fn interrupt(&self, _request: ExecutorInterruptRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn summarize_json_rpc_error(error: &Value) -> String {
@@ -177,7 +297,8 @@ pub mod test_support {
 
     use super::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
-        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate,
+        PreparedExecutor, TurnCancellation,
     };
 
     #[derive(Debug, Default)]
@@ -226,7 +347,11 @@ pub mod test_support {
         async fn prepare(
             &self,
             request: ExecutorPrepareRequest,
+            cancel: TurnCancellation,
         ) -> anyhow::Result<PreparedExecutor> {
+            if cancel.is_cancelled().await {
+                anyhow::bail!("executor prepare cancelled");
+            }
             self.prepared.lock().await.push(request.clone());
             let started_new_session =
                 self.force_started_new_session || request.previous_session_id.is_none();
@@ -244,19 +369,26 @@ pub mod test_support {
             &self,
             request: ExecutorPromptRequest,
             events: &mut dyn ExecutorEventSink,
-        ) -> anyhow::Result<ExecutorResponse> {
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            if cancel.is_cancelled().await {
+                return ExecutorPromptOutcome::Cancelled;
+            }
             self.prompts.lock().await.push(ExecutorRequest {
                 session_key: request.session_key,
                 executor: request.executor,
                 prompt: request.prompt,
             });
-            events
+            if let Err(err) = events
                 .send(
                     ExecutorUpdate::new("plan", "Plan", "working", "")
                         .with_transcript_summary("Plan: working"),
                 )
-                .await?;
-            Ok(ExecutorResponse {
+                .await
+            {
+                return ExecutorPromptOutcome::Failed(err);
+            }
+            ExecutorPromptOutcome::Completed(ExecutorResponse {
                 final_text: "fake response".to_string(),
             })
         }

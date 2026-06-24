@@ -25,8 +25,8 @@ use crate::{
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
         ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
-        ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate,
-        PreparedExecutor, summarize_json_rpc_error,
+        ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorResponse,
+        ExecutorUpdate, PreparedExecutor, TurnCancellation, summarize_json_rpc_error,
     },
 };
 
@@ -308,7 +308,14 @@ impl ExecutorBackend for CodexAppServerManager {
             .collect()
     }
 
-    async fn prepare(&self, request: ExecutorPrepareRequest) -> anyhow::Result<PreparedExecutor> {
+    async fn prepare(
+        &self,
+        request: ExecutorPrepareRequest,
+        cancel: TurnCancellation,
+    ) -> anyhow::Result<PreparedExecutor> {
+        if cancel.is_cancelled().await {
+            anyhow::bail!("Codex app-server prepare cancelled");
+        }
         let cfg = self
             .executors
             .get(&request.executor)
@@ -326,6 +333,9 @@ impl ExecutorBackend for CodexAppServerManager {
                 request.cwd.as_deref(),
             )
             .await?;
+        if cancel.is_cancelled().await {
+            anyhow::bail!("Codex app-server prepare cancelled");
+        }
         let mut session = session.lock().await;
         let (thread_id, started_new_session) = session.ensure_thread().await?;
         tracing::info!(
@@ -345,10 +355,15 @@ impl ExecutorBackend for CodexAppServerManager {
         &self,
         request: ExecutorPromptRequest,
         events: &mut dyn ExecutorEventSink,
-    ) -> anyhow::Result<ExecutorResponse> {
-        let session = self
+        cancel: TurnCancellation,
+    ) -> ExecutorPromptOutcome {
+        let session = match self
             .existing_session(&request.session_key, &request.executor)
-            .await?;
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => return ExecutorPromptOutcome::Failed(err),
+        };
         let mut session = session.lock().await;
         let session_key = request.session_key.clone();
         let executor = request.executor.clone();
@@ -360,16 +375,21 @@ impl ExecutorBackend for CodexAppServerManager {
             "starting Codex app-server turn"
         );
         let result = session
-            .run_turn(&request.prompt, request.user_id, events)
+            .run_turn(&request.prompt, request.user_id, events, cancel)
             .await;
         match &result {
-            Ok(response) => tracing::info!(
+            ExecutorPromptOutcome::Completed(response) => tracing::info!(
                 executor = %executor,
                 session_key = %session_key,
                 final_text_len = response.final_text.len(),
                 "completed Codex app-server turn"
             ),
-            Err(err) => tracing::warn!(
+            ExecutorPromptOutcome::Cancelled => tracing::info!(
+                executor = %executor,
+                session_key = %session_key,
+                "cancelled Codex app-server turn"
+            ),
+            ExecutorPromptOutcome::Failed(err) => tracing::warn!(
                 error = %err,
                 executor = %executor,
                 session_key = %session_key,
@@ -509,11 +529,19 @@ impl CodexAppServerSession {
         prompt: &str,
         user_id: Option<String>,
         events: &mut dyn ExecutorEventSink,
-    ) -> anyhow::Result<ExecutorResponse> {
-        let thread_id = self
-            .thread_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("codex app-server thread has not been created"))?;
+        cancel: TurnCancellation,
+    ) -> ExecutorPromptOutcome {
+        let thread_id = match self.thread_id.clone() {
+            Some(thread_id) => thread_id,
+            None => {
+                return ExecutorPromptOutcome::Failed(anyhow::anyhow!(
+                    "codex app-server thread has not been created"
+                ));
+            }
+        };
+        if cancel.is_cancelled().await {
+            return ExecutorPromptOutcome::Cancelled;
+        }
         let CodexTurnStreams {
             generation: turn_generation,
             mut notifications,
@@ -530,7 +558,7 @@ impl CodexAppServerSession {
             server_response_tx.clone(),
             turn_scope.subscribe(),
         );
-        let mut turn_start = self
+        let mut turn_start = match self
             .client
             .request_started(
                 "turn/start",
@@ -539,9 +567,19 @@ impl CodexAppServerSession {
                     "input": [{"type": "text", "text": prompt}],
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(turn_start) => turn_start,
+            Err(err) => {
+                drop(server_request_tx);
+                turn_scope.cancel();
+                let _ = server_request_handler.await;
+                return ExecutorPromptOutcome::Failed(err);
+            }
+        };
 
         let mut active_turn_id = None;
+        let mut cancelled = false;
         let result: anyhow::Result<ExecutorResponse> = async {
             let mut final_text = String::new();
             let mut turn_start_acknowledged = false;
@@ -648,6 +686,12 @@ impl CodexAppServerSession {
                         self.limits.rpc_timeout.as_secs()
                     );
                 }
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    self.client.cancel_pending(turn_start.id).await;
+                    self.client.close("codex app-server turn cancelled").await;
+                    break;
+                }
                 }
             }
 
@@ -664,7 +708,14 @@ impl CodexAppServerSession {
         drop(server_request_tx);
         turn_scope.cancel();
         let _ = server_request_handler.await;
-        result
+        if cancelled {
+            ExecutorPromptOutcome::Cancelled
+        } else {
+            match result {
+                Ok(response) => ExecutorPromptOutcome::Completed(response),
+                Err(err) => ExecutorPromptOutcome::Failed(err),
+            }
+        }
     }
 
     async fn drain_ready_notifications(
@@ -1706,7 +1757,7 @@ mod tests {
     use crate::approval::ApprovalBroker;
     use crate::executor::{
         ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
-        test_support::CollectingExecutorEventSink,
+        InterruptReason, test_support::CollectingExecutorEventSink,
     };
 
     use super::*;
@@ -1950,12 +2001,15 @@ for line in sys.stdin:
         let manager = CodexAppServerManager::new(executor_config(&script, &executor_cwd));
 
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: Some(session_cwd.clone()),
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: Some(session_cwd.clone()),
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -1992,12 +2046,15 @@ for line in sys.stdin:
         let manager = CodexAppServerManager::new(executor_config(&script, tmp.path()));
 
         let prepared = manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
         let mut events = CollectingExecutorEventSink::default();
@@ -2010,6 +2067,7 @@ for line in sys.stdin:
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
+                TurnCancellation::new(),
             )
             .await
             .unwrap();
@@ -2017,6 +2075,80 @@ for line in sys.stdin:
         assert_eq!(prepared.external_session_id.as_deref(), Some("thread-1"));
         assert!(prepared.started_new_session);
         assert_eq!(response.final_text, "codex reply");
+    }
+
+    #[tokio::test]
+    async fn codex_prompt_cancellation_closes_app_server_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("cancellable_codex.py");
+        let prompt_marker = tmp.path().join("turn_started");
+        let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
+            .expect("prompt marker path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "turn/start":
+        with open({prompt_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+"#
+            ),
+        );
+        let manager = Arc::new(CodexAppServerManager::new(executor_config(
+            &script,
+            tmp.path(),
+        )));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let cancel = TurnCancellation::new();
+        let prompt_cancel = cancel.clone();
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        session_key: "session-1".to_string(),
+                        executor: "codex".to_string(),
+                        prompt: "wait".to_string(),
+                        user_id: None,
+                    },
+                    &mut events,
+                    prompt_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if prompt_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(prompt_marker.exists());
+        assert!(cancel.cancel(InterruptReason::UserStop).await);
+        assert!(matches!(
+            prompt_task.await.unwrap(),
+            ExecutorPromptOutcome::Cancelled
+        ));
+
+        let session = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        assert!(!session.lock().await.client.is_alive());
     }
 
     #[tokio::test]
@@ -2057,12 +2189,15 @@ for line in sys.stdin:
             approvals.clone(),
         ));
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2078,6 +2213,7 @@ for line in sys.stdin:
                         user_id: Some("U1".to_string()),
                     },
                     &mut events,
+                    TurnCancellation::new(),
                 )
                 .await
         });
@@ -2138,12 +2274,15 @@ for line in sys.stdin:
             approvals.clone(),
         ));
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2159,6 +2298,7 @@ for line in sys.stdin:
                         user_id: Some("U1".to_string()),
                     },
                     &mut events,
+                    TurnCancellation::new(),
                 )
                 .await
         });
@@ -2215,12 +2355,15 @@ for line in sys.stdin:
         );
         let manager = CodexAppServerManager::new(executor_config(&script, tmp.path()));
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2234,6 +2377,7 @@ for line in sys.stdin:
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
+                TurnCancellation::new(),
             )
             .await
             .unwrap_err();
@@ -2300,12 +2444,15 @@ for line in sys.stdin:
             approvals.clone(),
         ));
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2321,6 +2468,7 @@ for line in sys.stdin:
                         user_id: Some("U1".to_string()),
                     },
                     &mut events,
+                    TurnCancellation::new(),
                 )
                 .await
         });
@@ -2376,12 +2524,15 @@ for line in sys.stdin:
         );
         let manager = CodexAppServerManager::new(executor_config(&script, tmp.path()));
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2395,6 +2546,7 @@ for line in sys.stdin:
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
+                TurnCancellation::new(),
             )
             .await
             .unwrap();
@@ -2420,12 +2572,15 @@ for line in sys.stdin:
             },
         );
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2439,6 +2594,7 @@ for line in sys.stdin:
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
+                TurnCancellation::new(),
             )
             .await
             .unwrap_err();
@@ -2470,12 +2626,15 @@ for line in sys.stdin:
             },
         );
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2490,6 +2649,7 @@ for line in sys.stdin:
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
+                TurnCancellation::new(),
             ),
         )
         .await
@@ -2524,12 +2684,15 @@ for line in sys.stdin:
             },
         );
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2544,6 +2707,7 @@ for line in sys.stdin:
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
+                TurnCancellation::new(),
             ),
         )
         .await
@@ -2599,12 +2763,15 @@ for line in sys.stdin:
             },
         ));
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2620,6 +2787,7 @@ for line in sys.stdin:
                         user_id: Some("U1".to_string()),
                     },
                     &mut events,
+                    TurnCancellation::new(),
                 )
                 .await
         });
@@ -2673,12 +2841,15 @@ for line in sys.stdin:
             },
         );
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 
@@ -2692,6 +2863,7 @@ for line in sys.stdin:
                     user_id: Some("U1".to_string()),
                 },
                 &mut events,
+                TurnCancellation::new(),
             )
             .await
             .unwrap();
@@ -2712,12 +2884,15 @@ for line in sys.stdin:
             },
         );
         manager
-            .prepare(ExecutorPrepareRequest {
-                session_key: "session-1".to_string(),
-                executor: "codex".to_string(),
-                cwd: None,
-                previous_session_id: None,
-            })
+            .prepare(
+                ExecutorPrepareRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
             .await
             .unwrap();
 

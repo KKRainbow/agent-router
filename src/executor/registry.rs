@@ -6,9 +6,9 @@ use crate::{
     approval::SharedApprovalBroker,
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
-        ExecutorPromptRequest, ExecutorResponse, PreparedExecutor, acp::AcpExecutorManager,
-        codex_app_server::CodexAppServerManager,
+        ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorInterruptRequest,
+        ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, PreparedExecutor,
+        TurnCancellation, acp::AcpExecutorManager, codex_app_server::CodexAppServerManager,
     },
 };
 
@@ -56,17 +56,32 @@ impl ExecutorBackend for ExecutorRegistry {
         executors
     }
 
-    async fn prepare(&self, request: ExecutorPrepareRequest) -> anyhow::Result<PreparedExecutor> {
-        self.backend_for(&request.executor)?.prepare(request).await
+    async fn prepare(
+        &self,
+        request: ExecutorPrepareRequest,
+        cancel: TurnCancellation,
+    ) -> anyhow::Result<PreparedExecutor> {
+        self.backend_for(&request.executor)?
+            .prepare(request, cancel)
+            .await
     }
 
     async fn prompt(
         &self,
         request: ExecutorPromptRequest,
         events: &mut dyn ExecutorEventSink,
-    ) -> anyhow::Result<ExecutorResponse> {
+        cancel: TurnCancellation,
+    ) -> ExecutorPromptOutcome {
+        let backend = match self.backend_for(&request.executor) {
+            Ok(backend) => backend,
+            Err(err) => return ExecutorPromptOutcome::Failed(err),
+        };
+        backend.prompt(request, events, cancel).await
+    }
+
+    async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
         self.backend_for(&request.executor)?
-            .prompt(request, events)
+            .interrupt(request)
             .await
     }
 }
