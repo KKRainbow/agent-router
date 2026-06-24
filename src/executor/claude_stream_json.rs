@@ -14,7 +14,9 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::time::{sleep, Instant};
 
-use crate::approval::{ApprovalBroker, SharedApprovalBroker};
+use crate::approval::{
+    ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection, SharedApprovalBroker,
+};
 use crate::config::{ExecutorConfig, ExecutorProtocol};
 use crate::executor::{
     ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
@@ -861,11 +863,11 @@ async fn read_stdout<R, E>(
     mut stderr: E,
     updates: broadcast::Sender<ExecutorUpdate>,
     session_id: Arc<Mutex<Option<String>>>,
-    _active_user_id: Arc<Mutex<Option<String>>>,
-    _approvals: SharedApprovalBroker,
-    _session_key: String,
-    _executor: String,
-    _stdin: SharedStdin,
+    active_user_id: Arc<Mutex<Option<String>>>,
+    approvals: SharedApprovalBroker,
+    session_key: String,
+    executor: String,
+    stdin: SharedStdin,
     child: Arc<Mutex<Child>>,
     alive: Arc<AtomicBool>,
     mut shutdown: oneshot::Receiver<()>,
@@ -888,7 +890,18 @@ async fn read_stdout<R, E>(
                 match res {
                     Ok(0) => break,
                     Ok(_) => {
-                        handle_event_line(&stdout_line, updates.clone(), &session_id).await;
+                        let user_id = active_user_id.lock().await.clone();
+                        handle_event_line(
+                            &stdout_line,
+                            updates.clone(),
+                            &session_id,
+                            approvals.clone(),
+                            &session_key,
+                            &executor,
+                            user_id,
+                            &stdin,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         tracing::warn!(target: "agent_router::claude", error = %err, "stdout read error");
@@ -922,10 +935,16 @@ async fn read_stdout<R, E>(
     let _ = child.wait().await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event_line(
     line: &str,
     updates: broadcast::Sender<ExecutorUpdate>,
     session_id: &Arc<Mutex<Option<String>>>,
+    approvals: SharedApprovalBroker,
+    session_key: &str,
+    executor: &str,
+    user_id: Option<String>,
+    stdin: &SharedStdin,
 ) {
     let Some(event) = parse_event_line(line) else {
         return;
@@ -938,8 +957,125 @@ async fn handle_event_line(
         *session_id.lock().await = Some(id);
     }
 
-    for update in event_to_updates(event) {
-        let _ = updates.send(update);
+    match event {
+        ClaudeEvent::ControlRequest { request_id, request } => {
+            let approval_req = build_approval_request(
+                session_key,
+                executor,
+                user_id,
+                request_id.clone(),
+                request.clone(),
+            );
+            let approvals = approvals.clone();
+            let stdin = stdin.clone();
+            tokio::spawn(async move {
+                let selection = approvals.request(approval_req).await;
+                let response = match selection {
+                    ApprovalSelection::Selected(option_id) if option_id == "allow" => {
+                        ControlResponse::allow(request_id)
+                    }
+                    _ => ControlResponse::deny(
+                        request_id,
+                        "The user denied this tool use. Stop and wait for instructions.",
+                    ),
+                };
+                let mut json = match serde_json::to_string(&response) {
+                    Ok(json) => json,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "agent_router::claude",
+                            error = %err,
+                            "failed to serialize control response"
+                        );
+                        return;
+                    }
+                };
+                json.push('\n');
+                let mut guard = stdin.lock().await;
+                if let Err(err) = guard.write_all(json.as_bytes()).await {
+                    tracing::warn!(
+                        target: "agent_router::claude",
+                        error = %err,
+                        "failed to write control response"
+                    );
+                    return;
+                }
+                if let Err(err) = guard.flush().await {
+                    tracing::warn!(
+                        target: "agent_router::claude",
+                        error = %err,
+                        "failed to flush control response"
+                    );
+                }
+            });
+        }
+        ClaudeEvent::ControlCancelRequest { request_id } => {
+            // MVP limitation: the approval broker does not support cancelling an
+            // in-flight request. The turn-level cancellation path will clean up
+            // the session when the user cancels the turn.
+            tracing::debug!(
+                target: "agent_router::claude",
+                request_id = %request_id,
+                "Claude control request cancelled; not propagated to approval broker"
+            );
+        }
+        other => {
+            for update in event_to_updates(other) {
+                let _ = updates.send(update);
+            }
+        }
+    }
+}
+
+fn build_approval_request(
+    session_key: &str,
+    executor: &str,
+    requester_user_id: Option<String>,
+    request_id: String,
+    request: Option<Value>,
+) -> ApprovalRequest {
+    let tool_name = request
+        .as_ref()
+        .and_then(|r| {
+            r.get("tool")
+                .or_else(|| r.get("tool_name"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("tool");
+    let description = request
+        .as_ref()
+        .and_then(|r| {
+            r.get("description")
+                .or_else(|| r.get("message"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Claude requests permission to run tool {} (request_id: {}).",
+                tool_name, request_id
+            )
+        });
+    ApprovalRequest {
+        session_key: session_key.to_string(),
+        executor: executor.to_string(),
+        requester_user_id,
+        title: format!("Claude: {tool_name}"),
+        body: description,
+        options: vec![
+            ApprovalOption {
+                id: "allow".to_string(),
+                kind: "allow".to_string(),
+                name: "Allow".to_string(),
+                auto_approvable: false,
+            },
+            ApprovalOption {
+                id: "deny".to_string(),
+                kind: "reject".to_string(),
+                name: "Deny".to_string(),
+                auto_approvable: false,
+            },
+        ],
     }
 }
 
@@ -1001,7 +1137,6 @@ fn event_to_updates(event: ClaudeEvent) -> Vec<ExecutorUpdate> {
                 updates.push(ExecutorUpdate::new("result", "Result", text, ""));
             }
         }
-        // TODO(Task 8): wire up permission bridge for ControlRequest / ControlCancelRequest.
         ClaudeEvent::ControlRequest { .. } | ClaudeEvent::ControlCancelRequest { .. } => {}
     }
     updates
@@ -1042,5 +1177,35 @@ mod session_tests {
         }
 
         assert_eq!(session.session_id().await, Some("sess-ext-123".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod approval_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn control_request_builds_approval_request() {
+        let request = serde_json::json!({
+            "tool": "bash",
+            "description": "Run `cargo test` in /workspace"
+        });
+        let approval_req = build_approval_request(
+            "session-1",
+            "claude-local",
+            Some("U123".to_string()),
+            "req-42".to_string(),
+            Some(request),
+        );
+        assert_eq!(approval_req.session_key, "session-1");
+        assert_eq!(approval_req.executor, "claude-local");
+        assert_eq!(approval_req.requester_user_id, Some("U123".to_string()));
+        assert_eq!(approval_req.title, "Claude: bash");
+        assert_eq!(approval_req.body, "Run `cargo test` in /workspace");
+        assert_eq!(approval_req.options.len(), 2);
+        assert_eq!(approval_req.options[0].id, "allow");
+        assert_eq!(approval_req.options[0].name, "Allow");
+        assert_eq!(approval_req.options[1].id, "deny");
+        assert_eq!(approval_req.options[1].name, "Deny");
     }
 }
