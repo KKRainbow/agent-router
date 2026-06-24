@@ -138,10 +138,7 @@ impl CodexActiveEventStream {
                 && self.turn_id.is_none()
                 && completed_turn_ids.is_empty();
         };
-        if completed_turn_ids
-            .iter()
-            .any(|completed| completed == message_turn_id)
-        {
+        if completed_turn_ids.contains(message_turn_id) {
             return false;
         }
         match self.turn_id.as_deref() {
@@ -2893,17 +2890,11 @@ for line in sys.stdin:
 
         let (new_notifications_tx, mut new_notifications) = mpsc::unbounded_channel();
         let (new_requests_tx, mut new_requests) = mpsc::unbounded_channel();
-        {
-            let generation = event_streams.lock().unwrap().open(
-                "thread-1".to_string(),
-                new_notifications_tx,
-                new_requests_tx,
-            );
-            event_streams
-                .lock()
-                .unwrap()
-                .set_turn_id(generation, "turn-21".to_string());
-        }
+        let new_generation = event_streams.lock().unwrap().open(
+            "thread-1".to_string(),
+            new_notifications_tx,
+            new_requests_tx,
+        );
 
         dispatch_codex_message(
             json!({
@@ -2966,6 +2957,11 @@ for line in sys.stdin:
             .await;
         }
         assert!(new_requests.try_recv().is_err());
+
+        event_streams
+            .lock()
+            .unwrap()
+            .set_turn_id(new_generation, "turn-21".to_string());
 
         dispatch_codex_message(
             json!({
