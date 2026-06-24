@@ -533,6 +533,16 @@ impl SlackSocketModeChannel {
         self.cfg.allowed_channels.is_empty() || self.cfg.allowed_channels.contains(channel)
     }
 
+    fn should_accept_linked_thread_channel(
+        &self,
+        current_channel: &str,
+        linked_channel: &str,
+    ) -> bool {
+        linked_channel == current_channel
+            || (!self.cfg.allowed_channels.is_empty()
+                && self.cfg.allowed_channels.contains(linked_channel))
+    }
+
     fn should_sync_context(&self, text: &str) -> bool {
         self.cfg.context_sync.enabled
             && !self.cfg.bot_token.is_empty()
@@ -553,6 +563,7 @@ impl SlackSocketModeChannel {
         let mut unresolved = Vec::new();
         let mut remove_artifacts = Vec::new();
         let mut current_thread_fresh = false;
+        let mut prune_derived_artifacts = false;
         let messages = if self.cfg.context_sync.current_thread {
             tracing::info!(
                 channel = %event.channel,
@@ -564,6 +575,7 @@ impl SlackSocketModeChannel {
                 .await
             {
                 Ok(fetch) => {
+                    prune_derived_artifacts = true;
                     let fresh = fetch.stale_reason.is_none();
                     if let Some(reason) = fetch.stale_reason {
                         tracing::info!(
@@ -592,6 +604,7 @@ impl SlackSocketModeChannel {
                 }
                 Err(err) => {
                     if slack_error_is_access_denied(&err) {
+                        prune_derived_artifacts = true;
                         remove_artifacts
                             .push(slack_current_thread_removal(&event.channel, &thread_ts));
                         remove_artifacts.push(slack_all_linked_threads_removal());
@@ -628,7 +641,7 @@ impl SlackSocketModeChannel {
             for link in collect_slack_thread_links(&link_messages, &event.channel, &thread_ts) {
                 let linked_artifact_id =
                     slack_linked_thread_artifact_id(&link.channel, &link.thread_ts);
-                if !self.should_accept_channel(&link.channel) {
+                if !self.should_accept_linked_thread_channel(&event.channel, &link.channel) {
                     tracing::info!(
                         linked_channel = %link.channel,
                         linked_thread_ts = %link.thread_ts,
@@ -826,8 +839,11 @@ impl SlackSocketModeChannel {
                 },
                 &linked_threads,
                 &downloaded_files,
-                retained_linked_thread_artifact_ids,
-                retained_file_artifact_ids,
+                SlackDerivedArtifactRetention {
+                    linked_thread_ids: retained_linked_thread_artifact_ids,
+                    file_ids: retained_file_artifact_ids,
+                    prune: prune_derived_artifacts,
+                },
                 remove_artifacts,
                 unresolved,
             ),
@@ -2032,13 +2048,28 @@ struct CurrentSlackThreadContext<'a> {
     messages: &'a [SlackThreadMessage],
 }
 
+struct SlackDerivedArtifactRetention {
+    linked_thread_ids: BTreeSet<String>,
+    file_ids: BTreeSet<String>,
+    prune: bool,
+}
+
+impl SlackDerivedArtifactRetention {
+    fn pruning(linked_thread_ids: BTreeSet<String>, file_ids: BTreeSet<String>) -> Self {
+        Self {
+            linked_thread_ids,
+            file_ids,
+            prune: true,
+        }
+    }
+}
+
 fn build_slack_context_request(
     session_key: &str,
     current_thread: CurrentSlackThreadContext<'_>,
     linked_threads: &[LinkedSlackThread],
     downloaded_files: &[DownloadedSlackFile],
-    mut retained_linked_thread_artifact_ids: BTreeSet<String>,
-    mut retained_file_artifact_ids: BTreeSet<String>,
+    mut retention: SlackDerivedArtifactRetention,
     remove_artifacts: Vec<ContextArtifactRemovalInput>,
     unresolved: Vec<ContextSyncIssueInput>,
 ) -> ContextSyncRequest {
@@ -2094,21 +2125,27 @@ fn build_slack_context_request(
         if linked_thread.messages.is_empty() {
             continue;
         }
-        retained_linked_thread_artifact_ids.insert(slack_linked_thread_artifact_id(
+        retention
+            .linked_thread_ids
+            .insert(slack_linked_thread_artifact_id(
             &linked_thread.link.channel,
             &linked_thread.link.thread_ts,
         ));
         artifacts.push(linked_thread_artifact(linked_thread));
     }
-    remove_artifacts.push(slack_retained_linked_threads_removal(
-        retained_linked_thread_artifact_ids,
-    ));
+    if retention.prune {
+        remove_artifacts.push(slack_retained_linked_threads_removal(retention.linked_thread_ids));
+    }
 
     for downloaded in downloaded_files {
-        retained_file_artifact_ids.insert(slack_file_artifact_id(&downloaded.file.id));
+        retention
+            .file_ids
+            .insert(slack_file_artifact_id(&downloaded.file.id));
         artifacts.push(slack_file_artifact(downloaded));
     }
-    remove_artifacts.push(slack_retained_files_removal(retained_file_artifact_ids));
+    if retention.prune {
+        remove_artifacts.push(slack_retained_files_removal(retention.file_ids));
+    }
 
     ContextSyncRequest {
         session_key: session_key.to_string(),
@@ -2393,6 +2430,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn linked_threads_default_to_same_channel_unless_explicitly_allowed() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+
+        assert!(channel.should_accept_linked_thread_channel("C1", "C1"));
+        assert!(!channel.should_accept_linked_thread_channel("C1", "C2"));
+
+        let mut cfg = test_slack_config(true);
+        cfg.allowed_channels.insert("C2".to_string());
+        let channel = SlackSocketModeChannel::new(cfg, Arc::new(ApprovalBroker::default()));
+
+        assert!(channel.should_accept_linked_thread_channel("C1", "C2"));
+    }
+
     fn approval_request(session_key: &str) -> ApprovalRequest {
         ApprovalRequest {
             session_key: session_key.to_string(),
@@ -2535,6 +2589,7 @@ mod tests {
             &[downloaded],
             BTreeSet::new(),
             BTreeSet::new(),
+            true,
             Vec::new(),
             Vec::new(),
         );
@@ -2597,6 +2652,7 @@ mod tests {
             &[downloaded],
             BTreeSet::new(),
             retained_files,
+            true,
             Vec::new(),
             Vec::new(),
         );
@@ -2669,6 +2725,7 @@ mod tests {
             &[],
             retained_linked_threads,
             BTreeSet::new(),
+            true,
             Vec::new(),
             Vec::new(),
         );
@@ -2686,6 +2743,37 @@ mod tests {
         assert!(linked_retain_ids.contains(&slack_linked_thread_artifact_id("C2", "222.000")));
         assert!(linked_retain_ids.contains(&slack_linked_thread_artifact_id("C4", "444.000")));
         assert!(!linked_retain_ids.contains(&slack_linked_thread_artifact_id("C5", "555.000")));
+    }
+
+    #[test]
+    fn slack_context_request_skips_derived_pruning_without_current_thread_view() {
+        let request = build_slack_context_request(
+            "slack:channel:C1:111.000",
+            CurrentSlackThreadContext {
+                channel: "C1",
+                thread_ts: "111.000",
+                fresh: false,
+                messages: &[],
+            },
+            &[],
+            &[],
+            BTreeSet::new(),
+            BTreeSet::new(),
+            false,
+            Vec::new(),
+            vec![ContextSyncIssueInput {
+                kind: "current_thread".to_string(),
+                reference: "C1:111.000".to_string(),
+                reason: "Slack conversations.replies failed: rate_limited".to_string(),
+            }],
+        );
+
+        assert!(!request.remove_artifacts.iter().any(|removal| matches!(
+            removal,
+            ContextArtifactRemovalInput::ExceptKind { kind, .. }
+                if kind == "slack_linked_thread" || kind == "slack_file"
+        )));
+        assert_eq!(request.unresolved.len(), 1);
     }
 
     #[test]
@@ -3284,6 +3372,7 @@ mod tests {
             &[],
             BTreeSet::new(),
             BTreeSet::new(),
+            true,
             Vec::new(),
             Vec::new(),
         );
@@ -3349,6 +3438,7 @@ mod tests {
             &[],
             BTreeSet::new(),
             BTreeSet::new(),
+            true,
             Vec::new(),
             Vec::new(),
         );

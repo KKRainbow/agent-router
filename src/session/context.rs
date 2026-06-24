@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::OpenOptions,
+    io::Write,
     path::{Component, Path, PathBuf},
 };
 
@@ -179,13 +181,7 @@ pub fn write_context_sync(
             validate_source_context_path(&request.base_path, &file.relative_path)?;
             let content = file.content.into_bytes();
             let hash = sha256_hex(&content);
-            let path = cwd.join(&file.relative_path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create context directory {}", parent.display()))?;
-            }
-            std::fs::write(&path, &content)
-                .with_context(|| format!("write context file {}", path.display()))?;
+            write_context_file(cwd, &request.base_path, &file.relative_path, &content)?;
             let relative_path = file.relative_path.display().to_string();
             path_records.push(relative_path.clone());
             file_manifest.push(ContextFileManifest {
@@ -215,6 +211,7 @@ pub fn write_context_sync(
         });
     }
 
+    remove_replaced_context_artifact_files(cwd, &request.base_path, &source_records, &updates)?;
     merge_context_artifacts(&mut source_records, updates);
 
     let manifest = ContextManifest {
@@ -233,13 +230,7 @@ pub fn write_context_sync(
         &unresolved,
     );
     let manifest_rel = request.base_path.join("manifest.json");
-    let manifest_path = cwd.join(&manifest_rel);
-    if let Some(parent) = manifest_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create context directory {}", parent.display()))?;
-    }
-    std::fs::write(&manifest_path, &manifest_bytes)
-        .with_context(|| format!("write context manifest {}", manifest_path.display()))?;
+    write_context_file(cwd, &request.base_path, &manifest_rel, &manifest_bytes)?;
 
     let manifest_record = ContextArtifactRecord {
         id: format!("{}:manifest", request.source),
@@ -278,17 +269,25 @@ pub fn read_context_artifacts_from_manifest(
     validate_relative_path(base_path)?;
     let manifest_rel = base_path.join("manifest.json");
     validate_relative_path(&manifest_rel)?;
-    let manifest_path = cwd.join(&manifest_rel);
-    let bytes = match std::fs::read(&manifest_path) {
+    let bytes = match read_context_file(cwd, base_path, &manifest_rel) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("read context manifest {}", manifest_path.display()));
+            return Err(err).with_context(|| {
+                format!(
+                    "read context manifest {}",
+                    cwd.join(&manifest_rel).display()
+                )
+            });
         }
     };
-    let snapshot = serde_json::from_slice::<ContextManifestSnapshot>(&bytes)
-        .with_context(|| format!("parse context manifest {}", manifest_path.display()))?;
+    let snapshot =
+        serde_json::from_slice::<ContextManifestSnapshot>(&bytes).with_context(|| {
+            format!(
+                "parse context manifest {}",
+                cwd.join(&manifest_rel).display()
+            )
+        })?;
     if snapshot.source != source || snapshot.session_key != session_key {
         return Ok(Vec::new());
     }
@@ -302,9 +301,8 @@ pub fn read_context_artifacts_from_manifest(
         let mut file_manifest = Vec::new();
         for path in &artifact.paths {
             validate_source_context_path(base_path, Path::new(path))?;
-            let artifact_path = cwd.join(path);
-            let bytes = std::fs::read(&artifact_path)
-                .with_context(|| format!("read context artifact {}", artifact_path.display()))?;
+            let bytes = read_context_file(cwd, base_path, Path::new(path))
+                .with_context(|| format!("read context artifact {}", cwd.join(path).display()))?;
             file_manifest.push(ContextFileManifest {
                 path: path.clone(),
                 size_bytes: bytes.len(),
@@ -367,6 +365,189 @@ pub fn merge_context_artifacts(
     }
 }
 
+fn read_context_file(cwd: &Path, base_path: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
+    validate_source_context_path(base_path, path).map_err(std::io::Error::other)?;
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::other("context file has no parent"));
+    };
+    if !context_dir_exists_without_symlink(cwd, parent)? {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    let target = cwd.join(path);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::other(format!(
+                "context file is a symlink: {}",
+                target.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "context path is not a file: {}",
+                target.display()
+            )));
+        }
+        Err(err) => return Err(err),
+    }
+    std::fs::read(target)
+}
+
+fn write_context_file(
+    cwd: &Path,
+    base_path: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    validate_source_context_path(base_path, path)?;
+    let parent_rel = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("context file has no parent: {}", path.display()))?;
+    ensure_context_dir_without_symlink(cwd, parent_rel)?;
+    let parent = cwd.join(parent_rel);
+    let target = cwd.join(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("context");
+    let mut temp_path = None;
+    let unique = now_ms();
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            unique.saturating_add(u64::from(attempt))
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)
+                    .with_context(|| format!("write context temp file {}", candidate.display()))?;
+                temp_path = Some(candidate);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("create context temp file {}", candidate.display()));
+            }
+        }
+    }
+    let temp_path = temp_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "create context temp file for {} after repeated collisions",
+            target.display()
+        )
+    })?;
+    if let Err(err) = std::fs::rename(&temp_path, &target) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "replace context file {} with {}",
+                target.display(),
+                temp_path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn ensure_context_dir_without_symlink(cwd: &Path, relative_dir: &Path) -> anyhow::Result<()> {
+    validate_relative_path(relative_dir)?;
+    ensure_context_root_without_symlink(cwd)?;
+    let mut path = cwd.to_path_buf();
+    for component in relative_dir.components() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!(
+                "context path contains invalid component: {}",
+                relative_dir.display()
+            );
+        };
+        path.push(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("context directory is a symlink: {}", path.display());
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!("context path is not a directory: {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&path)
+                    .with_context(|| format!("create context directory {}", path.display()))?;
+                let metadata = std::fs::symlink_metadata(&path)
+                    .with_context(|| format!("stat context directory {}", path.display()))?;
+                anyhow::ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "context directory is invalid after create: {}",
+                    path.display()
+                );
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("stat context directory {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_context_root_without_symlink(cwd: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(cwd) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("context root is a symlink: {}", cwd.display());
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => anyhow::bail!("context root is not a directory: {}", cwd.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(cwd)
+                .with_context(|| format!("create context root {}", cwd.display()))?;
+            let metadata = std::fs::symlink_metadata(cwd)
+                .with_context(|| format!("stat context root {}", cwd.display()))?;
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "context root is invalid after create: {}",
+                cwd.display()
+            );
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| format!("stat context root {}", cwd.display())),
+    }
+}
+
+fn context_dir_exists_without_symlink(cwd: &Path, relative_dir: &Path) -> std::io::Result<bool> {
+    validate_relative_path(relative_dir).map_err(std::io::Error::other)?;
+    let mut path = cwd.to_path_buf();
+    for component in relative_dir.components() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::other(format!(
+                "context path contains invalid component: {}",
+                relative_dir.display()
+            )));
+        };
+        path.push(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "context directory is a symlink: {}",
+                    path.display()
+                )));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "context path is not a directory: {}",
+                    path.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(true)
+}
+
 fn remove_context_artifact_files(
     cwd: &Path,
     base_path: &Path,
@@ -375,8 +556,15 @@ fn remove_context_artifact_files(
     let base_abs = cwd.join(base_path);
     for record in records {
         for path in &record.paths {
-            validate_source_context_path(base_path, Path::new(path))?;
-            let path = cwd.join(path);
+            let relative_path = Path::new(path);
+            validate_source_context_path(base_path, relative_path)?;
+            let parent_rel = relative_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("context file has no parent: {}", path))?;
+            if !context_dir_exists_without_symlink(cwd, parent_rel)? {
+                continue;
+            }
+            let path = cwd.join(relative_path);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -389,6 +577,36 @@ fn remove_context_artifact_files(
         }
     }
     Ok(())
+}
+
+fn remove_replaced_context_artifact_files(
+    cwd: &Path,
+    base_path: &Path,
+    existing: &[ContextArtifactRecord],
+    updates: &[ContextArtifactRecord],
+) -> anyhow::Result<()> {
+    let mut stale_records = Vec::new();
+    for update in updates {
+        let Some(existing) = existing.iter().find(|record| {
+            record.source == update.source && record.kind == update.kind && record.id == update.id
+        }) else {
+            continue;
+        };
+        let retained_paths = update.paths.iter().collect::<BTreeSet<_>>();
+        let stale_paths = existing
+            .paths
+            .iter()
+            .filter(|path| !retained_paths.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if stale_paths.is_empty() {
+            continue;
+        }
+        let mut stale_record = existing.clone();
+        stale_record.paths = stale_paths;
+        stale_records.push(stale_record);
+    }
+    remove_context_artifact_files(cwd, base_path, &stale_records)
 }
 
 fn prune_empty_context_dirs(mut dir: Option<&Path>, base_path: &Path) -> anyhow::Result<()> {
@@ -432,16 +650,25 @@ fn read_existing_unresolved(
     if validate_source_context_path(base_path, &manifest_rel).is_err() {
         return Ok(Vec::new());
     }
-    let path = cwd.join(&manifest_rel);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_context_file(cwd, base_path, &manifest_rel) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(err).with_context(|| format!("read context manifest {}", path.display()));
+            return Err(err).with_context(|| {
+                format!(
+                    "read context manifest {}",
+                    cwd.join(&manifest_rel).display()
+                )
+            });
         }
     };
-    let snapshot = serde_json::from_slice::<ContextManifestSnapshot>(&bytes)
-        .with_context(|| format!("parse context manifest {}", path.display()))?;
+    let snapshot =
+        serde_json::from_slice::<ContextManifestSnapshot>(&bytes).with_context(|| {
+            format!(
+                "parse context manifest {}",
+                cwd.join(&manifest_rel).display()
+            )
+        })?;
     if snapshot.source != source || snapshot.session_key != session_key {
         return Ok(Vec::new());
     }
@@ -692,6 +919,84 @@ mod tests {
         }];
 
         assert!(write_context_sync(tmp.path(), request, &existing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_context_sync_rejects_symlink_context_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("outside")).unwrap();
+        symlink(tmp.path().join("outside"), tmp.path().join("slack")).unwrap();
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("thread".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        assert!(write_context_sync(tmp.path(), request, &[]).is_err());
+        assert!(!tmp.path().join("outside/current-thread.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_context_sync_replaces_file_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("slack")).unwrap();
+        std::fs::write(tmp.path().join("outside.txt"), "outside").unwrap();
+        symlink(
+            tmp.path().join("outside.txt"),
+            tmp.path().join("slack/current-thread.md"),
+        )
+        .unwrap();
+        let request = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("inside".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        write_context_sync(tmp.path(), request, &[]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("outside.txt")).unwrap(),
+            "outside"
+        );
+        let metadata =
+            std::fs::symlink_metadata(tmp.path().join("slack/current-thread.md")).unwrap();
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("slack/current-thread.md")).unwrap(),
+            "inside"
+        );
     }
 
     #[test]
@@ -998,6 +1303,63 @@ mod tests {
         assert!(!file_dir.exists());
         assert!(!base.join("files").exists());
         assert!(base.exists());
+    }
+
+    #[test]
+    fn write_context_sync_removes_replaced_artifact_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:file:F1".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Slack file F1".to_string(),
+                source_locator: None,
+                files: vec![
+                    ContextFileInput {
+                        relative_path: PathBuf::from("slack/files/F1/original/old.txt"),
+                        content: ContextFileContent::Text("old".to_string()),
+                    },
+                    ContextFileInput {
+                        relative_path: PathBuf::from("slack/files/F1/extracted.md"),
+                        content: ContextFileContent::Text("old extracted".to_string()),
+                    },
+                ],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        let records = write_context_sync(tmp.path(), first, &[]).unwrap();
+        let second = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:file:F1".to_string(),
+                kind: "slack_file".to_string(),
+                title: "Slack file F1".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/files/F1/original/new.txt"),
+                    content: ContextFileContent::Text("new".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        write_context_sync(tmp.path(), second, &records).unwrap();
+
+        assert!(!tmp.path().join("slack/files/F1/original/old.txt").exists());
+        assert!(!tmp.path().join("slack/files/F1/extracted.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("slack/files/F1/original/new.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
