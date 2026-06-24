@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,6 +43,7 @@ pub struct SlackSocketModeChannel {
     seen_events: Arc<Mutex<EventDeduper>>,
     context_cache: Arc<Mutex<SlackContextCache>>,
     context_generations: Arc<Mutex<BTreeMap<String, u64>>>,
+    next_context_generation: Arc<AtomicU64>,
 }
 
 impl SlackSocketModeChannel {
@@ -51,6 +55,7 @@ impl SlackSocketModeChannel {
             seen_events: Arc::new(Mutex::new(EventDeduper::new(512))),
             context_cache: Arc::new(Mutex::new(SlackContextCache::default())),
             context_generations: Arc::new(Mutex::new(BTreeMap::new())),
+            next_context_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -264,16 +269,18 @@ impl SlackSocketModeChannel {
             return Ok(());
         }
         let command = text.split_whitespace().next().unwrap_or("");
+        let mut context_generation = None;
         let preempt_generation =
             if approval_command || matches!(command, "/stop" | "/agent" | "/yolo") {
                 None
             } else {
-                let generation = router.preempt(&session_key).await?;
+                let generation = self.next_context_generation.fetch_add(1, Ordering::Relaxed);
                 self.remember_context_generation(&session_key, generation)
                     .await;
-                Some(generation)
+                context_generation = Some(generation);
+                Some(router.preempt(&session_key).await?)
             };
-        let context_turn = preempt_generation.map(|generation| SlackContextTurn {
+        let context_turn = context_generation.map(|generation| SlackContextTurn {
             session_key: session_key.clone(),
             generation,
         });

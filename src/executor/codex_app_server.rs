@@ -734,6 +734,11 @@ impl CodexAppServerSession {
         drop(server_request_tx);
         turn_scope.cancel();
         let _ = server_request_handler.await;
+        if !cancelled && cancel.is_cancelled().await {
+            cancelled = true;
+            self.client.cancel_pending(turn_start.id).await;
+            self.client.close("codex app-server turn cancelled").await;
+        }
         if cancelled {
             ExecutorPromptOutcome::Cancelled
         } else {

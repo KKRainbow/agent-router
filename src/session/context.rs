@@ -126,11 +126,26 @@ impl ContextSyncPlan {
     }
 
     pub fn commit(mut self) -> anyhow::Result<Vec<ContextArtifactRecord>> {
-        remove_context_artifact_files(&self.cwd, &self.base_path, &self.removed_source_records)?;
+        let mut installed = Vec::new();
         for staged in &self.staged_files {
-            staged.commit()?;
+            match staged.install() {
+                Ok(file) => installed.push(file),
+                Err(err) => {
+                    rollback_installed_context_files(&installed);
+                    return Err(err);
+                }
+            }
         }
-        remove_context_artifact_files(&self.cwd, &self.base_path, &self.replaced_source_records)?;
+        for file in &installed {
+            file.discard_backup();
+        }
+        let _ =
+            remove_context_artifact_files(&self.cwd, &self.base_path, &self.removed_source_records);
+        let _ = remove_context_artifact_files(
+            &self.cwd,
+            &self.base_path,
+            &self.replaced_source_records,
+        );
         self.committed = true;
         Ok(std::mem::take(&mut self.records))
     }
@@ -154,44 +169,105 @@ struct StagedContextFile {
 }
 
 impl StagedContextFile {
-    fn commit(&self) -> anyhow::Result<()> {
-        match std::fs::rename(&self.temp_path, &self.target_path) {
-            Ok(()) => return Ok(()),
-            Err(err) if self.target_path.try_exists().unwrap_or(false) => {
-                std::fs::remove_file(&self.target_path).with_context(|| {
+    fn install(&self) -> anyhow::Result<InstalledContextFile> {
+        let backup_path = match std::fs::symlink_metadata(&self.target_path) {
+            Ok(_) => {
+                let backup_path = unique_context_backup_path(&self.target_path)?;
+                std::fs::rename(&self.target_path, &backup_path).with_context(|| {
                     format!(
-                        "remove existing context file {}",
+                        "stage replacement of context file {}",
                         self.target_path.display()
                     )
                 })?;
-                if let Err(rename_err) = std::fs::rename(&self.temp_path, &self.target_path) {
-                    let _ = std::fs::remove_file(&self.temp_path);
-                    return Err(rename_err).with_context(|| {
-                        format!(
-                            "replace context file {} with {}",
-                            self.target_path.display(),
-                            self.temp_path.display()
-                        )
-                    });
-                }
+                Some(backup_path)
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
-                let _ = std::fs::remove_file(&self.temp_path);
-                return Err(err).with_context(|| {
-                    format!(
-                        "replace context file {} with {}",
-                        self.target_path.display(),
-                        self.temp_path.display()
-                    )
-                });
+                return Err(err)
+                    .with_context(|| format!("stat context file {}", self.target_path.display()));
             }
+        };
+
+        if let Err(err) = std::fs::rename(&self.temp_path, &self.target_path) {
+            if let Some(backup_path) = backup_path.as_ref() {
+                let _ = std::fs::rename(backup_path, &self.target_path);
+            }
+            let _ = std::fs::remove_file(&self.temp_path);
+            return Err(err).with_context(|| {
+                format!(
+                    "replace context file {} with {}",
+                    self.target_path.display(),
+                    self.temp_path.display()
+                )
+            });
         }
-        Ok(())
+
+        Ok(InstalledContextFile {
+            target_path: self.target_path.clone(),
+            backup_path,
+        })
     }
 
     fn cleanup(&self) {
         let _ = std::fs::remove_file(&self.temp_path);
     }
+}
+
+#[derive(Debug)]
+struct InstalledContextFile {
+    target_path: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
+impl InstalledContextFile {
+    fn rollback(&self) {
+        let _ = std::fs::remove_file(&self.target_path);
+        if let Some(backup_path) = &self.backup_path {
+            let _ = std::fs::rename(backup_path, &self.target_path);
+        }
+    }
+
+    fn discard_backup(&self) {
+        if let Some(backup_path) = &self.backup_path {
+            let _ = std::fs::remove_file(backup_path);
+        }
+    }
+}
+
+fn rollback_installed_context_files(installed: &[InstalledContextFile]) {
+    for file in installed.iter().rev() {
+        file.rollback();
+    }
+}
+
+fn unique_context_backup_path(target_path: &Path) -> anyhow::Result<PathBuf> {
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("context file has no parent: {}", target_path.display()))?;
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("context");
+    let unique = now_ms();
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.backup",
+            std::process::id(),
+            unique.saturating_add(u64::from(attempt))
+        ));
+        match std::fs::symlink_metadata(&candidate) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("stat context backup {}", candidate.display()));
+            }
+        }
+    }
+    anyhow::bail!(
+        "create context backup path for {} after repeated collisions",
+        target_path.display()
+    )
 }
 
 pub fn write_context_sync(
@@ -311,6 +387,10 @@ pub fn prepare_context_sync(
 
     let replaced_source_records = replaced_context_artifact_file_records(&source_records, &updates);
     merge_context_artifacts(&mut source_records, updates);
+    let removed_source_records =
+        context_records_without_retained_paths(removed_source_records, &source_records);
+    let replaced_source_records =
+        context_records_without_retained_paths(replaced_source_records, &source_records);
 
     let manifest = ContextManifest {
         version: 1,
@@ -709,6 +789,23 @@ fn replaced_context_artifact_file_records(
         stale_records.push(stale_record);
     }
     stale_records
+}
+
+fn context_records_without_retained_paths(
+    records: Vec<ContextArtifactRecord>,
+    retained: &[ContextArtifactRecord],
+) -> Vec<ContextArtifactRecord> {
+    let retained_paths = retained
+        .iter()
+        .flat_map(|record| record.paths.iter())
+        .collect::<BTreeSet<_>>();
+    records
+        .into_iter()
+        .filter_map(|mut record| {
+            record.paths.retain(|path| !retained_paths.contains(path));
+            (!record.paths.is_empty()).then_some(record)
+        })
+        .collect()
 }
 
 fn prune_empty_context_dirs(mut dir: Option<&Path>, base_path: &Path) -> anyhow::Result<()> {
@@ -1235,6 +1332,69 @@ mod tests {
                     .file_name()
                     .to_string_lossy()
                     .contains(".tmp"))
+        );
+    }
+
+    #[test]
+    fn failed_context_sync_commit_restores_replaced_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("old thread".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        let records = write_context_sync(tmp.path(), first, &[]).unwrap();
+        let manifest_path = tmp.path().join("slack/manifest.json");
+        let original_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let replacement = ContextSyncRequest {
+            session_key: "s1".to_string(),
+            source: "slack".to_string(),
+            base_path: PathBuf::from("slack"),
+            artifacts: vec![ContextArtifactInput {
+                id: "slack:thread:C1:111.000".to_string(),
+                kind: "slack_current_thread".to_string(),
+                title: "Current Slack thread".to_string(),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: PathBuf::from("slack/current-thread.md"),
+                    content: ContextFileContent::Text("new thread".to_string()),
+                }],
+                metadata: BTreeMap::new(),
+            }],
+            remove_artifacts: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        let plan = prepare_context_sync(tmp.path(), replacement, &records).unwrap();
+        let manifest_temp = plan
+            .staged_files
+            .iter()
+            .find(|file| file.target_path == manifest_path)
+            .unwrap()
+            .temp_path
+            .clone();
+        std::fs::remove_file(manifest_temp).unwrap();
+
+        assert!(plan.commit().is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("slack/current-thread.md")).unwrap(),
+            "old thread"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            original_manifest
         );
     }
 

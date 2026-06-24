@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,6 +37,7 @@ pub struct QqBotChannel {
     gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
     reply_contexts: Arc<Mutex<HashMap<String, QqReplyContext>>>,
+    next_reply_generation: Arc<AtomicU64>,
 }
 
 impl QqBotChannel {
@@ -46,6 +50,7 @@ impl QqBotChannel {
             gateway_session: Arc::new(Mutex::new(QqGatewaySession::default())),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(1024))),
             reply_contexts: Arc::new(Mutex::new(HashMap::new())),
+            next_reply_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -223,9 +228,13 @@ impl QqBotChannel {
         }
 
         if is_approval_command(&message.text) {
+            let reply_generation = self.next_reply_generation.fetch_add(1, Ordering::Relaxed);
             let channel = self.clone();
             tokio::spawn(async move {
-                if let Err(err) = channel.route_message(message, None, router).await {
+                if let Err(err) = channel
+                    .route_message(message, None, reply_generation, router)
+                    .await
+                {
                     tracing::warn!(error = %err, "failed to handle QQ approval command");
                 }
             });
@@ -233,6 +242,7 @@ impl QqBotChannel {
         }
 
         let command = message.text.split_whitespace().next().unwrap_or("");
+        let reply_generation = self.next_reply_generation.fetch_add(1, Ordering::Relaxed);
         let preempt_generation = if matches!(command, "/stop" | "/agent" | "/yolo") {
             None
         } else {
@@ -242,7 +252,7 @@ impl QqBotChannel {
         tokio::spawn(async move {
             let session_key = message.session_key.clone();
             if let Err(err) = channel
-                .route_message(message, preempt_generation, router)
+                .route_message(message, preempt_generation, reply_generation, router)
                 .await
             {
                 tracing::warn!(
@@ -259,9 +269,10 @@ impl QqBotChannel {
         &self,
         message: QqInboundMessage,
         preempt_generation: Option<u64>,
+        reply_generation: u64,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
-        self.remember_reply_context(&message, preempt_generation)
+        self.remember_reply_context(&message, reply_generation)
             .await;
         tracing::info!(
             session_key = %message.session_key,
@@ -325,19 +336,8 @@ impl QqBotChannel {
         // chat and let tool activity summaries carry the useful progress.
     }
 
-    async fn remember_reply_context(&self, message: &QqInboundMessage, generation: Option<u64>) {
+    async fn remember_reply_context(&self, message: &QqInboundMessage, generation: u64) {
         let mut contexts = self.reply_contexts.lock().await;
-        let Some(generation) = generation else {
-            contexts
-                .entry(message.session_key.clone())
-                .or_insert_with(|| QqReplyContext {
-                    target: message.target.clone(),
-                    msg_id: message.msg_id.clone(),
-                    next_seq: 1,
-                    generation: 0,
-                });
-            return;
-        };
         if let Some(context) = contexts.get_mut(&message.session_key) {
             if generation >= context.generation {
                 context.target = message.target.clone();
@@ -885,8 +885,8 @@ mod tests {
             msg_id: "new_msg".to_string(),
         };
 
-        channel.remember_reply_context(&newer, Some(2)).await;
-        channel.remember_reply_context(&older, Some(1)).await;
+        channel.remember_reply_context(&newer, 2).await;
+        channel.remember_reply_context(&older, 1).await;
 
         let contexts = channel.reply_contexts.lock().await;
         let context = contexts.get("qq:group:g1").unwrap();

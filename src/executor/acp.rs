@@ -441,19 +441,35 @@ impl AcpSession {
                 result = &mut response_fut => {
                     let response = match result {
                         Ok(Ok(response)) => response,
-                        Ok(Err(err)) => return ExecutorPromptOutcome::Failed(err),
+                        Ok(Err(err)) => {
+                            return self
+                                .failed_prompt_or_cancelled(&cancel, &session_id, request.id, err)
+                                .await;
+                        }
                         Err(_) => {
-                            return ExecutorPromptOutcome::Failed(anyhow::anyhow!(
-                                "ACP response channel closed"
-                            ));
+                            return self
+                                .failed_prompt_or_cancelled(
+                                    &cancel,
+                                    &session_id,
+                                    request.id,
+                                    anyhow::anyhow!("ACP response channel closed"),
+                                )
+                                .await;
                         }
                     };
                     if let Some(error) = response.get("error") {
-                        return ExecutorPromptOutcome::Failed(anyhow::anyhow!(
-                            "ACP `{}` failed: {}",
-                            request.method,
-                            summarize_json_rpc_error(error)
-                        ));
+                        return self
+                            .failed_prompt_or_cancelled(
+                                &cancel,
+                                &session_id,
+                                request.id,
+                                anyhow::anyhow!(
+                                    "ACP `{}` failed: {}",
+                                    request.method,
+                                    summarize_json_rpc_error(error)
+                                ),
+                            )
+                            .await;
                     }
                     break response.get("result").cloned().unwrap_or(Value::Null);
                 }
@@ -465,7 +481,14 @@ impl AcpSession {
                     match received {
                         Ok(update) => {
                             if let Err(err) = collect_update(update, events, &mut text_parts).await {
-                                return ExecutorPromptOutcome::Failed(err);
+                                return self
+                                    .failed_prompt_or_cancelled(
+                                        &cancel,
+                                        &session_id,
+                                        request.id,
+                                        err,
+                                    )
+                                    .await;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -480,7 +503,9 @@ impl AcpSession {
         }
         while let Ok(update) = updates_rx.try_recv() {
             if let Err(err) = collect_update(update, events, &mut text_parts).await {
-                return ExecutorPromptOutcome::Failed(err);
+                return self
+                    .failed_prompt_or_cancelled(&cancel, &session_id, request.id, err)
+                    .await;
             }
         }
         if acp_result_cancelled(&result) {
@@ -494,6 +519,21 @@ impl AcpSession {
             text_parts.join("")
         };
         ExecutorPromptOutcome::Completed(ExecutorResponse { final_text })
+    }
+
+    async fn failed_prompt_or_cancelled(
+        &mut self,
+        cancel: &TurnCancellation,
+        session_id: &str,
+        request_id: u64,
+        err: anyhow::Error,
+    ) -> ExecutorPromptOutcome {
+        if cancel.is_cancelled().await {
+            self.cancel_prompt_session(session_id, request_id).await;
+            ExecutorPromptOutcome::Cancelled
+        } else {
+            ExecutorPromptOutcome::Failed(err)
+        }
     }
 
     async fn cancel_prompt_session(&mut self, session_id: &str, request_id: u64) {
