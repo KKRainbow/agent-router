@@ -406,7 +406,7 @@ impl CodexAppServerSession {
                                 events,
                                 &mut turn_completed,
                             ).await?;
-                            self.handle_server_request(request, user_id.clone()).await?;
+                            self.spawn_server_request_handler(request, user_id.clone());
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => {
@@ -504,10 +504,39 @@ impl CodexAppServerSession {
         Ok(())
     }
 
+    fn spawn_server_request_handler(&self, message: Value, user_id: Option<String>) {
+        let stdin = self.client.stdin.clone();
+        let approvals = self.approvals.clone();
+        let session_key = self.session_key.clone();
+        let executor = self.executor.clone();
+        let pending_file_change =
+            self.pending_file_change_summary(message.get("params").unwrap_or(&Value::Null));
+
+        tokio::spawn(async move {
+            if let Err(err) = Self::handle_server_request(
+                stdin,
+                approvals,
+                session_key,
+                executor,
+                user_id,
+                message,
+                pending_file_change,
+            )
+            .await
+            {
+                tracing::warn!(error = %err, "failed to handle Codex app-server request");
+            }
+        });
+    }
+
     async fn handle_server_request(
-        &self,
-        message: Value,
+        stdin: SharedStdin,
+        approvals: SharedApprovalBroker,
+        session_key: String,
+        executor: String,
         user_id: Option<String>,
+        message: Value,
+        pending_file_change: Option<String>,
     ) -> anyhow::Result<()> {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
@@ -515,39 +544,64 @@ impl CodexAppServerSession {
         match method {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 let request = codex_approval_request(
-                    &self.session_key,
-                    &self.executor,
+                    &session_key,
+                    &executor,
                     user_id,
                     method,
                     params,
-                    self.pending_file_change_summary(params),
+                    pending_file_change,
                 );
-                let decision = match self.approvals.request(request).await {
+                let decision = match approvals.request(request).await {
                     ApprovalSelection::Selected(option_id) if option_id == "accept" => "accept",
                     _ => "decline",
                 };
-                self.client
-                    .respond(id, json!({ "decision": decision }))
-                    .await?;
+                write_json(
+                    &stdin,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "decision": decision },
+                    }),
+                )
+                .await?;
             }
             "item/permissions/requestApproval" => {
-                self.client
-                    .respond(id, json!({ "decision": "decline" }))
-                    .await?;
+                write_json(
+                    &stdin,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "decision": "decline" },
+                    }),
+                )
+                .await?;
             }
             "mcpServer/elicitation/request" => {
-                self.client
-                    .respond(id, json!({ "action": "decline" }))
-                    .await?;
+                write_json(
+                    &stdin,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "action": "decline" },
+                    }),
+                )
+                .await?;
             }
             _ => {
-                self.client
-                    .respond_error(
-                        id,
-                        -32601,
-                        format!("agent-router does not support codex client method `{method}`"),
-                    )
-                    .await?;
+                write_json(
+                    &stdin,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!(
+                                "agent-router does not support codex client method `{method}`"
+                            ),
+                        },
+                    }),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -905,33 +959,6 @@ impl CodexJsonRpcClient {
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params,
-            }),
-        )
-        .await
-    }
-
-    async fn respond(&self, id: Value, result: Value) -> anyhow::Result<()> {
-        write_json(
-            &self.stdin,
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result,
-            }),
-        )
-        .await
-    }
-
-    async fn respond_error(&self, id: Value, code: i64, message: String) -> anyhow::Result<()> {
-        write_json(
-            &self.stdin,
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": code,
-                    "message": message,
-                },
             }),
         )
         .await
@@ -1897,6 +1924,60 @@ for line in sys.stdin:
             )
             .await
             .unwrap_err();
+
+        assert!(err.to_string().contains("turn/start"));
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn codex_turn_start_timeout_is_not_blocked_by_early_server_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("early_request_codex.py");
+        write_fake_codex_script(
+            &script,
+            r#"    elif method == "turn/start":
+        send({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "sleep 10", "cwd": "/tmp", "reason": "test"},
+        })
+"#,
+        );
+        let manager = CodexAppServerManager::with_limits(
+            executor_config(&script, tmp.path()),
+            Arc::new(ApprovalBroker::new(Duration::from_secs(5))),
+            CodexRuntimeLimits {
+                rpc_timeout: Duration::from_millis(100),
+                idle_timeout: Duration::from_secs(1),
+            },
+        );
+        manager
+            .prepare(ExecutorPrepareRequest {
+                session_key: "session-1".to_string(),
+                executor: "codex".to_string(),
+                cwd: None,
+                previous_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let mut events = CollectingExecutorEventSink::default();
+        let err = tokio::time::timeout(
+            Duration::from_millis(500),
+            manager.prompt(
+                ExecutorPromptRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "codex".to_string(),
+                    prompt: "hang".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut events,
+            ),
+        )
+        .await
+        .expect("turn/start timeout waited behind approval")
+        .unwrap_err();
 
         assert!(err.to_string().contains("turn/start"));
         assert!(err.to_string().contains("timed out"));
