@@ -209,6 +209,33 @@ impl SlackSocketModeChannel {
             }
             return Ok(());
         }
+        if approval_trigger {
+            tracing::info!(
+                channel = %event.channel,
+                user_id = %event.user,
+                session_key = %session_key,
+                "routing Slack approval command"
+            );
+            let reply_target = event.reply_target();
+            let mut output = SlackRouterOutputSink {
+                channel: self.clone(),
+                target: reply_target,
+                channel_events: self.cfg.channel_events,
+                compact_activity: SlackCompactActivity::default(),
+            };
+            router
+                .handle_with_context(
+                    RouterInput {
+                        session_key,
+                        text,
+                        user_id: Some(event.user),
+                    },
+                    None,
+                    &mut output,
+                )
+                .await?;
+            return Ok(());
+        }
         let session_lock = self.session_lock(&session_key).await;
         let _session_guard = session_lock.lock().await;
         tracing::info!(
@@ -489,6 +516,7 @@ impl SlackSocketModeChannel {
     ) -> SlackContextSyncBuild {
         let thread_ts = event.thread_root_ts();
         let mut unresolved = Vec::new();
+        let mut current_thread_fresh = false;
         let messages = if self.cfg.context_sync.current_thread {
             match self
                 .fetch_thread_messages_cached(&event.channel, &thread_ts)
@@ -501,6 +529,8 @@ impl SlackSocketModeChannel {
                             reference: format!("{}:{}", event.channel, thread_ts),
                             reason,
                         });
+                    } else {
+                        current_thread_fresh = true;
                     }
                     filter_context_messages(fetch.messages, bot_user_id)
                 }
@@ -534,6 +564,7 @@ impl SlackSocketModeChannel {
                     .await
                 {
                     Ok(fetch) => {
+                        let fresh = fetch.stale_reason.is_none();
                         if let Some(reason) = fetch.stale_reason {
                             unresolved.push(ContextSyncIssueInput {
                                 kind: "linked_thread_cache".to_string(),
@@ -543,6 +574,7 @@ impl SlackSocketModeChannel {
                         }
                         linked_threads.push(LinkedSlackThread {
                             link,
+                            fresh,
                             messages: filter_context_messages(fetch.messages, bot_user_id),
                         });
                     }
@@ -606,9 +638,12 @@ impl SlackSocketModeChannel {
         SlackContextSyncBuild {
             request: build_slack_context_request(
                 session_key,
-                &event.channel,
-                &thread_ts,
-                &messages,
+                CurrentSlackThreadContext {
+                    channel: &event.channel,
+                    thread_ts: &thread_ts,
+                    fresh: current_thread_fresh,
+                    messages: &messages,
+                },
                 &linked_threads,
                 &downloaded_files,
                 unresolved,
@@ -950,6 +985,7 @@ struct SlackThreadLink {
 #[derive(Debug, Clone)]
 struct LinkedSlackThread {
     link: SlackThreadLink,
+    fresh: bool,
     messages: Vec<SlackThreadMessage>,
 }
 
@@ -1337,28 +1373,41 @@ fn context_error_reason(err: &anyhow::Error) -> String {
     }
 }
 
+struct CurrentSlackThreadContext<'a> {
+    channel: &'a str,
+    thread_ts: &'a str,
+    fresh: bool,
+    messages: &'a [SlackThreadMessage],
+}
+
 fn build_slack_context_request(
     session_key: &str,
-    channel: &str,
-    thread_ts: &str,
-    messages: &[SlackThreadMessage],
+    current_thread: CurrentSlackThreadContext<'_>,
     linked_threads: &[LinkedSlackThread],
     downloaded_files: &[DownloadedSlackFile],
     unresolved: Vec<ContextSyncIssueInput>,
 ) -> ContextSyncRequest {
     let mut artifacts = Vec::new();
-    if !messages.is_empty() {
+    if !current_thread.messages.is_empty() {
         let mut metadata = BTreeMap::new();
+        let channel = current_thread.channel;
+        let thread_ts = current_thread.thread_ts;
         let thread_ref = format!("{channel}:{thread_ts}");
         metadata.insert("channel".to_string(), json!(channel));
         metadata.insert("thread_ts".to_string(), json!(thread_ts));
-        metadata.insert("message_count".to_string(), json!(messages.len()));
+        metadata.insert(
+            "message_count".to_string(),
+            json!(current_thread.messages.len()),
+        );
+        let mut resolves_unresolved =
+            vec![json!({"kind": "current_thread", "reference": &thread_ref})];
+        if current_thread.fresh {
+            resolves_unresolved
+                .push(json!({"kind": "current_thread_cache", "reference": &thread_ref}));
+        }
         metadata.insert(
             "resolves_unresolved".to_string(),
-            json!([
-                {"kind": "current_thread", "reference": &thread_ref},
-                {"kind": "current_thread_cache", "reference": &thread_ref},
-            ]),
+            json!(resolves_unresolved),
         );
         artifacts.push(ContextArtifactInput {
             id: format!("slack:thread:{channel}:{thread_ts}"),
@@ -1369,12 +1418,16 @@ fn build_slack_context_request(
                 ContextFileInput {
                     relative_path: PathBuf::from("slack/current-thread.md"),
                     content: ContextFileContent::Text(render_slack_thread_markdown(
-                        channel, thread_ts, messages,
+                        channel,
+                        thread_ts,
+                        current_thread.messages,
                     )),
                 },
                 ContextFileInput {
                     relative_path: PathBuf::from("slack/current-thread.jsonl"),
-                    content: ContextFileContent::Text(render_slack_thread_jsonl(messages)),
+                    content: ContextFileContent::Text(render_slack_thread_jsonl(
+                        current_thread.messages,
+                    )),
                 },
             ],
             metadata,
@@ -1411,12 +1464,15 @@ fn linked_thread_artifact(linked_thread: &LinkedSlackThread) -> ContextArtifactI
     let mut metadata = BTreeMap::new();
     metadata.insert("channel".to_string(), json!(channel));
     metadata.insert("thread_ts".to_string(), json!(thread_ts));
+    let mut resolves_unresolved =
+        vec![json!({"kind": "linked_thread", "reference": &linked_thread.link.url})];
+    if linked_thread.fresh {
+        resolves_unresolved
+            .push(json!({"kind": "linked_thread_cache", "reference": &linked_thread.link.url}));
+    }
     metadata.insert(
         "resolves_unresolved".to_string(),
-        json!([
-            {"kind": "linked_thread", "reference": &linked_thread.link.url},
-            {"kind": "linked_thread_cache", "reference": &linked_thread.link.url},
-        ]),
+        json!(resolves_unresolved),
     );
     metadata.insert(
         "source_message_ts".to_string(),
@@ -1769,9 +1825,12 @@ mod tests {
 
         let request = build_slack_context_request(
             "slack:channel:C1:111.000",
-            "C1",
-            "111.000",
-            &[message],
+            CurrentSlackThreadContext {
+                channel: "C1",
+                thread_ts: "111.000",
+                fresh: true,
+                messages: &[message],
+            },
             &[],
             &[downloaded],
             Vec::new(),
@@ -1981,6 +2040,7 @@ mod tests {
                 url: "https://example.slack.com/archives/C2/p1782253434835649".to_string(),
                 source_message_ts: "111.000".to_string(),
             },
+            fresh: true,
             messages: vec![SlackThreadMessage {
                 ts: "1782253434.835649".to_string(),
                 user: Some("U2".to_string()),
@@ -1992,9 +2052,12 @@ mod tests {
 
         let request = build_slack_context_request(
             "slack:channel:C1:111.000",
-            "C1",
-            "111.000",
-            &[current],
+            CurrentSlackThreadContext {
+                channel: "C1",
+                thread_ts: "111.000",
+                fresh: true,
+                messages: &[current],
+            },
             &[linked],
             &[],
             Vec::new(),
@@ -2021,6 +2084,80 @@ mod tests {
         assert!(
             paths.contains(&"slack/linked-threads/C2-1782253434.835649.metadata.json".to_string())
         );
+    }
+
+    #[test]
+    fn stale_thread_artifacts_do_not_resolve_cache_issues() {
+        let current = SlackThreadMessage {
+            ts: "111.000".to_string(),
+            user: Some("U1".to_string()),
+            bot_id: None,
+            text: "cached current".to_string(),
+            files: Vec::new(),
+        };
+        let linked = LinkedSlackThread {
+            link: SlackThreadLink {
+                channel: "C2".to_string(),
+                thread_ts: "222.000".to_string(),
+                url: "https://example.slack.com/archives/C2/p222000000".to_string(),
+                source_message_ts: "111.000".to_string(),
+            },
+            fresh: false,
+            messages: vec![SlackThreadMessage {
+                ts: "222.000".to_string(),
+                user: Some("U2".to_string()),
+                bot_id: None,
+                text: "cached linked".to_string(),
+                files: Vec::new(),
+            }],
+        };
+
+        let request = build_slack_context_request(
+            "slack:channel:C1:111.000",
+            CurrentSlackThreadContext {
+                channel: "C1",
+                thread_ts: "111.000",
+                fresh: false,
+                messages: &[current],
+            },
+            &[linked],
+            &[],
+            Vec::new(),
+        );
+
+        let current_resolves = request.artifacts[0]
+            .metadata
+            .get("resolves_unresolved")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(current_resolves.iter().any(|entry| {
+            entry["kind"].as_str() == Some("current_thread")
+                && entry["reference"].as_str() == Some("C1:111.000")
+        }));
+        assert!(!current_resolves.iter().any(|entry| {
+            entry["kind"].as_str() == Some("current_thread_cache")
+                && entry["reference"].as_str() == Some("C1:111.000")
+        }));
+
+        let linked_resolves = request
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "slack_linked_thread")
+            .unwrap()
+            .metadata
+            .get("resolves_unresolved")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(linked_resolves.iter().any(|entry| {
+            entry["kind"].as_str() == Some("linked_thread")
+                && entry["reference"].as_str()
+                    == Some("https://example.slack.com/archives/C2/p222000000")
+        }));
+        assert!(!linked_resolves.iter().any(|entry| {
+            entry["kind"].as_str() == Some("linked_thread_cache")
+                && entry["reference"].as_str()
+                    == Some("https://example.slack.com/archives/C2/p222000000")
+        }));
     }
 
     #[tokio::test]
