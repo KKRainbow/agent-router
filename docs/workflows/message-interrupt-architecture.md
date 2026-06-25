@@ -911,6 +911,8 @@ prepare owns the Backend Session it touched.
   - a cancel barrier while a cancelled prompt's JSON-RPC response is still
     pending, preventing late cancelled-turn `session/update` and permission
     requests from being projected into the replacement prompt;
+  - bounded unhealthy recovery if a cancelled prompt response never settles, so
+    the cancel barrier cannot wedge later prompts forever;
   - cancelled ACP stop reason maps to `ExecutorPromptOutcome::Cancelled`;
   - pending approvals are removed when their owning prompt is cancelled;
   - tests for active-prompt interrupt, stale interrupt isolation, late-update
@@ -927,6 +929,11 @@ prepare owns the Backend Session it touched.
   - if a cancelled ACP lifecycle RPC never settles, the adapter closes that
     process as unhealthy recovery and the next prepare replaces it through the
     handle-identity session manager path;
+  - ACP mismatched-session removal re-checks cancellation while holding the
+    session map, so a cancelled stale prepare cannot remove or close a matching
+    published session;
+  - ACP cancel barriers time out through unhealthy recovery if the cancelled
+    prompt response never arrives;
   - adapter-boundary tests cover cancelled prepare during `initialize`, after
     `session/new`, cancelled lifecycle permission requests, stale mismatched
     prepare after newer publication, and stale unhealthy-session removal after a
@@ -1006,12 +1013,14 @@ Codex coverage now includes:
   - kept adapter-local cache/reply ordering only where it protects platform
     cache state; it no longer uses router generation terminology and does not
     participate in router Turn lifecycle decisions.
-  - Codex app-server and Claude stream-json now publish Backend Sessions with
-    compare-before-publish semantics instead of last-writer-wins insertion.
+  - ACP, Codex app-server, and Claude stream-json now publish Backend Sessions
+    with compare-before-publish semantics instead of last-writer-wins insertion.
     Stale cancelled prepares cannot remove newer sessions, and publication
     losers close only their own unpublished process. Their mismatched-session
     removal helpers also check cancellation inside the session-map critical
     section, so cancellation cannot race with removal.
+  - ACP cancel barriers time out through unhealthy recovery if a cancelled
+    prompt response never settles, so later prompts are not wedged forever.
   - cancellation paths now map to cancellation outcomes or cancelled prepare
     abandonment rather than ordinary backend failure. Process close remains
     isolated to unhealthy recovery paths.
