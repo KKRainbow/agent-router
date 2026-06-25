@@ -96,15 +96,20 @@ explicit command path is stable.
 
 ## Slash Command Passthrough
 
-Slash commands have three distinct owners and must not be collapsed into one
+Slash commands have two semantic owners and must not be collapsed into one
 plain-text prompt path:
 
 - Router-owned commands, such as `/stop`, `/agent`, `/yolo`, `/approve`, and
   `/deny`, are consumed by Agent Router.
-- Channel-platform slash commands, such as Slack slash command payloads, are
-  normalized by the channel adapter before routing.
 - Agent-owned slash commands, such as an executor's `/status`, belong to the
   current active executor.
+
+Channel-platform slash commands, such as Slack slash command payloads, are only
+an ingress transport shape. Channel adapters should normalize them into the same
+router input model without losing the command boundary, command name, or
+arguments. Platform payloads should not be treated as a separate command owner,
+and adapters should not flatten them into plain text before the router can make
+the router-owned versus agent-owned decision.
 
 The router should preserve agent-owned slash command semantics when forwarding
 them to an executor. If a non-router command starts with `/`, the router should
