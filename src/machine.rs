@@ -369,6 +369,15 @@ fn local_workspace_path(
     request: &MachinePrepareRequest<'_>,
 ) -> anyhow::Result<Option<PathBuf>> {
     if let Some(root) = &machine.workspace_root {
+        if let Some(router_workspace) = request.router_workspace {
+            let router_root_workspace =
+                PathBuf::from(root).join(session_workspace_dir_name(request.session_key));
+            if machine.id == LOCAL_MACHINE_ID
+                && paths_refer_to_same_workspace(&router_root_workspace, router_workspace)
+            {
+                return Ok(Some(router_workspace.to_path_buf()));
+            }
+        }
         return Ok(Some(machine_workspace_path(
             Path::new(root),
             &machine.id,
@@ -386,6 +395,10 @@ fn machine_workspace_path(root: &Path, machine_id: &str, session_key: &str) -> P
 fn remote_machine_workspace_path(root: &str, machine_id: &str, session_key: &str) -> String {
     let machine_root = join_remote_path(root, &machine_workspace_machine_dir_name(machine_id));
     join_remote_path(&machine_root, &session_workspace_dir_name(session_key))
+}
+
+fn paths_refer_to_same_workspace(left: &Path, right: &Path) -> bool {
+    left == right || canonicalize_lossy(left) == canonicalize_lossy(right)
 }
 
 fn layered_env(
@@ -1119,6 +1132,57 @@ mod tests {
         );
         assert!(!Path::new(&workspace.cwd).join("slack/old.md").exists());
         assert_eq!(prepared.stdio.env["A"], "executor");
+    }
+
+    #[tokio::test]
+    async fn default_local_machine_reuses_matching_router_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:channel:C1:111.000";
+        let router_workspace = workspace_root.join(session_workspace_dir_name(session_key));
+        std::fs::create_dir_all(router_workspace.join("executor-output")).unwrap();
+        std::fs::write(router_workspace.join("executor-output/result.txt"), "keep").unwrap();
+        let registry = MachineRegistry::new(BTreeMap::from([(
+            LOCAL_MACHINE_ID.to_string(),
+            test_local_machine(LOCAL_MACHINE_ID, Some(&workspace_root), Vec::new()),
+        )]));
+        let env = BTreeMap::new();
+        let args = Vec::new();
+
+        let prepared = registry
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: LOCAL_MACHINE_ID,
+                session_key,
+                router_workspace: Some(&router_workspace),
+                executor_cwd: None,
+                command: "agent",
+                args: &args,
+                env: &env,
+                cancel: None,
+            })
+            .await
+            .unwrap();
+
+        let workspace = prepared.workspace.unwrap();
+        assert_eq!(
+            workspace.materialization,
+            MachineWorkspaceMaterialization::NotNeeded
+        );
+        assert_eq!(
+            Path::new(&workspace.cwd),
+            router_workspace.canonicalize().unwrap().as_path()
+        );
+        assert_eq!(
+            prepared.stdio.current_dir.as_deref(),
+            Some(Path::new(&workspace.cwd))
+        );
+        assert!(router_workspace.join("executor-output/result.txt").exists());
+        assert!(
+            !workspace_root
+                .join(machine_workspace_machine_dir_name(LOCAL_MACHINE_ID))
+                .join(session_workspace_dir_name(session_key))
+                .exists()
+        );
     }
 
     #[tokio::test]

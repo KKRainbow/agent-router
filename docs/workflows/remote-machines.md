@@ -89,8 +89,8 @@ The Router Workspace and a local Machine Workspace may refer to the same
 directory. A remote Machine Workspace is only a remote path string plus Machine
 identity; callers must go through the Machine interface to operate on it.
 
-When a Machine has a configured `workspace_root`, the session Machine Workspace
-is created under a Machine-scoped directory inside that root:
+When a non-default Machine has a configured `workspace_root`, the session
+Machine Workspace is created under a Machine-scoped directory inside that root:
 
 ```text
 <workspace_root>/<machine-id-component>/<session-component>
@@ -98,6 +98,9 @@ is created under a Machine-scoped directory inside that root:
 
 Both path components are router-generated stable names. This keeps two Machines
 with the same `workspace_root` from sharing a session workspace accidentally.
+The reserved `local` Machine may still reuse the Router Workspace directly when
+its configured root matches the router workspace root, preserving the no-copy
+local executor path.
 
 ## Machine Interface Semantics
 
