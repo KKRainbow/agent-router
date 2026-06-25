@@ -1039,6 +1039,7 @@ impl SlackSocketModeChannel {
     }
 
     async fn resolve_thread_message_authors(&self, messages: &mut [SlackThreadMessage]) {
+        let inline_names = slack_inline_user_author_names(messages);
         let user_ids = messages
             .iter()
             .filter(|message| message.author_name.is_none())
@@ -1046,13 +1047,18 @@ impl SlackSocketModeChannel {
             .map(ToOwned::to_owned)
             .collect::<BTreeSet<_>>();
         if user_ids.is_empty() {
+            if !inline_names.is_empty() {
+                let mut cache = self.context_cache.lock().await;
+                cache.user_names.extend(inline_names);
+            }
             return;
         }
 
-        let mut resolved = BTreeMap::new();
+        let mut resolved = inline_names.clone();
         let mut missing = Vec::new();
         {
-            let cache = self.context_cache.lock().await;
+            let mut cache = self.context_cache.lock().await;
+            cache.user_names.extend(inline_names);
             for user_id in user_ids {
                 if let Some(name) = cache.user_names.get(&user_id) {
                     resolved.insert(user_id, name.clone());
@@ -2013,6 +2019,18 @@ fn clean_slack_author_name(raw: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+fn slack_inline_user_author_names(messages: &[SlackThreadMessage]) -> BTreeMap<String, String> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            Some((
+                message.user.as_ref()?.clone(),
+                message.author_name.as_ref()?.clone(),
+            ))
+        })
+        .collect()
+}
+
 fn apply_slack_user_author_names(
     messages: &mut [SlackThreadMessage],
     names: &BTreeMap<String, String>,
@@ -2924,6 +2942,57 @@ mod tests {
 
         assert_eq!(messages[0].author_name.as_deref(), Some("Alice Smith"));
         assert_eq!(messages[1].author_name.as_deref(), Some("Inline Alice"));
+    }
+
+    #[test]
+    fn reuses_inline_author_names_for_same_user_messages() {
+        let mut messages = vec![
+            SlackThreadMessage {
+                ts: "111.000".to_string(),
+                user: Some("U1".to_string()),
+                author_name: Some("Alice Smith".to_string()),
+                bot_id: None,
+                text: "hello".to_string(),
+                files: Vec::new(),
+            },
+            SlackThreadMessage {
+                ts: "112.000".to_string(),
+                user: Some("U1".to_string()),
+                author_name: None,
+                bot_id: None,
+                text: "hello again".to_string(),
+                files: Vec::new(),
+            },
+        ];
+        let names = slack_inline_user_author_names(&messages);
+
+        apply_slack_user_author_names(&mut messages, &names);
+
+        assert_eq!(messages[1].author_name.as_deref(), Some("Alice Smith"));
+    }
+
+    #[tokio::test]
+    async fn resolved_thread_message_authors_cache_inline_names() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let mut messages = vec![SlackThreadMessage {
+            ts: "111.000".to_string(),
+            user: Some("U1".to_string()),
+            author_name: Some("Alice Smith".to_string()),
+            bot_id: None,
+            text: "hello".to_string(),
+            files: Vec::new(),
+        }];
+
+        channel.resolve_thread_message_authors(&mut messages).await;
+
+        let cache = channel.context_cache.lock().await;
+        assert_eq!(
+            cache.user_names.get("U1").map(String::as_str),
+            Some("Alice Smith")
+        );
     }
 
     #[test]
