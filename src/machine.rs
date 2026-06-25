@@ -383,7 +383,7 @@ async fn ensure_ssh_workspace(host: &str, remote_cwd: &str) -> anyhow::Result<()
         .args(ssh_remote_args(host, &remote_command))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .status()
         .await
         .map_err(|err| anyhow::anyhow!("could not create SSH workspace on `{host}`: {err}"))?;
@@ -395,20 +395,21 @@ async fn ensure_ssh_workspace(host: &str, remote_cwd: &str) -> anyhow::Result<()
 }
 
 fn create_remote_workspace_script(remote_cwd: &str) -> anyhow::Result<String> {
-    let parent = remote_parent_path(remote_cwd)
-        .ok_or_else(|| anyhow::anyhow!("remote workspace path has no parent: {remote_cwd}"))?;
-    let name = remote_basename(remote_cwd).ok_or_else(|| {
-        anyhow::anyhow!("remote workspace path has no final component: {remote_cwd}")
-    })?;
-    Ok(format!(
-        "mkdir -p -- {} && if [ -e {} ] || [ -L {} ]; then [ -d {} ] && [ ! -L {} ] || exit 73; else mkdir -- {}; fi",
-        shell_quote(&parent),
-        shell_quote(remote_cwd),
-        shell_quote(remote_cwd),
-        shell_quote(remote_cwd),
-        shell_quote(remote_cwd),
-        shell_quote(&join_remote_path(&parent, &name)),
-    ))
+    let components = remote_path_components(remote_cwd)?;
+    let mut current = String::new();
+    let mut commands = Vec::new();
+    for component in components {
+        current = if current.is_empty() {
+            format!("/{component}")
+        } else {
+            join_remote_path(&current, &component)
+        };
+        let quoted = shell_quote(&current);
+        commands.push(format!(
+            "if [ -e {quoted} ] || [ -L {quoted} ]; then [ -d {quoted} ] && [ ! -L {quoted} ] || exit 73; else mkdir -- {quoted}; fi"
+        ));
+    }
+    Ok(commands.join(" && "))
 }
 
 async fn materialize_ssh_workspace(
@@ -422,7 +423,7 @@ async fn materialize_ssh_workspace(
         .arg(router_workspace)
         .arg(".")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|err| {
             anyhow::anyhow!(
@@ -442,7 +443,7 @@ async fn materialize_ssh_workspace(
         .args(ssh_remote_args(host, &remote_command))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|err| {
             anyhow::anyhow!("could not start SSH workspace materialization to `{host}`: {err}")
@@ -804,22 +805,27 @@ fn join_remote_path(root: &str, child: &str) -> String {
     }
 }
 
-fn remote_parent_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_end_matches('/');
-    let (parent, _) = trimmed.rsplit_once('/')?;
-    if parent.is_empty() {
-        Some("/".to_string())
-    } else {
-        Some(parent.to_string())
-    }
-}
-
-fn remote_basename(path: &str) -> Option<String> {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
+fn remote_path_components(path: &str) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        path.starts_with('/'),
+        "remote workspace path must be absolute: {path}"
+    );
+    let components = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(|component| {
+            anyhow::ensure!(
+                component != "." && component != "..",
+                "remote workspace path contains invalid component: {path}"
+            );
+            Ok(component.to_string())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !components.is_empty(),
+        "remote workspace path must not be root: {path}"
+    );
+    Ok(components)
 }
 
 fn ssh_stdio_command(host: &str, remote_script: String, remote_cwd: String) -> StdioCommand {
@@ -1011,7 +1017,8 @@ mod tests {
     fn remote_workspace_creation_rejects_symlink_workspace() {
         let script = create_remote_workspace_script("/remote/work/session").unwrap();
 
-        assert!(script.contains("mkdir -p -- '/remote/work'"));
+        assert!(script.contains("[ ! -L '/remote' ]"));
+        assert!(script.contains("[ ! -L '/remote/work' ]"));
         assert!(script.contains("[ ! -L '/remote/work/session' ]"));
         assert!(script.contains("mkdir -- '/remote/work/session'"));
     }

@@ -2064,8 +2064,19 @@ fn is_json_rpc_like(message: &Value) -> bool {
     let Some(map) = message.as_object() else {
         return false;
     };
-    map.get("method").and_then(Value::as_str).is_some()
-        || (map.contains_key("id") && (map.contains_key("result") || map.contains_key("error")))
+    if map.contains_key("id") && (map.contains_key("result") || map.contains_key("error")) {
+        return true;
+    }
+    if map.contains_key("id") {
+        return map.get("method").and_then(Value::as_str).is_some();
+    }
+    map.get("method")
+        .and_then(Value::as_str)
+        .is_some_and(is_codex_notification_method)
+}
+
+fn is_codex_notification_method(method: &str) -> bool {
+    matches!(method, "item/completed" | "turn/completed")
 }
 
 async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
@@ -2510,7 +2521,11 @@ mod tests {
         assert!(is_json_rpc_like(
             &json!({"method": "turn/completed", "params": {}})
         ));
+        assert!(is_json_rpc_like(
+            &json!({"id": 1, "method": "client/request"})
+        ));
         assert!(!is_json_rpc_like(&json!({"id": 1, "message": "startup"})));
+        assert!(!is_json_rpc_like(&json!({"method": "startup"})));
         assert!(!is_json_rpc_like(&json!({"hello": "world"})));
         assert!(!is_json_rpc_like(&json!("banner")));
     }

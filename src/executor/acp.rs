@@ -1332,8 +1332,14 @@ fn is_json_rpc_like(message: &Value) -> bool {
     let Some(map) = message.as_object() else {
         return false;
     };
-    map.get("method").and_then(Value::as_str).is_some()
+    map.get("method")
+        .and_then(Value::as_str)
+        .is_some_and(is_acp_protocol_method)
         || (map.contains_key("id") && (map.contains_key("result") || map.contains_key("error")))
+}
+
+fn is_acp_protocol_method(method: &str) -> bool {
+    matches!(method, "session/update" | "session/request_permission")
 }
 
 async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
@@ -2240,6 +2246,7 @@ mod tests {
             &json!({"method": "session/update", "params": {}})
         ));
         assert!(!is_json_rpc_like(&json!({"id": 1, "message": "startup"})));
+        assert!(!is_json_rpc_like(&json!({"method": "startup"})));
         assert!(!is_json_rpc_like(&json!({"hello": "world"})));
         assert!(!is_json_rpc_like(&json!("banner")));
     }
