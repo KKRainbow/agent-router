@@ -1752,17 +1752,22 @@ fn project_acp_update_with_state(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let normalized_kind = if matches!(kind, "agent_message_chunk" | "agent_message") {
+    let message_phase = acp_message_phase(update);
+    let normalized_kind = if matches!(kind, "agent_message_chunk" | "agent_message")
+        && message_phase == Some("commentary")
+    {
+        "agent_progress".to_string()
+    } else if matches!(kind, "agent_message_chunk" | "agent_message") {
         "agent_message_chunk".to_string()
     } else if matches!(kind, "agent_thought_chunk" | "agent_thought") {
         "agent_thought_chunk".to_string()
     } else if is_tool_update {
         format!("tool_{kind}")
-    } else if kind.contains("plan") {
+    } else if lower_kind.contains("plan") {
         "plan".to_string()
-    } else if kind.contains("diff") || kind.contains("file") {
+    } else if lower_kind.contains("diff") || lower_kind.contains("file") {
         "diff".to_string()
-    } else if kind.contains("error") {
+    } else if lower_kind.contains("error") {
         "error".to_string()
     } else {
         kind.to_string()
@@ -1782,15 +1787,81 @@ fn project_acp_update_with_state(
     } else {
         (title, text, status, false)
     };
+    let plan_summary = if normalized_kind == "plan" {
+        acp_plan_summary(text.as_str(), update.get("entries"))
+    } else {
+        None
+    };
+    let is_agent_progress = normalized_kind == "agent_progress";
     let mut update =
         ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
-    if emit_tool_activity {
+    if is_agent_progress && !text.trim().is_empty() {
+        update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text.clone()));
+    } else if let Some(summary) = plan_summary {
+        update = update.with_channel_event(ExecutorChannelEvent::agent_progress(summary));
+    } else if emit_tool_activity {
         update = update.with_channel_event(ExecutorChannelEvent::tool_call(
             acp_tool_title(&title),
             acp_tool_channel_summary(&title, &text, &status),
         ));
     }
     Some(update)
+}
+
+fn acp_message_phase(update: &Value) -> Option<&str> {
+    fn direct_phase(value: &Value) -> Option<&str> {
+        value
+            .get("phase")
+            .or_else(|| value.get("messagePhase"))
+            .or_else(|| value.get("message_phase"))
+            .and_then(Value::as_str)
+            .filter(|phase| matches!(*phase, "commentary" | "final_answer"))
+    }
+
+    direct_phase(update)
+        .or_else(|| update.get("content").and_then(direct_phase))
+        .or_else(|| {
+            update
+                .get("_meta")
+                .and_then(|meta| meta.get("codex"))
+                .and_then(direct_phase)
+        })
+}
+
+fn acp_plan_summary(text: &str, entries: Option<&Value>) -> Option<String> {
+    let text = text.trim();
+    if !text.is_empty() {
+        return Some(truncate_text(text.to_string(), 1_000));
+    }
+    let entries = entries?.as_array()?;
+    let mut lines = Vec::new();
+    for entry in entries.iter().take(6) {
+        let content = entry
+            .get("content")
+            .or_else(|| entry.get("text"))
+            .or_else(|| entry.get("step"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if status.is_empty() {
+            lines.push(format!("- {content}"));
+        } else {
+            lines.push(format!("- [{status}] {content}"));
+        }
+    }
+    let remaining = entries.len().saturating_sub(6);
+    if remaining > 0 {
+        lines.push(format!("- {remaining} more"));
+    }
+    (!lines.is_empty()).then(|| truncate_text(lines.join("\n"), 1_000))
 }
 
 fn tool_call_id(update: &Value) -> Option<&str> {
@@ -2313,7 +2384,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_non_tool_updates_do_not_project_channel_events() {
+    fn acp_legacy_agent_message_remains_final_reply_only() {
         let agent_message = project_acp_update(&json!({
             "method": "session/update",
             "params": {
@@ -2326,7 +2397,119 @@ mod tests {
         .unwrap();
         assert_eq!(agent_message.kind, "agent_message_chunk");
         assert!(agent_message.channel_event.is_none());
+    }
 
+    #[test]
+    fn acp_commentary_agent_message_projects_progress_event() {
+        let agent_message = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "phase": "commentary",
+                    "content": {"text": "I will inspect the config first."}
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(agent_message.kind, "agent_progress");
+        assert_eq!(agent_message.text, "I will inspect the config first.");
+        let event = agent_message.channel_event.unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::AgentProgress);
+        assert_eq!(event.text, "I will inspect the config first.");
+    }
+
+    #[test]
+    fn acp_final_answer_phase_remains_final_reply_only() {
+        let agent_message = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "phase": "final_answer",
+                    "content": {"text": "final answer"}
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(agent_message.kind, "agent_message_chunk");
+        assert_eq!(agent_message.text, "final answer");
+        assert!(agent_message.channel_event.is_none());
+    }
+
+    #[test]
+    fn acp_plan_update_projects_progress_event() {
+        let plan = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "plan",
+                    "entries": [
+                        {"status": "in_progress", "content": "Inspect ACP events"},
+                        {"status": "pending", "content": "Patch router projection"}
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(plan.kind, "plan");
+        let event = plan.channel_event.unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::AgentProgress);
+        assert_eq!(
+            event.text,
+            "- [in_progress] Inspect ACP events\n- [pending] Patch router projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_commentary_agent_message_does_not_enter_final_text() {
+        let mut events = CollectingExecutorEventSink::default();
+        let mut text_parts = Vec::new();
+        collect_update(
+            project_acp_update(&json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "phase": "commentary",
+                        "content": {"text": "I will inspect the config first."}
+                    }
+                }
+            }))
+            .unwrap(),
+            &mut events,
+            &mut text_parts,
+        )
+        .await
+        .unwrap();
+        collect_update(
+            project_acp_update(&json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "phase": "final_answer",
+                        "content": {"text": "done"}
+                    }
+                }
+            }))
+            .unwrap(),
+            &mut events,
+            &mut text_parts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(text_parts, ["done"]);
+        assert_eq!(events.updates.len(), 2);
+        assert!(events.updates[0].channel_event.is_some());
+    }
+
+    #[test]
+    fn acp_thought_update_stays_internal_without_explicit_projection() {
         let thought = project_acp_update(&json!({
             "method": "session/update",
             "params": {
@@ -2339,6 +2522,41 @@ mod tests {
         .unwrap();
         assert_eq!(thought.kind, "agent_thought_chunk");
         assert!(thought.channel_event.is_none());
+    }
+
+    #[test]
+    fn acp_commentary_phase_does_not_override_non_message_updates() {
+        let thought = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "phase": "commentary",
+                    "content": {"text": "raw thought must stay internal"}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(thought.kind, "agent_thought_chunk");
+        assert!(thought.channel_event.is_none());
+
+        let tool = project_acp_update(&json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Bash",
+                    "rawInput": {"command": "cargo test"},
+                    "status": "completed",
+                    "_meta": {"codex": {"phase": "commentary"}}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(tool.kind, "tool_tool_call");
+        let event = tool.channel_event.unwrap();
+        assert_eq!(event.kind, ExecutorChannelEventKind::ToolCall);
+        assert_eq!(event.text, "$ cargo test\nstatus: completed");
     }
 
     #[test]
