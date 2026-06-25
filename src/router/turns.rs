@@ -146,6 +146,10 @@ impl TurnRegistry {
             .is_some_and(|turn| turn.generation == generation)
     }
 
+    pub(crate) async fn has_active(&self, session_key: &str) -> bool {
+        self.active.lock().await.contains_key(session_key)
+    }
+
     pub(crate) async fn discard_if_current(&self, session_key: &str, generation: u64) -> bool {
         let mut active = self.active.lock().await;
         if active

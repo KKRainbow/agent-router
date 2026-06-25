@@ -24,7 +24,7 @@ use crate::{
     config::{ChannelEventMode, SlackConfig},
     router::{
         RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
-        render_live_compact_channel_events,
+        is_slash_command_input, render_live_compact_channel_events,
     },
     session::context::{
         ContextArtifactInput, ContextArtifactRecord, ContextArtifactRemovalInput,
@@ -227,6 +227,16 @@ impl SlackSocketModeChannel {
             || self.cfg.free_response_channels.contains(&event.channel);
         if !should_route {
             if event.is_thread_reply() {
+                if is_slash_command_input(&text) {
+                    tracing::info!(
+                        channel = %event.channel,
+                        user_id = %event.user,
+                        session_key = %session_key,
+                        text_len = text.len(),
+                        "ignored unmentioned Slack thread slash command"
+                    );
+                    return Ok(());
+                }
                 tracing::info!(
                     channel = %event.channel,
                     user_id = %event.user,
@@ -269,20 +279,22 @@ impl SlackSocketModeChannel {
         }
         let command = text.split_whitespace().next().unwrap_or("");
         let mut context_cache_sequence = None;
-        let turn_reservation =
-            if approval_command || matches!(command, "/stop" | "/agent" | "/yolo") {
-                None
-            } else {
-                let cache_sequence = self
-                    .next_context_cache_sequence
-                    .fetch_add(1, Ordering::Relaxed);
-                self.remember_context_cache_sequence(&session_key, cache_sequence)
-                    .await;
-                context_cache_sequence = Some(cache_sequence);
-                router
-                    .reserve_turn(&session_key, TurnBeginMode::ReplaceActive)
-                    .await?
-            };
+        let turn_reservation = if approval_command
+            || matches!(command, "/stop" | "/agent" | "/yolo")
+            || is_slash_command_input(&text)
+        {
+            None
+        } else {
+            let cache_sequence = self
+                .next_context_cache_sequence
+                .fetch_add(1, Ordering::Relaxed);
+            self.remember_context_cache_sequence(&session_key, cache_sequence)
+                .await;
+            context_cache_sequence = Some(cache_sequence);
+            router
+                .reserve_turn(&session_key, TurnBeginMode::ReplaceActive)
+                .await?
+        };
         let context_cache_token =
             context_cache_sequence.map(|cache_sequence| SlackContextCacheToken {
                 session_key: session_key.clone(),
@@ -366,9 +378,7 @@ impl SlackSocketModeChannel {
         if !self.should_accept_channel(&command.channel_id) {
             return Ok(());
         }
-        let text = format!("{} {}", command.command, command.text)
-            .trim()
-            .to_string();
+        let text = normalize_slack_slash_command_text(&command);
         let reply_target = SlackReplyTarget {
             channel: command.channel_id.clone(),
             thread_ts: None,
@@ -627,6 +637,7 @@ impl SlackSocketModeChannel {
                 || self.cfg.context_sync.files)
             && !is_approval_command(text)
             && !matches!(command, "/stop" | "/agent" | "/yolo")
+            && !is_slash_command_input(text)
     }
 
     async fn current_thread_context_request(
@@ -1968,6 +1979,19 @@ fn parse_slash_command(payload: &Value) -> Option<SlackSlashCommand> {
     })
 }
 
+fn normalize_slack_slash_command_text(command: &SlackSlashCommand) -> String {
+    let name = command.command.trim();
+    let text = command.text.trim();
+    if matches!(name, "/stop" | "/agent" | "/yolo" | "/approve" | "/deny") {
+        return format!("{name} {text}").trim().to_string();
+    }
+    if text.is_empty() {
+        name.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 fn parse_slack_thread_message(raw: Value) -> Option<SlackThreadMessage> {
     let ts = raw.get("ts").and_then(Value::as_str)?.to_string();
     let text = raw
@@ -2877,6 +2901,36 @@ mod tests {
             thread_ts: Some("111.000".to_string()),
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn slack_app_entry_slash_command_uses_payload_text() {
+        let command = SlackSlashCommand {
+            command: "/hermes".to_string(),
+            text: " //status --json ".to_string(),
+            channel_id: "C1".to_string(),
+            user_id: "U1".to_string(),
+        };
+
+        assert_eq!(
+            normalize_slack_slash_command_text(&command),
+            "//status --json"
+        );
+    }
+
+    #[test]
+    fn router_owned_slack_platform_slash_command_keeps_command_name() {
+        let command = SlackSlashCommand {
+            command: "/agent".to_string(),
+            text: " status ".to_string(),
+            channel_id: "C1".to_string(),
+            user_id: "U1".to_string(),
+        };
+
+        assert_eq!(
+            normalize_slack_slash_command_text(&command),
+            "/agent status"
+        );
     }
 
     fn file_ref(id: &str) -> SlackFileRef {
@@ -4334,6 +4388,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmentioned_thread_slash_command_is_ignored() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(thread_reply("//status"), router_service, "BOT")
+            .await
+            .unwrap();
+
+        assert!(router.handled.lock().await.is_empty());
+        assert!(router.observed.lock().await.is_empty());
+        assert!(router.reserved.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn unmentioned_top_level_channel_message_is_ignored() {
         let channel = SlackSocketModeChannel::new(
             test_slack_config(true),
@@ -4361,7 +4434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmentioned_approval_text_without_pending_is_observed_not_routed() {
+    async fn unmentioned_approval_text_without_pending_is_ignored() {
         let channel = SlackSocketModeChannel::new(
             test_slack_config(true),
             Arc::new(ApprovalBroker::default()),
@@ -4375,9 +4448,8 @@ mod tests {
             .unwrap();
 
         assert!(router.handled.lock().await.is_empty());
-        let observed = router.observed.lock().await;
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].text, "/approve 1");
+        assert!(router.observed.lock().await.is_empty());
+        assert!(router.reserved.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -4404,6 +4476,92 @@ mod tests {
             .unwrap();
 
         assert!(router.reserved.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn routed_slash_command_does_not_preempt() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+        let event = SlackMessageEvent {
+            event_key: "Ev1".to_string(),
+            channel: "D1".to_string(),
+            user: "U1".to_string(),
+            text: "/status".to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+            files: Vec::new(),
+        };
+
+        channel
+            .handle_message_event(event, router_service, "BOT")
+            .await
+            .unwrap();
+
+        assert!(router.reserved.lock().await.is_empty());
+        let handled = router.handled.lock().await;
+        assert_eq!(handled.len(), 1);
+        assert_eq!(handled[0].text, "/status");
+    }
+
+    #[tokio::test]
+    async fn slack_app_entry_slash_command_routes_payload_text() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_slash_command(
+                SlackSlashCommand {
+                    command: "/hermes".to_string(),
+                    text: "//status --json".to_string(),
+                    channel_id: "C1".to_string(),
+                    user_id: "U1".to_string(),
+                },
+                router_service,
+            )
+            .await
+            .unwrap();
+
+        let handled = router.handled.lock().await;
+        assert_eq!(handled.len(), 1);
+        assert_eq!(handled[0].session_key, "slack:C1:slash:U1");
+        assert_eq!(handled[0].text, "//status --json");
+        assert_eq!(handled[0].user_id.as_deref(), Some("U1"));
+    }
+
+    #[tokio::test]
+    async fn router_owned_slack_platform_slash_command_routes_command_name() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_slash_command(
+                SlackSlashCommand {
+                    command: "/agent".to_string(),
+                    text: "status".to_string(),
+                    channel_id: "C1".to_string(),
+                    user_id: "U1".to_string(),
+                },
+                router_service,
+            )
+            .await
+            .unwrap();
+
+        let handled = router.handled.lock().await;
+        assert_eq!(handled.len(), 1);
+        assert_eq!(handled[0].session_key, "slack:C1:slash:U1");
+        assert_eq!(handled[0].text, "/agent status");
     }
 
     #[tokio::test]

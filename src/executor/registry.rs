@@ -7,9 +7,10 @@ use crate::{
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorInterruptRequest,
-        ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, PreparedExecutor,
-        TurnCancellation, acp::AcpExecutorManager, claude_stream_json::ClaudeStreamJsonManager,
-        codex_app_server::CodexAppServerManager,
+        ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorSlashCommand,
+        ExecutorSlashCommandOutcome, ExecutorSlashCommandRequest, ExecutorSlashCommandSupport,
+        PreparedExecutor, TurnCancellation, acp::AcpExecutorManager,
+        claude_stream_json::ClaudeStreamJsonManager, codex_app_server::CodexAppServerManager,
     },
     machine::MachineRegistry,
 };
@@ -103,6 +104,27 @@ impl ExecutorBackend for ExecutorRegistry {
             Err(err) => return ExecutorPromptOutcome::Failed(err),
         };
         backend.prompt(request, events, cancel).await
+    }
+
+    fn slash_command_support(
+        &self,
+        executor: &str,
+        command: &ExecutorSlashCommand,
+    ) -> ExecutorSlashCommandSupport {
+        self.backend_for(executor)
+            .map(|backend| backend.slash_command_support(executor, command))
+            .unwrap_or(ExecutorSlashCommandSupport::Unsupported)
+    }
+
+    async fn slash_command(
+        &self,
+        request: ExecutorSlashCommandRequest,
+    ) -> ExecutorSlashCommandOutcome {
+        let backend = match self.backend_for(&request.executor) {
+            Ok(backend) => backend,
+            Err(err) => return ExecutorSlashCommandOutcome::Failed(err),
+        };
+        backend.slash_command(request).await
     }
 
     async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {

@@ -19,7 +19,7 @@ use crate::{
     config::{ChannelEventMode, QqConfig},
     router::{
         RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
-        TurnReservation, render_compact_channel_events,
+        TurnReservation, is_slash_command_input, render_compact_channel_events,
     },
 };
 
@@ -249,7 +249,9 @@ impl QqBotChannel {
         let reply_context_sequence = self
             .next_reply_context_sequence
             .fetch_add(1, Ordering::Relaxed);
-        let turn_reservation = if matches!(command, "/stop" | "/agent" | "/yolo") {
+        let turn_reservation = if matches!(command, "/stop" | "/agent" | "/yolo")
+            || is_slash_command_input(&message.text)
+        {
             None
         } else {
             router
@@ -906,12 +908,44 @@ fn qq_error_body_is_markdown_payload_rejection(body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
     use crate::approval::ApprovalBroker;
     use serde_json::json;
+    use tokio::sync::Mutex;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingRouter {
+        handled: Mutex<Vec<RouterInput>>,
+        reserved: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouterService for RecordingRouter {
+        async fn reserve_turn(
+            &self,
+            session_key: &str,
+            _mode: TurnBeginMode,
+        ) -> anyhow::Result<Option<TurnReservation>> {
+            self.reserved.lock().await.push(session_key.to_string());
+            Ok(None)
+        }
+
+        async fn handle(
+            &self,
+            input: RouterInput,
+            _output: &mut dyn RouterOutputSink,
+        ) -> anyhow::Result<()> {
+            self.handled.lock().await.push(input);
+            Ok(())
+        }
+
+        async fn observe(&self, _input: RouterInput) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn parses_c2c_message() {
@@ -977,6 +1011,51 @@ mod tests {
 
         assert!(parse_inbound_message("C2C_MESSAGE_CREATE", &empty).is_none());
         assert!(parse_inbound_message("READY", &json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn slash_command_does_not_preempt() {
+        let channel = QqBotChannel::new(
+            QqConfig {
+                enabled: true,
+                app_id: String::new(),
+                client_secret: String::new(),
+                sandbox: false,
+                intents: 0,
+                channel_events: ChannelEventMode::Off,
+                allowed_users: BTreeSet::new(),
+                allowed_groups: BTreeSet::new(),
+            },
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(RecordingRouter::default());
+        let data = json!({
+            "id": "m1",
+            "content": "/status",
+            "author": {
+                "id": "legacy",
+                "user_openid": "u_open"
+            }
+        });
+
+        channel
+            .handle_dispatch("C2C_MESSAGE_CREATE", &data, router.clone())
+            .await
+            .unwrap();
+
+        assert!(router.reserved.lock().await.is_empty());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !router.handled.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("QQ slash command was not routed");
+        let handled = router.handled.lock().await;
+        assert_eq!(handled[0].text, "/status");
     }
 
     #[test]

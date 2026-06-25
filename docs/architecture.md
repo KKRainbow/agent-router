@@ -67,8 +67,9 @@ produce router-compatible output. Hermes, Codex, and Kimi are examples of
 executor identities from the user's point of view.
 
 Executor-owned slash commands are executor control input, not ordinary chat
-prompts. Router-owned commands are consumed by Agent Router; other slash
-commands should be forwarded only through a backend path that preserves command
+prompts. Router-owned commands are consumed by Agent Router. A double-slash
+input such as `//status` explicitly targets the active executor as `/status`,
+and should be forwarded only through a backend path that preserves command
 semantics, or rejected explicitly when the active backend cannot do that.
 
 The first supported backend protocol is ACP. A configured executor such as

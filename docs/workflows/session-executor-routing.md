@@ -101,8 +101,9 @@ plain-text prompt path:
 
 - Router-owned commands, such as `/stop`, `/agent`, `/yolo`, `/approve`, and
   `/deny`, are consumed by Agent Router.
-- Agent-owned slash commands, such as an executor's `/status`, belong to the
-  current active executor.
+- Agent-owned slash commands use an explicit double-slash escape, such as
+  `//status`, and belong to the current active executor after the router strips
+  one leading `/`.
 
 Channel-platform slash commands, such as Slack slash command payloads, are only
 an ingress transport shape. Channel adapters should normalize them into the same
@@ -112,9 +113,12 @@ and adapters should not flatten them into plain text before the router can make
 the router-owned versus agent-owned decision.
 
 The router should preserve agent-owned slash command semantics when forwarding
-them to an executor. If a non-router command starts with `/`, the router should
-parse it into a structured command turn instead of sending it as a normal user
-prompt. A minimal representation is:
+them to an executor. Single-slash commands stay in the router namespace; unknown
+single-slash commands return a clear hint such as "use `//status` to send
+`/status` to the active agent." If a command starts with `//`, the router should
+strip exactly one leading `/` and parse the remaining `/...` input into a
+structured command turn instead of sending it as a normal user prompt. A minimal
+representation is:
 
 ```rust
 pub struct ExecutorSlashCommand {
@@ -146,9 +150,9 @@ The dispatch rule is:
 
 ```text
 router-owned slash command -> router handles it
-agent-owned slash command + backend supports command passthrough -> structured executor command
-agent-owned slash command + backend cannot preserve command semantics -> explicit unsupported reply
-literal text beginning with "/" -> escaped by the user, for example "//status" or "\/status"
+unknown single-slash command -> router reply with a // passthrough hint
+double-slash command + backend supports command passthrough -> structured executor command with one leading slash stripped
+double-slash command + backend cannot preserve command semantics -> explicit unsupported reply
 ```
 
 Agent slash commands are control input, not ordinary chat content. By default

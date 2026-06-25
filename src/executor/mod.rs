@@ -61,6 +61,35 @@ pub struct ExecutorPromptRequest {
     pub user_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorSlashCommand {
+    pub raw: String,
+    pub name: String,
+    pub args: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorSlashCommandSupport {
+    Unsupported,
+    IdleOnly,
+    DuringActiveTurn,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutorSlashCommandRequest {
+    pub session_key: String,
+    pub executor: String,
+    pub command: ExecutorSlashCommand,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum ExecutorSlashCommandOutcome {
+    Completed(ExecutorResponse),
+    Unsupported,
+    Failed(anyhow::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptReason {
     ReplacedByNewMessage,
@@ -314,6 +343,26 @@ pub trait ExecutorBackend: Send + Sync + 'static {
         events: &mut dyn ExecutorEventSink,
         cancel: TurnCancellation,
     ) -> ExecutorPromptOutcome;
+
+    fn slash_command_support(
+        &self,
+        _executor: &str,
+        _command: &ExecutorSlashCommand,
+    ) -> ExecutorSlashCommandSupport {
+        ExecutorSlashCommandSupport::Unsupported
+    }
+
+    /// Run one executor-owned slash command.
+    ///
+    /// Slash commands are executor control input, not ordinary chat prompts.
+    /// Backends must return `Unsupported` unless they can preserve the command's
+    /// native semantics instead of re-wrapping it as plain user text.
+    async fn slash_command(
+        &self,
+        _request: ExecutorSlashCommandRequest,
+    ) -> ExecutorSlashCommandOutcome {
+        ExecutorSlashCommandOutcome::Unsupported
+    }
 
     /// Request cancellation of active backend work for a router Turn.
     ///
