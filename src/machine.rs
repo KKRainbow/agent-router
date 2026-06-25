@@ -434,11 +434,7 @@ async fn materialize_ssh_workspace(
     let mut tar_stdout = tar.stdout.take().ok_or_else(|| {
         anyhow::anyhow!("workspace materialization archive did not expose stdout")
     })?;
-    let remote_command = format!(
-        "find {} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + && tar xf - -C {}",
-        shell_quote(remote_cwd),
-        shell_quote(remote_cwd)
-    );
+    let remote_command = materialize_remote_workspace_script(remote_cwd)?;
     let mut ssh = Command::new("ssh")
         .args(ssh_remote_args(host, &remote_command))
         .stdin(Stdio::piped())
@@ -495,6 +491,14 @@ async fn materialize_ssh_workspace(
         "workspace materialization to `{host}:{remote_cwd}` failed: {ssh_status}"
     );
     Ok(())
+}
+
+fn materialize_remote_workspace_script(remote_cwd: &str) -> anyhow::Result<String> {
+    let ensure_workspace = create_remote_workspace_script(remote_cwd)?;
+    let quoted = shell_quote(remote_cwd);
+    Ok(format!(
+        "{ensure_workspace} && cd -P -- {quoted} && [ \"$(pwd -P)\" = {quoted} ] && find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + && tar xf - -C ."
+    ))
 }
 
 async fn collect_ssh_skills(machine: &MachineConfig) -> Vec<CollectedSkill> {
@@ -1021,6 +1025,18 @@ mod tests {
         assert!(script.contains("[ ! -L '/remote/work' ]"));
         assert!(script.contains("[ ! -L '/remote/work/session' ]"));
         assert!(script.contains("mkdir -- '/remote/work/session'"));
+    }
+
+    #[test]
+    fn remote_workspace_materialization_binds_to_validated_directory() {
+        let script = materialize_remote_workspace_script("/remote/work/session").unwrap();
+
+        assert!(script.contains("[ ! -L '/remote/work/session' ]"));
+        assert!(script.contains("cd -P -- '/remote/work/session'"));
+        assert!(script.contains("[ \"$(pwd -P)\" = '/remote/work/session' ]"));
+        assert!(script.contains("find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"));
+        assert!(script.contains("tar xf - -C ."));
+        assert!(!script.contains("tar xf - -C '/remote/work/session'"));
     }
 
     #[tokio::test]

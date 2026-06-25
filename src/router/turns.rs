@@ -165,11 +165,11 @@ impl TurnRegistry {
 }
 
 impl TurnReservation {
-    pub(in crate::router) fn generation(&self) -> u64 {
+    pub(in crate::router) fn log_generation(&self) -> u64 {
         self.generation
     }
 
-    pub(in crate::router) async fn discard_if_current(&self) -> bool {
+    pub(in crate::router) async fn abandon_if_current(&self) -> bool {
         self.registry
             .discard_if_current(&self.session_key, self.generation)
             .await
@@ -201,7 +201,7 @@ impl TurnGuard {
         &self.executor
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    pub(crate) fn log_generation(&self) -> u64 {
         self.generation
     }
 
@@ -217,16 +217,32 @@ impl TurnGuard {
         }
     }
 
-    pub(crate) async fn is_current(&self) -> bool {
+    async fn is_current(&self) -> bool {
         self.registry
             .is_current(&self.session_key, self.generation)
             .await
     }
 
-    pub(crate) async fn finish_if_current(&self) -> bool {
+    async fn is_current_and_uncancelled(&self) -> bool {
+        !self.cancel.is_cancelled().await && self.is_current().await
+    }
+
+    pub(crate) async fn is_output_allowed(&self) -> bool {
+        self.is_current_and_uncancelled().await
+    }
+
+    pub(crate) async fn is_context_commit_allowed(&self) -> bool {
+        self.is_current_and_uncancelled().await
+    }
+
+    async fn remove_if_current(&self) -> bool {
         self.registry
             .discard_if_current(&self.session_key, self.generation)
             .await
+    }
+
+    pub(crate) async fn abandon_if_current(&self) -> bool {
+        self.remove_if_current().await
     }
 
     pub(crate) async fn commit_if_current<F, Fut, T>(&self, commit: F) -> Option<T>
@@ -234,7 +250,7 @@ impl TurnGuard {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        if !self.finish_if_current().await {
+        if !self.remove_if_current().await {
             return None;
         }
         Some(commit().await)
@@ -297,13 +313,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_guard_cannot_finish_current_turn() {
+    async fn stale_guard_cannot_abandon_current_turn() {
         let turns = TurnRegistry::new();
         let stale = turns.begin("session", "kimi".to_string()).await.guard;
         let current = turns.begin("session", "kimi".to_string()).await.guard;
 
-        assert!(!stale.finish_if_current().await);
-        assert!(current.finish_if_current().await);
+        assert!(!stale.abandon_if_current().await);
+        assert!(current.abandon_if_current().await);
         assert!(!turns.has_current("session").await);
     }
 
@@ -325,7 +341,7 @@ mod tests {
 
         assert!(result.is_none());
         assert!(committed.lock().await.is_empty());
-        assert!(current.finish_if_current().await);
+        assert!(current.abandon_if_current().await);
     }
 
     #[tokio::test]
@@ -346,7 +362,7 @@ mod tests {
 
         assert_eq!(result, Some(7));
         assert_eq!(*committed.lock().await, vec!["current"]);
-        assert!(!current.finish_if_current().await);
+        assert!(!current.abandon_if_current().await);
     }
 
     #[tokio::test]

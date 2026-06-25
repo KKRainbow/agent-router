@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     path::Path,
     sync::{
         Arc,
@@ -195,6 +196,7 @@ impl AcpBackendSessionManager {
                         &key,
                         existing,
                         "ACP session no longer matches config",
+                        cancel,
                     )
                     .await
                 {
@@ -243,12 +245,14 @@ impl AcpBackendSessionManager {
         key: &SessionKey,
         session: &Arc<Mutex<AcpSession>>,
         reason: &str,
+        cancel: &TurnCancellation,
     ) -> bool {
         let removed = {
             let mut sessions = self.sessions.lock().await;
-            if sessions
-                .get(key)
-                .is_some_and(|existing| Arc::ptr_eq(existing, session))
+            if !cancel.is_cancelled_now()
+                && sessions
+                    .get(key)
+                    .is_some_and(|existing| Arc::ptr_eq(existing, session))
             {
                 sessions.remove(key);
                 true
@@ -663,7 +667,11 @@ impl AcpSession {
             return ExecutorPromptOutcome::Cancelled;
         }
         tokio::select! {
-            _ = self.client.wait_for_cancel_barrier() => {}
+            result = self.client.wait_for_cancel_barrier() => {
+                if let Err(err) = result {
+                    return ExecutorPromptOutcome::Failed(err);
+                }
+            }
             _ = cancel.cancelled() => return ExecutorPromptOutcome::Cancelled,
         }
         if cancel.is_cancelled().await {
@@ -1044,8 +1052,12 @@ impl JsonRpcClient {
         begin_cancel_barrier_if_pending(&self.state, &self.cancel_barrier, id).await
     }
 
-    async fn wait_for_cancel_barrier(&self) {
-        wait_for_cancel_barrier(&self.state, &self.cancel_barrier).await;
+    async fn wait_for_cancel_barrier(&self) -> anyhow::Result<()> {
+        wait_for_cancel_barrier(&self.state, &self.cancel_barrier, || async {
+            self.close("ACP cancelled prompt response did not settle")
+                .await;
+        })
+        .await
     }
 
     fn is_alive(&self) -> bool {
@@ -1435,16 +1447,38 @@ async fn active_cancel_barrier_id(state: &SharedJsonRpcState) -> Option<u64> {
     state.lock().await.cancel_barrier_response_id
 }
 
-async fn wait_for_cancel_barrier(
+async fn wait_for_cancel_barrier<F, Fut>(
     state: &SharedJsonRpcState,
     cancel_barrier: &SharedAcpCancelBarrier,
-) {
+    on_timeout: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let timeout = sleep(ACP_CANCELLED_LIFECYCLE_SETTLE_TIMEOUT);
+    tokio::pin!(timeout);
+    let mut on_timeout = Some(on_timeout);
     loop {
         let changed = cancel_barrier.changed.notified();
         if state.lock().await.cancel_barrier_response_id.is_none() {
-            return;
+            return Ok(());
         }
-        changed.await;
+        tokio::select! {
+            _ = changed => {}
+            _ = &mut timeout => {
+                if active_cancel_barrier_id(state).await.is_none() {
+                    return Ok(());
+                }
+                if let Some(on_timeout) = on_timeout.take() {
+                    on_timeout().await;
+                }
+                anyhow::bail!(
+                    "ACP cancelled prompt response did not settle within {}s",
+                    ACP_CANCELLED_LIFECYCLE_SETTLE_TIMEOUT.as_secs()
+                );
+            }
+        }
     }
 }
 
@@ -1924,7 +1958,10 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         fs,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -1962,7 +1999,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(50),
-                wait_for_cancel_barrier(&state, &barrier)
+                wait_for_cancel_barrier(&state, &barrier, || async {})
             )
             .await
             .is_ok()
@@ -1987,11 +2024,77 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(50),
-                wait_for_cancel_barrier(&state, &barrier)
+                wait_for_cancel_barrier(&state, &barrier, || async {})
             )
             .await
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_barrier_timeout_clears_pending_barrier() {
+        let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let barrier = Arc::new(AcpCancelBarrier::default());
+        let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<Value>>();
+        state.lock().await.pending.insert(7, tx);
+
+        assert!(begin_cancel_barrier_if_pending(&state, &barrier, 7).await);
+        assert_eq!(active_cancel_barrier_id(&state).await, Some(7));
+
+        let result = wait_for_cancel_barrier(&state, &barrier, {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            || async move {
+                fail_all_pending(&state, &barrier, "test cancelled prompt timeout").await;
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(active_cancel_barrier_id(&state).await, None);
+        if let Ok(response) = rx.await {
+            assert!(response.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_barrier_timeout_rechecks_cleared_barrier_before_recovery() {
+        let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let barrier = Arc::new(AcpCancelBarrier::default());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<anyhow::Result<Value>>();
+        state.lock().await.pending.insert(7, tx);
+
+        assert!(begin_cancel_barrier_if_pending(&state, &barrier, 7).await);
+        assert_eq!(active_cancel_barrier_id(&state).await, Some(7));
+
+        let timeout_hook_called = Arc::new(AtomicBool::new(false));
+        let mut wait_task = tokio::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            let timeout_hook_called = timeout_hook_called.clone();
+            async move {
+                wait_for_cancel_barrier(&state, &barrier, || {
+                    let timeout_hook_called = timeout_hook_called.clone();
+                    async move {
+                        timeout_hook_called.store(true, Ordering::SeqCst);
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::select! {
+            result = &mut wait_task => {
+                panic!("barrier wait finished before the test cleared it: {result:?}");
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+
+        state.lock().await.cancel_barrier_response_id = None;
+
+        let result = wait_task.await.unwrap();
+        assert!(result.is_ok());
+        assert!(!timeout_hook_called.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2747,12 +2850,70 @@ for line in sys.stdin:
 
         assert!(
             !manager
-                .remove_unhealthy_session_if_same(&key, &first, "stale cleanup")
+                .remove_unhealthy_session_if_same(
+                    &key,
+                    &first,
+                    "stale cleanup",
+                    &TurnCancellation::new()
+                )
                 .await
         );
         let current = manager.existing_session("session-1", "kimi").await.unwrap();
         assert!(Arc::ptr_eq(&current, &second));
         second.lock().await.client.close("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn acp_cancelled_removal_does_not_remove_matching_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("current_acp.py");
+        fs::write(
+            &script,
+            r#"
+import sys
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+"#,
+        )
+        .unwrap();
+        let manager = AcpBackendSessionManager::new(
+            Arc::new(ApprovalBroker::default()),
+            MachineRegistry::local_default(),
+        );
+        let cfg = ExecutorConfig {
+            name: "kimi".to_string(),
+            protocol: ExecutorProtocol::Acp,
+            machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
+            command: "python3".to_string(),
+            args: vec![script.display().to_string()],
+            cwd: Some(tmp.path().to_path_buf()),
+            env: BTreeMap::new(),
+        };
+        let key = ("session-1".to_string(), "kimi".to_string());
+        let cancel = TurnCancellation::new();
+        let session = manager
+            .get_or_create_session("session-1", "kimi", &cfg, None, &cancel)
+            .await
+            .unwrap();
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+
+        assert!(
+            !manager
+                .remove_unhealthy_session_if_same(
+                    &key,
+                    &session,
+                    "cancelled stale removal",
+                    &cancel
+                )
+                .await
+        );
+
+        let current = manager.existing_session("session-1", "kimi").await.unwrap();
+        assert!(Arc::ptr_eq(&current, &session));
+        assert!(session.lock().await.client.is_alive());
+        session.lock().await.client.close("test complete").await;
     }
 
     #[tokio::test]
@@ -3423,6 +3584,177 @@ for line in sys.stdin:
         .unwrap();
 
         assert_eq!(response.final_text, "new reply");
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_barrier_timeout_closes_unsettled_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("unsettled_cancel_acp.py");
+        let prompt_marker = tmp.path().join("first_prompt_started");
+        let cancel_marker = tmp.path().join("cancel_received");
+        let second_prompt_marker = tmp.path().join("second_prompt_started");
+        let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
+            .expect("prompt marker path serializes");
+        let cancel_marker_literal = serde_json::to_string(&cancel_marker.display().to_string())
+            .expect("cancel marker path serializes");
+        let second_prompt_marker_literal =
+            serde_json::to_string(&second_prompt_marker.display().to_string())
+                .expect("second marker path serializes");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json
+import sys
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def prompt_text(msg):
+    return "".join(item.get("text", "") for item in msg.get("params", {{}}).get("prompt", []))
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+    elif method == "session/new":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"sessionId": "fake-session"}}}})
+    elif method == "session/prompt":
+        prompt = prompt_text(msg)
+        if prompt == "first":
+            with open({prompt_marker_literal}, "w") as f:
+                f.write("started")
+                f.flush()
+        else:
+            with open({second_prompt_marker_literal}, "w") as f:
+                f.write("started")
+                f.flush()
+            send({{"jsonrpc": "2.0", "id": request_id, "result": {{"stopReason": "end_turn"}}}})
+    elif method == "session/cancel":
+        with open({cancel_marker_literal}, "w") as f:
+            f.write("cancelled")
+            f.flush()
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let manager = Arc::new(AcpExecutorManager::new(executors));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "kimi", 1),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let cancel = TurnCancellation::new();
+        let prompt_manager = manager.clone();
+        let prompt_cancel = cancel.clone();
+        let first_prompt = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "kimi", 1),
+                        prompt: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut events,
+                    prompt_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if prompt_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(prompt_marker.exists());
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        let first_outcome = tokio::time::timeout(Duration::from_secs(2), first_prompt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first_outcome, ExecutorPromptOutcome::Cancelled));
+        for _ in 0..50 {
+            if cancel_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(cancel_marker.exists());
+
+        let mut events = CollectingExecutorEventSink::default();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(4),
+            manager.prompt(
+                ExecutorPromptRequest {
+                    turn: turn_ref("session-1", "kimi", 2),
+                    prompt: "second".to_string(),
+                    user_id: None,
+                },
+                &mut events,
+                TurnCancellation::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        let err = match outcome {
+            ExecutorPromptOutcome::Failed(err) => err,
+            other => panic!("expected failed prompt after barrier timeout, got {other:?}"),
+        };
+        assert!(
+            err.to_string()
+                .contains("ACP cancelled prompt response did not settle")
+        );
+        assert!(!second_prompt_marker.exists());
+        let stale_session = manager
+            .session_manager
+            .existing_session("session-1", "kimi")
+            .await
+            .unwrap();
+        assert!(!stale_session.lock().await.client.is_alive());
+
+        let prepared = manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "kimi", 3),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.external_session_id.as_deref(),
+            Some("fake-session")
+        );
     }
 
     #[tokio::test]

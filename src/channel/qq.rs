@@ -39,7 +39,7 @@ pub struct QqBotChannel {
     gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
     reply_contexts: Arc<Mutex<HashMap<String, QqReplyContext>>>,
-    next_reply_generation: Arc<AtomicU64>,
+    next_reply_context_sequence: Arc<AtomicU64>,
 }
 
 impl QqBotChannel {
@@ -52,7 +52,7 @@ impl QqBotChannel {
             gateway_session: Arc::new(Mutex::new(QqGatewaySession::default())),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(1024))),
             reply_contexts: Arc::new(Mutex::new(HashMap::new())),
-            next_reply_generation: Arc::new(AtomicU64::new(1)),
+            next_reply_context_sequence: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -230,11 +230,13 @@ impl QqBotChannel {
         }
 
         if is_approval_command(&message.text) {
-            let reply_generation = self.next_reply_generation.fetch_add(1, Ordering::Relaxed);
+            let reply_context_sequence = self
+                .next_reply_context_sequence
+                .fetch_add(1, Ordering::Relaxed);
             let channel = self.clone();
             tokio::spawn(async move {
                 if let Err(err) = channel
-                    .route_message(message, None, reply_generation, router)
+                    .route_message(message, None, reply_context_sequence, router)
                     .await
                 {
                     tracing::warn!(error = %err, "failed to handle QQ approval command");
@@ -244,7 +246,9 @@ impl QqBotChannel {
         }
 
         let command = message.text.split_whitespace().next().unwrap_or("");
-        let reply_generation = self.next_reply_generation.fetch_add(1, Ordering::Relaxed);
+        let reply_context_sequence = self
+            .next_reply_context_sequence
+            .fetch_add(1, Ordering::Relaxed);
         let turn_reservation = if matches!(command, "/stop" | "/agent" | "/yolo") {
             None
         } else {
@@ -256,7 +260,7 @@ impl QqBotChannel {
         tokio::spawn(async move {
             let session_key = message.session_key.clone();
             if let Err(err) = channel
-                .route_message(message, turn_reservation, reply_generation, router)
+                .route_message(message, turn_reservation, reply_context_sequence, router)
                 .await
             {
                 tracing::warn!(
@@ -273,10 +277,10 @@ impl QqBotChannel {
         &self,
         message: QqInboundMessage,
         turn_reservation: Option<TurnReservation>,
-        reply_generation: u64,
+        reply_context_sequence: u64,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
-        self.remember_reply_context(&message, reply_generation)
+        self.remember_reply_context(&message, reply_context_sequence)
             .await;
         tracing::info!(
             session_key = %message.session_key,
@@ -340,13 +344,17 @@ impl QqBotChannel {
         // chat and let tool activity summaries carry the useful progress.
     }
 
-    async fn remember_reply_context(&self, message: &QqInboundMessage, generation: u64) {
+    async fn remember_reply_context(
+        &self,
+        message: &QqInboundMessage,
+        reply_context_sequence: u64,
+    ) {
         let mut contexts = self.reply_contexts.lock().await;
         if let Some(context) = contexts.get_mut(&message.session_key) {
-            if generation >= context.generation {
+            if reply_context_sequence >= context.reply_context_sequence {
                 context.target = message.target.clone();
                 context.msg_id = message.msg_id.clone();
-                context.generation = generation;
+                context.reply_context_sequence = reply_context_sequence;
             }
             return;
         }
@@ -356,7 +364,7 @@ impl QqBotChannel {
                 target: message.target.clone(),
                 msg_id: message.msg_id.clone(),
                 next_seq: 1,
-                generation,
+                reply_context_sequence,
             },
         );
     }
@@ -702,7 +710,7 @@ struct QqReplyContext {
     target: QqReplyTarget,
     msg_id: String,
     next_seq: u32,
-    generation: u64,
+    reply_context_sequence: u64,
 }
 
 impl QqReplyContext {
@@ -1036,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn older_generation_does_not_overwrite_reply_context() {
+    async fn older_reply_context_sequence_does_not_overwrite_reply_context() {
         let channel = QqBotChannel::new(
             QqConfig {
                 enabled: true,
@@ -1085,6 +1093,6 @@ mod tests {
             }
         );
         assert_eq!(context.msg_id, "new_msg");
-        assert_eq!(context.generation, 2);
+        assert_eq!(context.reply_context_sequence, 2);
     }
 }

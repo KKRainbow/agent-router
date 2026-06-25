@@ -72,10 +72,10 @@ distributed:
   `src/router.rs` still contains route-flow code that manually sequences
   currentness checks, interrupt requests, guarded output, context commit,
   success commit, failure commit, and cleanup.
-- `src/channel/slack.rs` still keeps adapter-local generation watermarks to
-  protect Slack context and file-sync caches from stale external data. These
-  should remain adapter-cache ordering only and must not decide router state.
-- `src/channel/qq.rs` still keeps adapter-local reply generations to avoid stale
+- `src/channel/slack.rs` keeps adapter-local context cache sequences to protect
+  Slack context and file-sync caches from stale external data. These are
+  adapter-cache ordering only and do not decide router state.
+- `src/channel/qq.rs` keeps adapter-local reply-context sequences to avoid stale
   reply target updates. This is platform-output bookkeeping, not the router Turn
   identity.
 - `src/session/context.rs` provides transactional context file installation,
@@ -433,6 +433,12 @@ Recommended contracts:
 - once a Backend Session is published in the adapter's shared session registry,
   a cancelled Turn cannot remove or close it merely because that Turn was
   cancelled.
+- Backend Session publication is compare-before-publish, never
+  last-writer-wins. If another prepare publishes first, the losing unpublished
+  process is closed and the winner remains the Manager-owned session.
+- Mismatched-session removal is compare-before-remove and cancellation-aware in
+  the same session-map critical section. A prepare cancelled while waiting to
+  remove a mismatched session cannot remove or close that session.
 - `prompt()` owns active backend work for one Turn.
 - `interrupt()` requests cancellation of active backend work for the specified
   Turn or Backend Session; it does not mean "destroy the shared Backend
@@ -774,53 +780,53 @@ the owning Module.
 - Treat every newly discovered race as a missing Module invariant first, not as
   a missing `if stale { return }` branch.
 
-### Phase 1: Add Turn Lifecycle Module `[mostly implemented]`
+### Phase 1: Add Turn Lifecycle Module `[implemented]`
 
 Already present:
 
 - `TurnRegistry`, `TurnReservation`, and `TurnGuard`;
 - active Turn storage and generation allocation outside `AgentRouter`;
 - replacement reservation, adoption, cancellation, stale finish, and `/stop`;
+- `TurnGuard` exposes typed router lifecycle operations for context commit
+  eligibility, output eligibility, abandoned Turns, and guarded commits instead
+  of exposing generic currentness checks to route code;
+- raw Turn generation exposure from router flow is limited to logging and
+  Executor correlation;
 - tests for replacement cancellation, stale reservation behavior, and command
   cancellation.
 
-Remaining work:
+The remaining `src/router.rs` route-flow size is an organization issue, not an
+ownership-rule gap. A dedicated Turn Runner is tracked as an Open Decision.
 
-- make `TurnGuard` the only router-state commit capability, not just the
-  currentness probe;
-- reduce raw generation exposure to logging and Executor correlation only;
-- move repeated route-flow sequencing out of `src/router.rs` once the Turn
-  Runner exists.
-
-### Phase 2: Move Router Commit Paths Behind Turn Guard `[partial]`
+### Phase 2: Move Router Commit Paths Behind Turn Guard `[implemented]`
 
 Already present:
 
 - success, cancellation, and stale paths use `TurnGuard` currentness checks;
 - successful Turn commits and failure-to-unhealthy binding commits now run
   through `TurnGuard::commit_if_current()`;
+- cancellation cleanup and context commit eligibility now run through typed
+  `TurnGuard` operations instead of ad hoc cancellation plus active-generation
+  checks;
 - old Turn events and final replies are gated against currentness;
 - route errors clear reserved placeholder Turns instead of leaving stale active
   records.
 
-Remaining work:
-
-- move cancellation cleanup and remaining context commit sequencing behind typed
-  `TurnGuard` operations;
-- separate the Turn Runner from command/intake code;
-- centralize stream event and final reply projection in one Turn-scoped output
-  Module.
+The projection code still lives in `src/router.rs`, but Turn-owned output
+eligibility is centralized behind `TurnGuard::is_output_allowed()`. Splitting
+the Turn Runner and output projection into smaller files is deferred to the
+module-organization Open Decision.
 
 Required tests:
 
 - old successful Turn cannot commit after replacement `[covered]`;
 - old failed Turn cannot mark Executor Binding unhealthy after replacement
   `[covered]`;
-- old stream events are dropped after replacement;
-- final reply belongs to the latest Turn only;
-- route validation failures never create ghost active Turns.
+- old stream events are dropped after replacement `[covered]`;
+- final reply belongs to the latest Turn only `[covered]`;
+- route validation failures never create ghost active Turns `[covered]`.
 
-### Phase 3: Replace Channel Raw Generation Interface `[mostly implemented]`
+### Phase 3: Replace Channel Raw Generation Interface `[implemented]`
 
 Already present:
 
@@ -829,15 +835,10 @@ Already present:
 - Slack reserves before slow thread/file context fetch for ordinary messages;
 - QQ reserves before spawning route work for ordinary messages;
 - approval and command paths stay explicit.
-
-Remaining work:
-
-- keep Slack context generations and QQ reply generations clearly scoped to
-  platform-cache ordering;
-- prevent adapter-local generation concepts from leaking back into router
-  state decisions;
-- consider replacing cache generation bookkeeping with opaque reservation or
-  Turn tokens if cache mutation must be tied to router lifecycle.
+- Slack's former context generation naming is now explicit
+  `context_cache_sequence` / `SlackContextCacheToken` platform-cache ordering;
+- QQ's former reply generation naming is now explicit
+  `reply_context_sequence` platform-cache ordering.
 
 Required tests:
 
@@ -845,9 +846,10 @@ Required tests:
 - QQ second message reaches router before old Turn finishes;
 - approval resolution does not interrupt active Turn;
 - ordinary text without pending approval does interrupt active Turn;
-- stale adapter cache updates cannot update router Session state.
+- stale adapter cache updates cannot update router Session state or adapter
+  reply/cache targets.
 
-### Phase 4: Make Context Commit Turn-Guarded `[mostly implemented]`
+### Phase 4: Make Context Commit Turn-Guarded `[implemented]`
 
 Already present:
 
@@ -856,23 +858,21 @@ Already present:
 - route errors discard reserved placeholder Turns.
 - stale after file install rolls back files without saving new context state;
 - stale after Session state save rolls back files and restores old Session
-  state.
-
-Remaining work:
-
-- decide whether `PreparedContextSync` should move into a dedicated context
-  commit Module instead of living in `src/router.rs`;
-- add any missing lower-level failed-install coverage that is not already
-  covered by `src/session/context.rs`;
-- keep context rollback semantics independent from Channel Adapter cache
+  state;
+- lower-level failed install coverage lives in `src/session/context.rs`, keeping
+  filesystem rollback independent from router Turn currentness;
+- context rollback semantics are independent from Channel Adapter cache
   ordering.
+
+Moving `PreparedContextSync` into a dedicated context commit Module remains a
+module-organization Open Decision, not an interrupt correctness gap.
 
 Required tests:
 
-- stale before install;
+- stale before install `[covered]`;
 - stale after install before state save `[covered]`;
 - stale after state save before finalization `[covered]`;
-- failed install restores replaced files and old state;
+- failed install restores replaced files and old state `[covered]`;
 - reserved context validation failure clears placeholder active Turns
   `[covered]`.
 
@@ -911,6 +911,8 @@ prepare owns the Backend Session it touched.
   - a cancel barrier while a cancelled prompt's JSON-RPC response is still
     pending, preventing late cancelled-turn `session/update` and permission
     requests from being projected into the replacement prompt;
+  - bounded unhealthy recovery if a cancelled prompt response never settles, so
+    the cancel barrier cannot wedge later prompts forever;
   - cancelled ACP stop reason maps to `ExecutorPromptOutcome::Cancelled`;
   - pending approvals are removed when their owning prompt is cancelled;
   - tests for active-prompt interrupt, stale interrupt isolation, late-update
@@ -927,6 +929,13 @@ prepare owns the Backend Session it touched.
   - if a cancelled ACP lifecycle RPC never settles, the adapter closes that
     process as unhealthy recovery and the next prepare replaces it through the
     handle-identity session manager path;
+  - ACP mismatched-session removal re-checks cancellation while holding the
+    session map, so a cancelled stale prepare cannot remove or close a matching
+    published session;
+  - ACP cancel barriers time out through unhealthy recovery if the cancelled
+    prompt response never arrives, and the timeout path re-checks the barrier
+    state before recovery so a just-settled cancelled response is not
+    misclassified as unhealthy;
   - adapter-boundary tests cover cancelled prepare during `initialize`, after
     `session/new`, cancelled lifecycle permission requests, stale mismatched
     prepare after newer publication, and stale unhealthy-session removal after a
@@ -961,6 +970,12 @@ prepare owns the Backend Session it touched.
   Backend Session. Lifecycle RPCs such as `initialize` and `thread/start` are
   driven to their response under the session lock before the cancelled prepare
   returns, so the shared session is not left in an unknown state.
+- Codex Backend Session publication is compare-before-publish; stale cancelled
+  prepares cannot remove newer published sessions, and publish losers close
+  their unpublished app-server process instead of overwriting the winner.
+- Codex mismatched-session removal re-checks cancellation while holding the
+  session map, so a cancellation that arrives after the first stale check still
+  prevents removal.
 - `started_new_session` is derived from actual `threadId` versus router
   `previous_session_id`, so a thread created by a cancelled prepare is still
   treated as a new session on the next successful prepare.
@@ -980,42 +995,65 @@ Codex coverage now includes:
   pending backend interrupt;
 - cancelled prepare after Backend Session publication keeps the same session
   reusable;
+- publication-lost and cancelled-mismatched-prepare races keep the newer
+  published Backend Session;
 - interrupted backend completion maps to `ExecutorPromptOutcome::Cancelled`.
 
-### Phase 8: Delete Old Scattered State Rules `[pending]`
+### Phase 8: Delete Old Scattered State Rules `[implemented]`
 
 - Implemented:
   - removed `created_session` cancellation cleanup from Executor adapters; ACP,
     Codex app-server, and Claude stream-json no longer close an already
     published Backend Session from cancelled prepare cleanup.
-- Remaining:
-- Remove raw generation checks from Channel Adapters unless they are strictly
-  local platform-cache sequence numbers.
-- Remove duplicated context-cache currentness code that the Turn Guard replaces.
-- Remove router helper methods that expose active generation directly.
-- Remove any fallback path where cancellation is handled as ordinary backend
-  failure.
+  - removed generic `TurnGuard::is_current()`, `finish_if_current()`, and raw
+    `generation()` calls from router code; router now uses typed TurnGuard
+    operations and explicit logging-only generation accessors.
+  - renamed Channel Adapter cache watermarks away from `generation`
+    terminology: Slack uses context cache sequences and QQ uses reply-context
+    sequences, so adapter-local ordering cannot be confused with router Turn
+    generation.
+  - kept adapter-local cache/reply ordering only where it protects platform
+    cache state; it no longer uses router generation terminology and does not
+    participate in router Turn lifecycle decisions.
+  - ACP, Codex app-server, and Claude stream-json now publish Backend Sessions
+    with compare-before-publish semantics instead of last-writer-wins insertion.
+    Stale cancelled prepares cannot remove newer sessions, and publication
+    losers close only their own unpublished process. Their mismatched-session
+    removal helpers also check cancellation inside the session-map critical
+    section, so cancellation cannot race with removal.
+  - ACP cancel barriers time out through unhealthy recovery if a cancelled
+    prompt response never settles, so later prompts are not wedged forever. The
+    timeout path re-checks barrier state before closing the process, which
+    avoids misclassifying a response that settled at the timeout boundary.
+  - cancellation paths now map to cancellation outcomes or cancelled prepare
+    abandonment rather than ordinary backend failure. Process close remains
+    isolated to unhealthy recovery paths.
 
-### Phase 9: Final Verification `[per phase and final]`
+### Phase 9: Final Verification `[implemented]`
 
-- Run formatting and all local tests.
-- Add race-focused tests before fixing each newly discovered race.
-- After every code-change commit, run the required subagent review.
-- Final review must inspect:
-  - behavioral regressions;
-  - concurrency and race risks;
-  - cache invalidation and state consistency;
-  - permission and approval implications;
-  - unintended broad coupling or over-complexity.
+- Completed local verification:
+  - `rtk cargo fmt --check`;
+  - `rtk cargo test acp_cancel_barrier_timeout_rechecks_cleared_barrier_before_recovery -- --nocapture`;
+  - `rtk cargo test acp -- --nocapture`;
+  - `rtk cargo test`;
+  - `rtk cargo clippy --all-targets -- -D warnings`;
+  - `rtk git diff --check`.
+- Race-focused tests now cover the discovered publication, removal, and cancel
+  barrier boundary cases before each corresponding fix.
+- Code reviews inspected behavioral regressions, concurrency and race risks,
+  state consistency, permission/approval implications, and coupling. The final
+  ACP timeout-boundary finding was fixed by re-checking barrier state before
+  timeout recovery.
 
 ## Acceptance Criteria
 
 Architecture is acceptable when:
 
 - Channel Adapters never inspect router generation values.
-- router state commits require a `TurnGuard`.
-- context sync finalization requires a current `TurnGuard`.
-- final replies and channel events go through Turn-scoped output gating.
+- Turn-result router state commits require a `TurnGuard`.
+- Turn-owned context sync finalization requires a current `TurnGuard`.
+- Turn-owned final replies and channel events go through Turn-scoped output
+  gating.
 - ACP and Codex prepare cancellation cannot close a Backend Session that a
   replacement Turn may reuse.
 - Executor interrupt can send soft cancel without waiting for the long prompt
@@ -1038,17 +1076,10 @@ Do not fix interrupt by:
 
 ## Open Decisions
 
-1. Whether to split the route execution path into `src/router/runner.rs` or keep
-   it in `src/router.rs` until Executor Backend Session Managers are done.
+1. Whether to split the route execution path into `src/router/runner.rs` after
+   the ownership rules have settled.
 2. Whether `TurnGuard::commit_session()` should take a closure over
    `SessionState` or expose narrower typed operations for transcript, binding,
    and context commits.
-3. Whether channel-side cache updates should keep local platform sequence
-   numbers or use an opaque Turn token directly when cache mutation is tied to
-   router lifecycle.
-4. Codex app-server's true soft-cancel protocol. If it has no turn cancel
-   method, close/recreate must be isolated as documented technical debt.
-5. How much of Backend Session Manager should be shared between ACP and Codex
-   versus duplicated initially for clarity.
-6. Whether context commit should remain as `PreparedContextSync` in the router
+3. Whether context commit should remain as `PreparedContextSync` in the router
    or move into `src/session/context.rs` behind a router-facing commit type.
