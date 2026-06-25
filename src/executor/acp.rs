@@ -48,35 +48,12 @@ struct AcpToolCallState {
 
 #[derive(Debug, Default)]
 struct AcpCancelBarrier {
-    pending_response_id: Mutex<Option<u64>>,
     changed: Notify,
 }
 
 impl AcpCancelBarrier {
-    async fn begin(&self, request_id: u64) {
-        *self.pending_response_id.lock().await = Some(request_id);
-    }
-
-    async fn active_request_id(&self) -> Option<u64> {
-        *self.pending_response_id.lock().await
-    }
-
-    async fn clear_if_response(&self, response_id: u64) {
-        let mut pending = self.pending_response_id.lock().await;
-        if *pending == Some(response_id) {
-            *pending = None;
-            self.changed.notify_waiters();
-        }
-    }
-
-    async fn wait(&self) {
-        loop {
-            let changed = self.changed.notified();
-            if self.pending_response_id.lock().await.is_none() {
-                return;
-            }
-            changed.await;
-        }
+    fn notify_changed(&self) {
+        self.changed.notify_waiters();
     }
 }
 
@@ -767,12 +744,22 @@ impl AcpSession {
     }
 
     async fn cancel_prompt_session(&mut self, session_id: &str, request_id: u64) {
-        self.client.begin_cancel_barrier(request_id).await;
+        if !self
+            .client
+            .begin_cancel_barrier_if_pending(request_id)
+            .await
+        {
+            tracing::debug!(
+                target: "agent_router::acp",
+                request_id,
+                "skipping ACP session/cancel because prompt response is no longer pending"
+            );
+            return;
+        }
         let notify_result = self
             .client
             .notify("session/cancel", json!({ "sessionId": session_id }))
             .await;
-        self.client.cancel_pending(request_id).await;
         if let Err(err) = notify_result {
             tracing::debug!(
                 target: "agent_router::acp",
@@ -810,6 +797,7 @@ struct JsonRpcClient {
 struct JsonRpcState {
     closed: bool,
     pending: HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>,
+    cancel_barrier_response_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -952,12 +940,12 @@ impl JsonRpcClient {
         self.updates.subscribe()
     }
 
-    async fn begin_cancel_barrier(&self, id: u64) {
-        self.cancel_barrier.begin(id).await;
+    async fn begin_cancel_barrier_if_pending(&self, id: u64) -> bool {
+        begin_cancel_barrier_if_pending(&self.state, &self.cancel_barrier, id).await
     }
 
     async fn wait_for_cancel_barrier(&self) {
-        self.cancel_barrier.wait().await;
+        wait_for_cancel_barrier(&self.state, &self.cancel_barrier).await;
     }
 
     fn is_alive(&self) -> bool {
@@ -1103,7 +1091,7 @@ impl JsonRpcClient {
     }
 
     async fn close(&self, reason: &str) {
-        fail_all_pending(&self.state, reason).await;
+        fail_all_pending(&self.state, &self.cancel_barrier, reason).await;
         let mut child = self.child.lock().await;
         let pid = child.id();
         tracing::warn!(
@@ -1141,15 +1129,28 @@ where
         session_key = %context.session_key,
         "ACP process stdout closed"
     );
-    fail_all_pending(&context.state, "ACP process closed stdout").await;
+    fail_all_pending(
+        &context.state,
+        &context.cancel_barrier,
+        "ACP process closed stdout",
+    )
+    .await;
 }
 
-async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
-    let drained = {
+async fn fail_all_pending(
+    state: &SharedJsonRpcState,
+    cancel_barrier: &SharedAcpCancelBarrier,
+    message: &str,
+) {
+    let (drained, cleared_barrier) = {
         let mut guard = state.lock().await;
         guard.closed = true;
-        guard.pending.drain().collect::<Vec<_>>()
+        let cleared_barrier = guard.cancel_barrier_response_id.take().is_some();
+        (guard.pending.drain().collect::<Vec<_>>(), cleared_barrier)
     };
+    if cleared_barrier {
+        cancel_barrier.notify_changed();
+    }
     for (_, tx) in drained {
         let _ = tx.send(Err(anyhow::anyhow!("{message}")));
     }
@@ -1158,13 +1159,21 @@ async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
 async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     if message.get("method").is_none() {
         let response_id = message.get("id").and_then(Value::as_u64);
-        if let Some(id) = response_id {
-            clear_cancel_barrier_for_response(context, id).await;
-        }
-        let sender = match message.get("id").and_then(Value::as_u64) {
-            Some(id) => context.state.lock().await.pending.remove(&id),
-            None => None,
+        let (sender, cleared_barrier) = match response_id {
+            Some(id) => {
+                response_sender_and_clear_barrier(&context.state, &context.cancel_barrier, id).await
+            }
+            None => (None, false),
         };
+        if cleared_barrier {
+            tracing::debug!(
+                target: "agent_router::acp",
+                executor = %context.executor,
+                session_key = %context.session_key,
+                response_id,
+                "cleared ACP cancelled prompt barrier"
+            );
+        }
         if let Some(tx) = sender {
             let _ = tx.send(Ok(message));
         }
@@ -1172,7 +1181,7 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     }
 
     if message.get("id").is_some() {
-        if let Some(request_id) = context.cancel_barrier.active_request_id().await {
+        if let Some(request_id) = active_cancel_barrier_id(&context.state).await {
             respond_to_cancel_barrier_server_request(context, &message, request_id).await;
             return;
         }
@@ -1181,7 +1190,7 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     }
 
     if message.get("method").and_then(Value::as_str) == Some("session/update") {
-        if let Some(request_id) = context.cancel_barrier.active_request_id().await {
+        if let Some(request_id) = active_cancel_barrier_id(&context.state).await {
             tracing::debug!(
                 target: "agent_router::acp",
                 executor = %context.executor,
@@ -1201,17 +1210,55 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     }
 }
 
-async fn clear_cancel_barrier_for_response(context: &JsonRpcServerContext, response_id: u64) {
-    let was_active = context.cancel_barrier.active_request_id().await == Some(response_id);
-    context.cancel_barrier.clear_if_response(response_id).await;
-    if was_active {
-        tracing::debug!(
-            target: "agent_router::acp",
-            executor = %context.executor,
-            session_key = %context.session_key,
-            response_id,
-            "cleared ACP cancelled prompt barrier"
-        );
+async fn begin_cancel_barrier_if_pending(
+    state: &SharedJsonRpcState,
+    cancel_barrier: &SharedAcpCancelBarrier,
+    response_id: u64,
+) -> bool {
+    let mut guard = state.lock().await;
+    if guard.pending.remove(&response_id).is_none() {
+        return false;
+    }
+    guard.cancel_barrier_response_id = Some(response_id);
+    cancel_barrier.notify_changed();
+    true
+}
+
+async fn response_sender_and_clear_barrier(
+    state: &SharedJsonRpcState,
+    cancel_barrier: &SharedAcpCancelBarrier,
+    response_id: u64,
+) -> (Option<oneshot::Sender<anyhow::Result<Value>>>, bool) {
+    let (sender, cleared_barrier) = {
+        let mut guard = state.lock().await;
+        let cleared_barrier = if guard.cancel_barrier_response_id == Some(response_id) {
+            guard.cancel_barrier_response_id = None;
+            true
+        } else {
+            false
+        };
+        (guard.pending.remove(&response_id), cleared_barrier)
+    };
+    if cleared_barrier {
+        cancel_barrier.notify_changed();
+    }
+    (sender, cleared_barrier)
+}
+
+async fn active_cancel_barrier_id(state: &SharedJsonRpcState) -> Option<u64> {
+    state.lock().await.cancel_barrier_response_id
+}
+
+async fn wait_for_cancel_barrier(
+    state: &SharedJsonRpcState,
+    cancel_barrier: &SharedAcpCancelBarrier,
+) {
+    loop {
+        let changed = cancel_barrier.changed.notified();
+        if state.lock().await.cancel_barrier_response_id.is_none() {
+            return;
+        }
+        changed.await;
     }
 }
 
@@ -1715,6 +1762,55 @@ mod tests {
             executor: executor.to_string(),
             generation,
         }
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_barrier_does_not_begin_after_response_is_dispatched() {
+        let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let barrier = Arc::new(AcpCancelBarrier::default());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<anyhow::Result<Value>>();
+        state.lock().await.pending.insert(7, tx);
+
+        let (sender, cleared_barrier) =
+            response_sender_and_clear_barrier(&state, &barrier, 7).await;
+        assert!(sender.is_some());
+        assert!(!cleared_barrier);
+
+        assert!(!begin_cancel_barrier_if_pending(&state, &barrier, 7).await);
+        assert_eq!(active_cancel_barrier_id(&state).await, None);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                wait_for_cancel_barrier(&state, &barrier)
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_barrier_clears_when_cancelled_prompt_response_arrives() {
+        let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let barrier = Arc::new(AcpCancelBarrier::default());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<anyhow::Result<Value>>();
+        state.lock().await.pending.insert(7, tx);
+
+        assert!(begin_cancel_barrier_if_pending(&state, &barrier, 7).await);
+        assert_eq!(active_cancel_barrier_id(&state).await, Some(7));
+
+        let (sender, cleared_barrier) =
+            response_sender_and_clear_barrier(&state, &barrier, 7).await;
+        assert!(sender.is_none());
+        assert!(cleared_barrier);
+        assert_eq!(active_cancel_barrier_id(&state).await, None);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                wait_for_cancel_barrier(&state, &barrier)
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[test]
