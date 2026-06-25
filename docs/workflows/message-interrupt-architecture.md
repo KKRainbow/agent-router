@@ -42,6 +42,10 @@ The repository already has part of this architecture:
 - Executor prepare, prompt, and interrupt requests now carry an
   `ExecutorTurnRef` so backend adapters receive one Turn identity across the
   per-Turn lifecycle.
+- ACP prompt cancellation now uses soft `session/cancel`, keeps the Backend
+  Session process alive, exposes an interrupt-readable active prompt handle, and
+  suppresses late updates from a cancelled prompt until that prompt's JSON-RPC
+  response is observed.
 
 The remaining architectural work is still substantial:
 
@@ -49,8 +53,9 @@ The remaining architectural work is still substantial:
 - not every durable router commit is expressed as a `TurnGuard` operation;
 - output projection is still only partially centralized;
 - Executor adapters still need explicit Backend Session Manager boundaries;
-- ACP and Codex app-server still need protocol-level soft cancel semantics that
-  do not destroy replacement-owned shared sessions;
+- ACP still needs the manager boundary cleanup, while Codex app-server still
+  needs protocol-level soft cancel semantics that do not destroy
+  replacement-owned shared sessions;
 - context commit still lives in `src/router.rs` instead of a dedicated context
   commit Module.
 
@@ -896,18 +901,24 @@ Phase 5 is the required bridge before ACP and Codex can be made robust. Without
 it, adapter code will keep guessing whether a cancelled prepare owns the
 Backend Session it touched.
 
-### Phase 6: Refactor ACP Backend Session Lifecycle `[pending]`
+### Phase 6: Refactor ACP Backend Session Lifecycle `[partial]`
 
-- Introduce ACP Backend Session Manager.
-- Split long prompt execution from interrupt-readable active backend turn
-  metadata.
-- Implement soft `session/cancel` through active backend turn metadata.
-- Ensure cancelled prepare does not close a published Backend Session.
-- Close and replace ACP process only through explicit unhealthy recovery.
-- Add ACP tests for:
-  - interrupt sends `session/cancel` even while prompt is active;
+- Implemented:
+  - soft `session/cancel` for local prompt cancellation without closing the ACP
+    process;
+  - interrupt-readable active prompt metadata outside the long session lock;
+  - update suppression while a cancelled prompt's JSON-RPC response is still
+    pending, preventing late cancelled-turn `session/update` events from being
+    collected by the replacement prompt;
   - cancelled ACP stop reason maps to `ExecutorPromptOutcome::Cancelled`;
-  - cancelled prepare after publication keeps replacement session alive;
+  - pending approvals are removed when their owning prompt is cancelled;
+  - tests for active-prompt interrupt, late-update isolation, soft cancel
+    session reuse, cancelled stop reason, and approval cleanup.
+- Remaining:
+  - introduce a named ACP Backend Session Manager instead of keeping the
+    manager behavior directly in `AcpExecutorManager`;
+  - make unhealthy process replacement an explicit handle-identity operation;
+  - add cancelled-prepare publication tests at the ACP adapter boundary;
   - unhealthy session replacement does not remove a newer session.
 
 ### Phase 7: Refactor Codex App-Server Backend Session Lifecycle `[pending]`

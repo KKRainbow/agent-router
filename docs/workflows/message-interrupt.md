@@ -10,9 +10,9 @@ to correct, redirect, or stop a long-running turn without waiting for the old
 turn to finish. The router should treat this as a first-class turn lifecycle
 state, not as a timeout, queue overflow, or process-kill fallback.
 
-## Current State
+## Implementation State
 
-The current implementation is a synchronous per-session turn model:
+The original implementation was a synchronous per-session turn model:
 
 - `AgentRouter::handle()` holds the per-session lock across
   `executor.prompt()`.
@@ -27,6 +27,19 @@ The current implementation is a synchronous per-session turn model:
 
 The practical result is that a second message for the same session waits behind
 the first turn instead of interrupting it.
+
+Current work has moved several of these items forward:
+
+- `ExecutorBackend` now has `prepare()`, `prompt()`, and `interrupt()` requests
+  carrying one `ExecutorTurnRef`.
+- ACP now uses soft `session/cancel` for prompt cancellation and `/stop` or
+  replacement interrupt, without closing a healthy ACP process.
+- ACP active prompt metadata is visible to `interrupt()` without waiting for the
+  long prompt lock.
+- ACP suppresses late `session/update` events from a cancelled prompt until that
+  prompt's JSON-RPC response is observed, so replacement turns do not collect
+  stale output.
+- Codex app-server still needs its equivalent protocol-level cancel path.
 
 ## Target Semantics
 
@@ -196,14 +209,17 @@ The backend should send this notification when interrupting an active turn:
 
 Implementation requirements:
 
-- Add `JsonRpcClient::notify(method, params)` for ACP.
-- Track the current active session id in `AcpSession`.
-- Implement `AcpExecutorBackend::interrupt()` by locating the existing
-  session and sending `session/cancel`.
-- Make `AcpSession::prompt()` select on the turn cancellation handle.
-- Map ACP cancelled results, such as `stopReason = "cancelled"`, to
+- `JsonRpcClient::notify(method, params)` sends ACP notifications.
+- The manager records the active prompt's external `sessionId`, JSON-RPC
+  request id, and notify handle outside the long prompt lock.
+- `AcpExecutorManager::interrupt()` sends `session/cancel` through that active
+  prompt handle when one exists.
+- `AcpSession::prompt()` selects on the turn cancellation handle.
+- ACP cancelled results, such as `stopReason = "cancelled"`, map to
   `ExecutorPromptOutcome::Cancelled`.
-- Clear pending approval requests when the turn is cancelled.
+- Pending approval requests are cleared when the turn is cancelled.
+- Late `session/update` events from a locally cancelled prompt are suppressed
+  until the cancelled prompt's JSON-RPC response clears the barrier.
 
 The preferred path is soft cancel with `session/cancel`. Closing the ACP process
 should be a fallback only when the backend does not acknowledge cancellation or
