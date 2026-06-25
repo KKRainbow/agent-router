@@ -259,6 +259,9 @@ Important constraints:
 - If `turn/interrupt` fails, times out, or returns a JSON-RPC error, the
   adapter closes the app-server as unhealthy recovery before allowing another
   turn to use that backend session.
+- If `interrupt()` sent `turn/interrupt` asynchronously, the prompt loop waits
+  for that request to be acknowledged or fail before releasing the backend
+  session.
 - Direct `interrupt()` cancels the local turn scope, so pending approval
   prompts are removed even before the backend emits `turn/completed`.
 - If Codex sends approval requests before `turn/start` returns a `turnId`,

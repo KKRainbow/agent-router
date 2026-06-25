@@ -937,6 +937,8 @@ Backend Session it touched.
 - If `turn/interrupt` fails, times out, or returns a JSON-RPC error, Codex is
   treated as unhealthy and the app-server process is closed before another turn
   can reuse that backend session.
+- Prompt cancellation waits for any already-sent asynchronous `turn/interrupt`
+  request to be acknowledged or fail before the session lock is released.
 - Direct backend `interrupt()` cancels the local turn scope, which clears
   pending approval prompts while the backend turn is being interrupted.
 - Cancellation still answers pre-`turnId` Codex approval requests with
@@ -961,6 +963,8 @@ Codex coverage now includes:
 - interrupt sends `turn/interrupt` while the prompt holds the session lock;
 - prompt cancellation sends `turn/interrupt` and keeps the app-server reusable;
 - router cancellation plus backend interrupt sends only one `turn/interrupt`;
+- prompt cancellation waits for a direct interrupt ack before releasing the
+  backend session;
 - direct backend interrupt clears pending approval scope;
 - failed `turn/interrupt` closes the app-server as unhealthy recovery;
 - pre-`turnId` interrupt declines early approval requests before sending the
