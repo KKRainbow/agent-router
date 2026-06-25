@@ -72,10 +72,10 @@ distributed:
   `src/router.rs` still contains route-flow code that manually sequences
   currentness checks, interrupt requests, guarded output, context commit,
   success commit, failure commit, and cleanup.
-- `src/channel/slack.rs` still keeps adapter-local generation watermarks to
-  protect Slack context and file-sync caches from stale external data. These
-  should remain adapter-cache ordering only and must not decide router state.
-- `src/channel/qq.rs` still keeps adapter-local reply generations to avoid stale
+- `src/channel/slack.rs` keeps adapter-local context cache sequences to protect
+  Slack context and file-sync caches from stale external data. These are
+  adapter-cache ordering only and do not decide router state.
+- `src/channel/qq.rs` keeps adapter-local reply-context sequences to avoid stale
   reply target updates. This is platform-output bookkeeping, not the router Turn
   identity.
 - `src/session/context.rs` provides transactional context file installation,
@@ -822,7 +822,7 @@ Required tests:
 - final reply belongs to the latest Turn only;
 - route validation failures never create ghost active Turns.
 
-### Phase 3: Replace Channel Raw Generation Interface `[mostly implemented]`
+### Phase 3: Replace Channel Raw Generation Interface `[implemented]`
 
 Already present:
 
@@ -831,15 +831,10 @@ Already present:
 - Slack reserves before slow thread/file context fetch for ordinary messages;
 - QQ reserves before spawning route work for ordinary messages;
 - approval and command paths stay explicit.
-
-Remaining work:
-
-- keep Slack context generations and QQ reply generations clearly scoped to
-  platform-cache ordering;
-- prevent adapter-local generation concepts from leaking back into router
-  state decisions;
-- consider replacing cache generation bookkeeping with opaque reservation or
-  Turn tokens if cache mutation must be tied to router lifecycle.
+- Slack's former context generation naming is now explicit
+  `context_cache_sequence` / `SlackContextCacheToken` platform-cache ordering;
+- QQ's former reply generation naming is now explicit
+  `reply_context_sequence` platform-cache ordering.
 
 Required tests:
 
@@ -847,7 +842,8 @@ Required tests:
 - QQ second message reaches router before old Turn finishes;
 - approval resolution does not interrupt active Turn;
 - ordinary text without pending approval does interrupt active Turn;
-- stale adapter cache updates cannot update router Session state.
+- stale adapter cache updates cannot update router Session state or adapter
+  reply/cache targets.
 
 ### Phase 4: Make Context Commit Turn-Guarded `[mostly implemented]`
 
@@ -993,9 +989,11 @@ Codex coverage now includes:
   - removed generic `TurnGuard::is_current()`, `finish_if_current()`, and raw
     `generation()` calls from router code; router now uses typed TurnGuard
     operations and explicit logging-only generation accessors.
+  - renamed Channel Adapter cache watermarks away from `generation`
+    terminology: Slack uses context cache sequences and QQ uses reply-context
+    sequences, so adapter-local ordering cannot be confused with router Turn
+    generation.
 - Remaining:
-- Remove raw generation checks from Channel Adapters unless they are strictly
-  local platform-cache sequence numbers.
 - Remove duplicated context-cache currentness code that the Turn Guard replaces.
 - Remove any fallback path where cancellation is handled as ordinary backend
   failure.
