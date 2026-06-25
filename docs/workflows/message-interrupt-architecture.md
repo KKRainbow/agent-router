@@ -984,11 +984,14 @@ Codex coverage now includes:
 
 ### Phase 8: Delete Old Scattered State Rules `[pending]`
 
+- Implemented:
+  - removed `created_session` cancellation cleanup from Executor adapters; ACP,
+    Codex app-server, and Claude stream-json no longer close an already
+    published Backend Session from cancelled prepare cleanup.
+- Remaining:
 - Remove raw generation checks from Channel Adapters unless they are strictly
   local platform-cache sequence numbers.
 - Remove duplicated context-cache currentness code that the Turn Guard replaces.
-- Remove `created_session` cancellation cleanup from Executor adapters unless
-  it only refers to unpublished resources.
 - Remove router helper methods that expose active generation directly.
 - Remove any fallback path where cancellation is handled as ordinary backend
   failure.
