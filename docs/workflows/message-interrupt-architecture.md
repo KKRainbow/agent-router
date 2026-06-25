@@ -1029,17 +1029,21 @@ Codex coverage now includes:
     abandonment rather than ordinary backend failure. Process close remains
     isolated to unhealthy recovery paths.
 
-### Phase 9: Final Verification `[in progress]`
+### Phase 9: Final Verification `[implemented]`
 
-- Run formatting and all local tests.
-- Add race-focused tests before fixing each newly discovered race.
-- After every code-change commit, run the required subagent review.
-- Final review must inspect:
-  - behavioral regressions;
-  - concurrency and race risks;
-  - cache invalidation and state consistency;
-  - permission and approval implications;
-  - unintended broad coupling or over-complexity.
+- Completed local verification:
+  - `rtk cargo fmt --check`;
+  - `rtk cargo test acp_cancel_barrier_timeout_rechecks_cleared_barrier_before_recovery -- --nocapture`;
+  - `rtk cargo test acp -- --nocapture`;
+  - `rtk cargo test`;
+  - `rtk cargo clippy --all-targets -- -D warnings`;
+  - `rtk git diff --check`.
+- Race-focused tests now cover the discovered publication, removal, and cancel
+  barrier boundary cases before each corresponding fix.
+- Code reviews inspected behavioral regressions, concurrency and race risks,
+  state consistency, permission/approval implications, and coupling. The final
+  ACP timeout-boundary finding was fixed by re-checking barrier state before
+  timeout recovery.
 
 ## Acceptance Criteria
 
