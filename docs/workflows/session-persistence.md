@@ -189,12 +189,14 @@ Each session can have workspace records for one or more machines.
 Required fields should match `MachineWorkspaceRecord`, including:
 
 ```text
-session_key
 machine_id
-workspace_path
-materialized_at_ms
-metadata
+cwd
+materialization
+artifact_fingerprint
 ```
+
+`session_key` belongs to the enclosing `SessionState`; machine workspace records
+are keyed by Machine id inside `SessionState.machine_workspaces`.
 
 Rules:
 
