@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, Notify, broadcast, oneshot},
 };
 
 use crate::{
@@ -35,7 +35,7 @@ type SharedStdin = Arc<Mutex<ChildStdin>>;
 type SessionKey = (String, String);
 type SharedAcpSession = Arc<Mutex<AcpSession>>;
 type SessionMap = HashMap<SessionKey, SharedAcpSession>;
-type SharedAcpUpdateSuppression = Arc<Mutex<Option<u64>>>;
+type SharedAcpCancelBarrier = Arc<AcpCancelBarrier>;
 type SharedActiveAcpPrompts = Arc<Mutex<HashMap<SessionKey, ActiveAcpPrompt>>>;
 
 #[derive(Debug, Default)]
@@ -46,10 +46,45 @@ struct AcpToolCallState {
     activity_emitted: bool,
 }
 
+#[derive(Debug, Default)]
+struct AcpCancelBarrier {
+    pending_response_id: Mutex<Option<u64>>,
+    changed: Notify,
+}
+
+impl AcpCancelBarrier {
+    async fn begin(&self, request_id: u64) {
+        *self.pending_response_id.lock().await = Some(request_id);
+    }
+
+    async fn active_request_id(&self) -> Option<u64> {
+        *self.pending_response_id.lock().await
+    }
+
+    async fn clear_if_response(&self, response_id: u64) {
+        let mut pending = self.pending_response_id.lock().await;
+        if *pending == Some(response_id) {
+            *pending = None;
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.pending_response_id.lock().await.is_none() {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveAcpPrompt {
     session_id: String,
     request_id: u64,
+    generation: u64,
     client: JsonRpcClientHandle,
 }
 
@@ -59,6 +94,13 @@ impl ActiveAcpPrompt {
             .notify("session/cancel", json!({ "sessionId": self.session_id }))
             .await
     }
+}
+
+#[derive(Debug, Clone)]
+struct AcpPromptTurnRegistration {
+    active_prompts: SharedActiveAcpPrompts,
+    key: SessionKey,
+    generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -274,14 +316,18 @@ impl ExecutorBackend for AcpExecutorManager {
             prompt_len,
             "starting ACP executor turn"
         );
+        let active_prompt_turn = AcpPromptTurnRegistration {
+            active_prompts: self.active_prompts.clone(),
+            key: active_key,
+            generation,
+        };
         let result = session
             .prompt(
                 &request.prompt,
                 request.user_id,
                 events,
                 cancel,
-                self.active_prompts.clone(),
-                active_key,
+                active_prompt_turn,
             )
             .await;
         match &result {
@@ -316,6 +362,19 @@ impl ExecutorBackend for AcpExecutorManager {
         );
         let active_prompt = self.active_prompts.lock().await.get(&key).cloned();
         if let Some(active_prompt) = active_prompt {
+            if active_prompt.generation != request.turn.generation {
+                tracing::debug!(
+                    target: "agent_router::acp",
+                    executor = %request.turn.executor,
+                    session_key = %request.turn.session_key,
+                    interrupted_generation = request.turn.generation,
+                    active_generation = active_prompt.generation,
+                    active_request_id = active_prompt.request_id,
+                    reason = ?request.reason,
+                    "ignoring stale ACP interrupt for newer active prompt"
+                );
+                return Ok(());
+            }
             tracing::debug!(
                 target: "agent_router::acp",
                 executor = %request.turn.executor,
@@ -327,18 +386,6 @@ impl ExecutorBackend for AcpExecutorManager {
             );
             active_prompt.notify_cancel().await?;
             return Ok(());
-        }
-        let session = self.sessions.lock().await.get(&key).cloned();
-        let Some(session) = session else {
-            return Ok(());
-        };
-        if let Ok(session) = session.try_lock()
-            && let Some(session_id) = session.session_id.as_deref()
-        {
-            session
-                .client
-                .notify("session/cancel", json!({ "sessionId": session_id }))
-                .await?;
         }
         Ok(())
     }
@@ -507,13 +554,12 @@ impl AcpSession {
         user_id: Option<String>,
         events: &mut dyn ExecutorEventSink,
         cancel: TurnCancellation,
-        active_prompts: SharedActiveAcpPrompts,
-        active_key: SessionKey,
+        active_prompt_turn: AcpPromptTurnRegistration,
     ) -> ExecutorPromptOutcome {
         self.client.set_active_user(user_id).await;
         self.client.set_active_turn_cancel(cancel.clone()).await;
         let result = self
-            .prompt_with_active_user(prompt, events, cancel, active_prompts, active_key)
+            .prompt_with_active_user(prompt, events, cancel, active_prompt_turn)
             .await;
         self.client.clear_active_turn_cancel().await;
         self.client.clear_active_user().await;
@@ -525,8 +571,7 @@ impl AcpSession {
         prompt: &str,
         events: &mut dyn ExecutorEventSink,
         cancel: TurnCancellation,
-        active_prompts: SharedActiveAcpPrompts,
-        active_key: SessionKey,
+        active_prompt_turn: AcpPromptTurnRegistration,
     ) -> ExecutorPromptOutcome {
         let session_id = match self.session_id.clone() {
             Some(session_id) => session_id,
@@ -539,10 +584,23 @@ impl AcpSession {
         if cancel.is_cancelled().await {
             return ExecutorPromptOutcome::Cancelled;
         }
+        tokio::select! {
+            _ = self.client.wait_for_cancel_barrier() => {}
+            _ = cancel.cancelled() => return ExecutorPromptOutcome::Cancelled,
+        }
+        if cancel.is_cancelled().await {
+            return ExecutorPromptOutcome::Cancelled;
+        }
         let mut updates_rx = self.client.subscribe();
         let request = match self
             .client
-            .prompt_request_started(&session_id, prompt, &active_prompts, active_key.clone())
+            .prompt_request_started(
+                &session_id,
+                prompt,
+                &active_prompt_turn.active_prompts,
+                active_prompt_turn.key.clone(),
+                active_prompt_turn.generation,
+            )
             .await
         {
             Ok(request) => request,
@@ -561,8 +619,12 @@ impl AcpSession {
                             let outcome = self
                                 .failed_prompt_or_cancelled(&cancel, &session_id, request.id, err)
                                 .await;
-                            clear_active_acp_prompt(&active_prompts, &active_key, request.id)
-                                .await;
+                            clear_active_acp_prompt(
+                                &active_prompt_turn.active_prompts,
+                                &active_prompt_turn.key,
+                                request.id,
+                            )
+                            .await;
                             return outcome;
                         }
                         Err(_) => {
@@ -574,8 +636,12 @@ impl AcpSession {
                                     anyhow::anyhow!("ACP response channel closed"),
                                 )
                                 .await;
-                            clear_active_acp_prompt(&active_prompts, &active_key, request.id)
-                                .await;
+                            clear_active_acp_prompt(
+                                &active_prompt_turn.active_prompts,
+                                &active_prompt_turn.key,
+                                request.id,
+                            )
+                            .await;
                             return outcome;
                         }
                     };
@@ -592,15 +658,24 @@ impl AcpSession {
                                 ),
                             )
                             .await;
-                        clear_active_acp_prompt(&active_prompts, &active_key, request.id)
-                            .await;
+                        clear_active_acp_prompt(
+                            &active_prompt_turn.active_prompts,
+                            &active_prompt_turn.key,
+                            request.id,
+                        )
+                        .await;
                         return outcome;
                     }
                     break response.get("result").cloned().unwrap_or(Value::Null);
                 }
                 _ = cancel.cancelled() => {
                     self.cancel_prompt_session(&session_id, request.id).await;
-                    clear_active_acp_prompt(&active_prompts, &active_key, request.id).await;
+                    clear_active_acp_prompt(
+                        &active_prompt_turn.active_prompts,
+                        &active_prompt_turn.key,
+                        request.id,
+                    )
+                    .await;
                     return ExecutorPromptOutcome::Cancelled;
                 }
                 received = updates_rx.recv() => {
@@ -616,8 +691,8 @@ impl AcpSession {
                                     )
                                     .await;
                                 clear_active_acp_prompt(
-                                    &active_prompts,
-                                    &active_key,
+                                    &active_prompt_turn.active_prompts,
+                                    &active_prompt_turn.key,
                                     request.id,
                                 )
                                 .await;
@@ -631,8 +706,12 @@ impl AcpSession {
             }
         };
         if cancel.is_cancelled().await {
-            self.cancel_prompt_session(&session_id, request.id).await;
-            clear_active_acp_prompt(&active_prompts, &active_key, request.id).await;
+            clear_active_acp_prompt(
+                &active_prompt_turn.active_prompts,
+                &active_prompt_turn.key,
+                request.id,
+            )
+            .await;
             return ExecutorPromptOutcome::Cancelled;
         }
         while let Ok(update) = updates_rx.try_recv() {
@@ -640,12 +719,22 @@ impl AcpSession {
                 let outcome = self
                     .failed_prompt_or_cancelled(&cancel, &session_id, request.id, err)
                     .await;
-                clear_active_acp_prompt(&active_prompts, &active_key, request.id).await;
+                clear_active_acp_prompt(
+                    &active_prompt_turn.active_prompts,
+                    &active_prompt_turn.key,
+                    request.id,
+                )
+                .await;
                 return outcome;
             }
         }
         if acp_result_cancelled(&result) {
-            clear_active_acp_prompt(&active_prompts, &active_key, request.id).await;
+            clear_active_acp_prompt(
+                &active_prompt_turn.active_prompts,
+                &active_prompt_turn.key,
+                request.id,
+            )
+            .await;
             return ExecutorPromptOutcome::Cancelled;
         }
         let final_text = if text_parts.is_empty() {
@@ -653,7 +742,12 @@ impl AcpSession {
         } else {
             text_parts.join("")
         };
-        clear_active_acp_prompt(&active_prompts, &active_key, request.id).await;
+        clear_active_acp_prompt(
+            &active_prompt_turn.active_prompts,
+            &active_prompt_turn.key,
+            request.id,
+        )
+        .await;
         ExecutorPromptOutcome::Completed(ExecutorResponse { final_text })
     }
 
@@ -673,9 +767,7 @@ impl AcpSession {
     }
 
     async fn cancel_prompt_session(&mut self, session_id: &str, request_id: u64) {
-        self.client
-            .suppress_updates_until_response(request_id)
-            .await;
+        self.client.begin_cancel_barrier(request_id).await;
         let notify_result = self
             .client
             .notify("session/cancel", json!({ "sessionId": session_id }))
@@ -708,7 +800,7 @@ struct JsonRpcClient {
     state: SharedJsonRpcState,
     next_id: AtomicU64,
     updates: broadcast::Sender<ExecutorUpdate>,
-    update_suppression: SharedAcpUpdateSuppression,
+    cancel_barrier: SharedAcpCancelBarrier,
     child: Arc<Mutex<Child>>,
     active_user_id: Arc<Mutex<Option<String>>>,
     active_turn_cancel: Arc<Mutex<Option<TurnCancellation>>>,
@@ -733,7 +825,7 @@ struct JsonRpcServerContext {
     tool_calls: SharedAcpToolCalls,
     stdin: SharedStdin,
     updates: broadcast::Sender<ExecutorUpdate>,
-    update_suppression: SharedAcpUpdateSuppression,
+    cancel_barrier: SharedAcpCancelBarrier,
     approvals: SharedApprovalBroker,
     session_key: String,
     executor: String,
@@ -795,7 +887,7 @@ impl JsonRpcClient {
         let state = Arc::new(Mutex::new(JsonRpcState::default()));
         let tool_calls = Arc::new(Mutex::new(HashMap::new()));
         let (updates, _) = broadcast::channel(256);
-        let update_suppression = Arc::new(Mutex::new(None));
+        let cancel_barrier = Arc::new(AcpCancelBarrier::default());
         let child = Arc::new(Mutex::new(child));
         let active_user_id = Arc::new(Mutex::new(None));
         let active_turn_cancel = Arc::new(Mutex::new(None));
@@ -804,7 +896,7 @@ impl JsonRpcClient {
             tool_calls,
             stdin: stdin.clone(),
             updates: updates.clone(),
-            update_suppression: update_suppression.clone(),
+            cancel_barrier: cancel_barrier.clone(),
             approvals,
             session_key,
             executor,
@@ -827,7 +919,7 @@ impl JsonRpcClient {
             state,
             next_id: AtomicU64::new(1),
             updates,
-            update_suppression,
+            cancel_barrier,
             child,
             active_user_id,
             active_turn_cancel,
@@ -860,8 +952,12 @@ impl JsonRpcClient {
         self.updates.subscribe()
     }
 
-    async fn suppress_updates_until_response(&self, id: u64) {
-        *self.update_suppression.lock().await = Some(id);
+    async fn begin_cancel_barrier(&self, id: u64) {
+        self.cancel_barrier.begin(id).await;
+    }
+
+    async fn wait_for_cancel_barrier(&self) {
+        self.cancel_barrier.wait().await;
     }
 
     fn is_alive(&self) -> bool {
@@ -923,6 +1019,7 @@ impl JsonRpcClient {
         prompt: &str,
         active_prompts: &SharedActiveAcpPrompts,
         active_key: SessionKey,
+        generation: u64,
     ) -> anyhow::Result<PendingJsonRpcRequest> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -937,6 +1034,7 @@ impl JsonRpcClient {
             ActiveAcpPrompt {
                 session_id: session_id.to_string(),
                 request_id: id,
+                generation,
                 client: self.handle(),
             },
         )
@@ -1061,7 +1159,7 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     if message.get("method").is_none() {
         let response_id = message.get("id").and_then(Value::as_u64);
         if let Some(id) = response_id {
-            clear_update_suppression_for_response(context, id).await;
+            clear_cancel_barrier_for_response(context, id).await;
         }
         let sender = match message.get("id").and_then(Value::as_u64) {
             Some(id) => context.state.lock().await.pending.remove(&id),
@@ -1074,12 +1172,16 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     }
 
     if message.get("id").is_some() {
+        if let Some(request_id) = context.cancel_barrier.active_request_id().await {
+            respond_to_cancel_barrier_server_request(context, &message, request_id).await;
+            return;
+        }
         respond_to_server_request(context, &message).await;
         return;
     }
 
     if message.get("method").and_then(Value::as_str) == Some("session/update") {
-        if let Some(request_id) = *context.update_suppression.lock().await {
+        if let Some(request_id) = context.cancel_barrier.active_request_id().await {
             tracing::debug!(
                 target: "agent_router::acp",
                 executor = %context.executor,
@@ -1099,18 +1201,52 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
     }
 }
 
-async fn clear_update_suppression_for_response(context: &JsonRpcServerContext, response_id: u64) {
-    let mut suppressed = context.update_suppression.lock().await;
-    if *suppressed == Some(response_id) {
-        *suppressed = None;
+async fn clear_cancel_barrier_for_response(context: &JsonRpcServerContext, response_id: u64) {
+    let was_active = context.cancel_barrier.active_request_id().await == Some(response_id);
+    context.cancel_barrier.clear_if_response(response_id).await;
+    if was_active {
         tracing::debug!(
             target: "agent_router::acp",
             executor = %context.executor,
             session_key = %context.session_key,
             response_id,
-            "cleared ACP cancelled prompt update suppression"
+            "cleared ACP cancelled prompt barrier"
         );
     }
+}
+
+async fn respond_to_cancel_barrier_server_request(
+    context: &JsonRpcServerContext,
+    message: &Value,
+    request_id: u64,
+) {
+    let id = message.get("id").cloned().unwrap_or(Value::Null);
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    tracing::debug!(
+        target: "agent_router::acp",
+        executor = %context.executor,
+        session_key = %context.session_key,
+        suppressed_until_response_id = request_id,
+        method,
+        "responding to ACP server request from cancelled prompt barrier"
+    );
+    let payload = if method == "session/request_permission" {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": permission_result(ApprovalSelection::Cancelled),
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("agent-router ignored `{method}` from a cancelled ACP prompt")
+            }
+        })
+    };
+    let _ = write_json(&context.stdin, payload).await;
 }
 
 async fn respond_to_server_request(context: &JsonRpcServerContext, message: &Value) {
@@ -1838,6 +1974,7 @@ mod tests {
             r#"
 import json
 import sys
+import time
 
 def send(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
@@ -1997,6 +2134,7 @@ import json
 import sys
 
 cancelled = False
+prompt_id = None
 
 def send(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
@@ -2015,6 +2153,7 @@ for line in sys.stdin:
     elif method == "session/prompt":
         prompt = "".join(item.get("text", "") for item in msg.get("params", {{}}).get("prompt", []))
         if not cancelled:
+            prompt_id = request_id
             with open({prompt_marker_literal}, "w") as f:
                 f.write("started")
                 f.flush()
@@ -2025,6 +2164,8 @@ for line in sys.stdin:
         with open({cancel_marker_literal}, "w") as f:
             f.write("cancelled")
             f.flush()
+        if prompt_id is not None:
+            send({{"jsonrpc": "2.0", "id": prompt_id, "result": {{"stopReason": "cancelled"}}}})
 "#
             ),
         )
@@ -2122,16 +2263,25 @@ for line in sys.stdin:
         let script = tmp.path().join("late_update_acp.py");
         let prompt_marker = tmp.path().join("first_prompt_started");
         let cancel_marker = tmp.path().join("cancel_received");
+        let old_response_marker = tmp.path().join("old_response_sent");
+        let second_prompt_marker = tmp.path().join("second_prompt_started");
         let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
             .expect("prompt marker path serializes");
         let cancel_marker_literal = serde_json::to_string(&cancel_marker.display().to_string())
             .expect("cancel marker path serializes");
+        let old_response_marker_literal =
+            serde_json::to_string(&old_response_marker.display().to_string())
+                .expect("old response marker path serializes");
+        let second_prompt_marker_literal =
+            serde_json::to_string(&second_prompt_marker.display().to_string())
+                .expect("second prompt marker path serializes");
         fs::write(
             &script,
             format!(
                 r#"
 import json
 import sys
+import time
 
 first_prompt_id = None
 
@@ -2160,13 +2310,9 @@ for line in sys.stdin:
                 f.write("started")
                 f.flush()
         else:
-            send({{
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"text": "old late"}}}}}},
-            }})
-            if first_prompt_id is not None:
-                send({{"jsonrpc": "2.0", "id": first_prompt_id, "result": {{"stopReason": "cancelled"}}}})
+            with open({second_prompt_marker_literal}, "w") as f:
+                f.write("started")
+                f.flush()
             send({{
                 "jsonrpc": "2.0",
                 "method": "session/update",
@@ -2177,6 +2323,17 @@ for line in sys.stdin:
         with open({cancel_marker_literal}, "w") as f:
             f.write("cancelled")
             f.flush()
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"text": "old late"}}}}}},
+        }})
+        time.sleep(0.1)
+        if first_prompt_id is not None:
+            send({{"jsonrpc": "2.0", "id": first_prompt_id, "result": {{"stopReason": "cancelled"}}}})
+            with open({old_response_marker_literal}, "w") as f:
+                f.write("sent")
+                f.flush()
 "#
             ),
         )
@@ -2245,10 +2402,18 @@ for line in sys.stdin:
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(cancel_marker.exists());
+        for _ in 0..50 {
+            if old_response_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(old_response_marker.exists());
 
         let mut events = CollectingExecutorEventSink::default();
-        let response = manager
-            .prompt(
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.prompt(
                 ExecutorPromptRequest {
                     turn: turn_ref("session-1", "kimi", 2),
                     prompt: "second".to_string(),
@@ -2256,10 +2421,13 @@ for line in sys.stdin:
                 },
                 &mut events,
                 TurnCancellation::new(),
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
+        assert!(second_prompt_marker.exists());
         assert_eq!(response.final_text, "new reply");
         assert!(
             events
@@ -2267,6 +2435,204 @@ for line in sys.stdin:
                 .iter()
                 .all(|update| update.text != "old late")
         );
+    }
+
+    #[tokio::test]
+    async fn acp_late_permission_request_after_cancel_does_not_create_pending_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("late_permission_acp.py");
+        let prompt_marker = tmp.path().join("first_prompt_started");
+        let cancel_marker = tmp.path().join("cancel_received");
+        let permission_gate = tmp.path().join("send_late_permission");
+        let permission_cancelled_marker = tmp.path().join("permission_cancelled");
+        let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
+            .expect("prompt marker path serializes");
+        let cancel_marker_literal = serde_json::to_string(&cancel_marker.display().to_string())
+            .expect("cancel marker path serializes");
+        let permission_gate_literal = serde_json::to_string(&permission_gate.display().to_string())
+            .expect("permission gate path serializes");
+        let permission_cancelled_marker_literal =
+            serde_json::to_string(&permission_cancelled_marker.display().to_string())
+                .expect("permission marker path serializes");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json
+import os
+import sys
+import time
+
+prompt_id = None
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def prompt_text(msg):
+    return "".join(item.get("text", "") for item in msg.get("params", {{}}).get("prompt", []))
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+    elif method == "session/new":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"sessionId": "fake-session"}}}})
+    elif method == "session/prompt":
+        prompt = prompt_text(msg)
+        if prompt == "first":
+            prompt_id = request_id
+            with open({prompt_marker_literal}, "w") as f:
+                f.write("started")
+                f.flush()
+        else:
+            send({{
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"text": "new reply"}}}}}},
+            }})
+            send({{"jsonrpc": "2.0", "id": request_id, "result": {{"stopReason": "end_turn"}}}})
+    elif method == "session/cancel":
+        with open({cancel_marker_literal}, "w") as f:
+            f.write("cancelled")
+            f.flush()
+        while not os.path.exists({permission_gate_literal}):
+            time.sleep(0.01)
+        send({{
+            "jsonrpc": "2.0",
+            "id": 900,
+            "method": "session/request_permission",
+            "params": {{
+                "sessionId": "fake-session",
+                "toolCall": {{
+                    "title": "Run shell command",
+                    "content": [{{"type": "text", "text": "$ cargo test"}}]
+                }},
+                "options": [
+                    {{"optionId": "allow_once", "kind": "allow_once", "name": "Allow once"}},
+                    {{"optionId": "deny", "kind": "reject_once", "name": "Deny"}}
+                ]
+            }}
+        }})
+    elif request_id == 900:
+        outcome = msg.get("result", {{}}).get("outcome", {{}}).get("outcome")
+        if outcome == "cancelled":
+            with open({permission_cancelled_marker_literal}, "w") as f:
+                f.write("cancelled")
+                f.flush()
+        if prompt_id is not None:
+            send({{"jsonrpc": "2.0", "id": prompt_id, "result": {{"stopReason": "cancelled"}}}})
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(AcpExecutorManager::with_approvals(
+            executors,
+            approvals.clone(),
+        ));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "kimi", 1),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let cancel = TurnCancellation::new();
+        let prompt_manager = manager.clone();
+        let prompt_cancel = cancel.clone();
+        let first_prompt = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "kimi", 1),
+                        prompt: "first".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                    prompt_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if prompt_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(prompt_marker.exists());
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        let first_outcome = tokio::time::timeout(Duration::from_secs(2), first_prompt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first_outcome, ExecutorPromptOutcome::Cancelled));
+        for _ in 0..50 {
+            if cancel_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(cancel_marker.exists());
+
+        fs::write(&permission_gate, "go").unwrap();
+        for _ in 0..100 {
+            if permission_cancelled_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(permission_cancelled_marker.exists());
+        assert!(!approvals.has_pending_for_session("session-1").await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), prompts.recv())
+                .await
+                .is_err()
+        );
+
+        let mut events = CollectingExecutorEventSink::default();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.prompt(
+                ExecutorPromptRequest {
+                    turn: turn_ref("session-1", "kimi", 2),
+                    prompt: "second".to_string(),
+                    user_id: None,
+                },
+                &mut events,
+                TurnCancellation::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.final_text, "new reply");
     }
 
     #[tokio::test]
@@ -2374,6 +2740,130 @@ for line in sys.stdin:
             .await
             .unwrap();
 
+        for _ in 0..50 {
+            if cancel_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(cancel_marker.exists());
+        let outcome = tokio::time::timeout(Duration::from_secs(2), prompt_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, ExecutorPromptOutcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn acp_stale_generation_interrupt_does_not_cancel_newer_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("stale_interrupt_acp.py");
+        let prompt_marker = tmp.path().join("prompt_started");
+        let cancel_marker = tmp.path().join("cancel_received");
+        let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
+            .expect("prompt marker path serializes");
+        let cancel_marker_literal = serde_json::to_string(&cancel_marker.display().to_string())
+            .expect("cancel marker path serializes");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json
+import sys
+
+prompt_id = None
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+    elif method == "session/new":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"sessionId": "fake-session"}}}})
+    elif method == "session/prompt":
+        prompt_id = request_id
+        with open({prompt_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+    elif method == "session/cancel":
+        with open({cancel_marker_literal}, "w") as f:
+            f.write("cancelled")
+            f.flush()
+        if prompt_id is not None:
+            send({{"jsonrpc": "2.0", "id": prompt_id, "result": {{"stopReason": "cancelled"}}}})
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let manager = Arc::new(AcpExecutorManager::new(executors));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "kimi", 2),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let cancel = TurnCancellation::new();
+        let prompt_manager = manager.clone();
+        let prompt_cancel = cancel.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "kimi", 2),
+                        prompt: "newer".to_string(),
+                        user_id: None,
+                    },
+                    &mut events,
+                    prompt_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if prompt_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(prompt_marker.exists());
+        manager
+            .interrupt(ExecutorInterruptRequest {
+                turn: turn_ref("session-1", "kimi", 1),
+                reason: InterruptReason::ReplacedByNewMessage,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!cancel_marker.exists());
+
+        assert!(cancel.cancel(InterruptReason::UserStop).await);
         for _ in 0..50 {
             if cancel_marker.exists() {
                 break;

@@ -35,10 +35,10 @@ Current work has moved several of these items forward:
 - ACP now uses soft `session/cancel` for prompt cancellation and `/stop` or
   replacement interrupt, without closing a healthy ACP process.
 - ACP active prompt metadata is visible to `interrupt()` without waiting for the
-  long prompt lock.
-- ACP suppresses late `session/update` events from a cancelled prompt until that
-  prompt's JSON-RPC response is observed, so replacement turns do not collect
-  stale output.
+  long prompt lock, and stale generation interrupts are ignored.
+- ACP holds replacement prompts behind a cancel barrier until the cancelled
+  prompt's JSON-RPC response is observed, so stale output and late permission
+  requests cannot be projected into the replacement turn.
 - Codex app-server still needs its equivalent protocol-level cancel path.
 
 ## Target Semantics
@@ -211,15 +211,17 @@ Implementation requirements:
 
 - `JsonRpcClient::notify(method, params)` sends ACP notifications.
 - The manager records the active prompt's external `sessionId`, JSON-RPC
-  request id, and notify handle outside the long prompt lock.
+  request id, generation, and notify handle outside the long prompt lock.
 - `AcpExecutorManager::interrupt()` sends `session/cancel` through that active
-  prompt handle when one exists.
+  prompt handle only when the interrupted generation matches the active prompt.
 - `AcpSession::prompt()` selects on the turn cancellation handle.
 - ACP cancelled results, such as `stopReason = "cancelled"`, map to
   `ExecutorPromptOutcome::Cancelled`.
 - Pending approval requests are cleared when the turn is cancelled.
-- Late `session/update` events from a locally cancelled prompt are suppressed
-  until the cancelled prompt's JSON-RPC response clears the barrier.
+- After local cancellation, the next prompt waits for the cancelled prompt's
+  JSON-RPC response. While that barrier is active, late `session/update` events
+  are dropped and late `session/request_permission` requests receive a cancelled
+  result without creating approval prompts.
 
 The preferred path is soft cancel with `session/cancel`. Closing the ACP process
 should be a fallback only when the backend does not acknowledge cancellation or

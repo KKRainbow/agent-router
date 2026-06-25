@@ -43,9 +43,9 @@ The repository already has part of this architecture:
   `ExecutorTurnRef` so backend adapters receive one Turn identity across the
   per-Turn lifecycle.
 - ACP prompt cancellation now uses soft `session/cancel`, keeps the Backend
-  Session process alive, exposes an interrupt-readable active prompt handle, and
-  suppresses late updates from a cancelled prompt until that prompt's JSON-RPC
-  response is observed.
+  Session process alive, exposes a generation-checked interrupt-readable active
+  prompt handle, and holds the next prompt behind a cancel barrier until the
+  cancelled prompt's JSON-RPC response is observed.
 
 The remaining architectural work is still substantial:
 
@@ -906,14 +906,16 @@ Backend Session it touched.
 - Implemented:
   - soft `session/cancel` for local prompt cancellation without closing the ACP
     process;
-  - interrupt-readable active prompt metadata outside the long session lock;
-  - update suppression while a cancelled prompt's JSON-RPC response is still
-    pending, preventing late cancelled-turn `session/update` events from being
-    collected by the replacement prompt;
+  - generation-checked interrupt-readable active prompt metadata outside the
+    long session lock;
+  - a cancel barrier while a cancelled prompt's JSON-RPC response is still
+    pending, preventing late cancelled-turn `session/update` and permission
+    requests from being projected into the replacement prompt;
   - cancelled ACP stop reason maps to `ExecutorPromptOutcome::Cancelled`;
   - pending approvals are removed when their owning prompt is cancelled;
-  - tests for active-prompt interrupt, late-update isolation, soft cancel
-    session reuse, cancelled stop reason, and approval cleanup.
+  - tests for active-prompt interrupt, stale interrupt isolation, late-update
+    and late-permission isolation, soft cancel session reuse, cancelled stop
+    reason, and approval cleanup.
 - Remaining:
   - introduce a named ACP Backend Session Manager instead of keeping the
     manager behavior directly in `AcpExecutorManager`;
