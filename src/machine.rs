@@ -986,6 +986,21 @@ fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn test_local_machine(
+        id: &str,
+        workspace_root: Option<&Path>,
+        skill_roots: Vec<String>,
+    ) -> MachineConfig {
+        MachineConfig {
+            id: id.to_string(),
+            kind: MachineKind::Local,
+            host: None,
+            workspace_root: workspace_root.map(|root| root.display().to_string()),
+            env: BTreeMap::new(),
+            skill_roots,
+        }
+    }
+
     #[test]
     fn remote_exec_uses_no_tty_ssh_and_executor_visible_cwd() {
         let env = BTreeMap::from([
@@ -1052,12 +1067,8 @@ mod tests {
         let registry = MachineRegistry::new(BTreeMap::from([(
             "local".to_string(),
             MachineConfig {
-                id: "local".to_string(),
-                kind: MachineKind::Local,
-                host: None,
-                workspace_root: Some(machine_root.display().to_string()),
                 env: BTreeMap::from([("A".to_string(), "machine".to_string())]),
-                skill_roots: Vec::new(),
+                ..test_local_machine("local", Some(&machine_root), Vec::new())
             },
         )]));
         let executor_env = BTreeMap::from([("A".to_string(), "executor".to_string())]);
@@ -1091,6 +1102,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_workspace_names_are_stable_per_session_and_machine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("machine-a");
+        let root_b = tmp.path().join("machine-b");
+        let registry = MachineRegistry::new(BTreeMap::from([
+            (
+                "machine-a".to_string(),
+                test_local_machine("machine-a", Some(&root_a), Vec::new()),
+            ),
+            (
+                "machine-b".to_string(),
+                test_local_machine("machine-b", Some(&root_b), Vec::new()),
+            ),
+        ]));
+        let env = BTreeMap::new();
+        let args = Vec::new();
+
+        let first_a = registry
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: "machine-a",
+                session_key: "slack:channel:C1:111.000",
+                router_workspace: None,
+                executor_cwd: None,
+                command: "agent",
+                args: &args,
+                env: &env,
+                cancel: None,
+            })
+            .await
+            .unwrap()
+            .workspace
+            .unwrap();
+        let second_a = registry
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: "machine-a",
+                session_key: "slack:channel:C1:111.000",
+                router_workspace: None,
+                executor_cwd: None,
+                command: "agent",
+                args: &args,
+                env: &env,
+                cancel: None,
+            })
+            .await
+            .unwrap()
+            .workspace
+            .unwrap();
+        let first_b = registry
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: "machine-b",
+                session_key: "slack:channel:C1:111.000",
+                router_workspace: None,
+                executor_cwd: None,
+                command: "agent",
+                args: &args,
+                env: &env,
+                cancel: None,
+            })
+            .await
+            .unwrap()
+            .workspace
+            .unwrap();
+
+        assert_eq!(first_a.cwd, second_a.cwd);
+        assert_ne!(first_a.cwd, first_b.cwd);
+        assert_eq!(first_a.machine_id, "machine-a");
+        assert_eq!(first_b.machine_id, "machine-b");
+        assert!(Path::new(&first_a.cwd).starts_with(root_a.canonicalize().unwrap()));
+        assert!(Path::new(&first_b.cwd).starts_with(root_b.canonicalize().unwrap()));
+    }
+
+    #[tokio::test]
     async fn local_skill_identity_includes_machine_id_and_relative_path() {
         let tmp = tempfile::tempdir().unwrap();
         let skill = tmp.path().join("writer");
@@ -1102,14 +1185,7 @@ mod tests {
         .unwrap();
         let registry = MachineRegistry::new(BTreeMap::from([(
             "local".to_string(),
-            MachineConfig {
-                id: "local".to_string(),
-                kind: MachineKind::Local,
-                host: None,
-                workspace_root: None,
-                env: BTreeMap::new(),
-                skill_roots: vec![tmp.path().display().to_string()],
-            },
+            test_local_machine("local", None, vec![tmp.path().display().to_string()]),
         )]));
 
         let skills = registry.collect_skills().await;
@@ -1124,6 +1200,47 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("# Writer")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_identity_disambiguates_same_relative_path_across_machines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("root-a");
+        let root_b = tmp.path().join("root-b");
+        for root in [&root_a, &root_b] {
+            let skill = root.join("writer");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                "---\nname: writer\ndescription: Writes text\n---\n# Writer\n",
+            )
+            .unwrap();
+        }
+        let registry = MachineRegistry::new(BTreeMap::from([
+            (
+                "machine-a".to_string(),
+                test_local_machine("machine-a", None, vec![root_a.display().to_string()]),
+            ),
+            (
+                "machine-b".to_string(),
+                test_local_machine("machine-b", None, vec![root_b.display().to_string()]),
+            ),
+        ]));
+
+        let identities = registry
+            .collect_skills()
+            .await
+            .into_iter()
+            .map(|skill| (skill.machine_id, skill.relative_path))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            identities,
+            [
+                ("machine-a".to_string(), "writer".to_string()),
+                ("machine-b".to_string(), "writer".to_string()),
+            ]
         );
     }
 }
