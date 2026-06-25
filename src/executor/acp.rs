@@ -1329,7 +1329,11 @@ fn ensure_stdout_open(state: &JsonRpcState) -> anyhow::Result<()> {
 }
 
 fn is_json_rpc_like(message: &Value) -> bool {
-    message.get("method").is_some() || message.get("id").is_some()
+    let Some(map) = message.as_object() else {
+        return false;
+    };
+    map.get("method").and_then(Value::as_str).is_some()
+        || (map.contains_key("id") && (map.contains_key("result") || map.contains_key("error")))
 }
 
 async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
@@ -2226,6 +2230,18 @@ mod tests {
         .unwrap();
         assert_eq!(thought.kind, "agent_thought_chunk");
         assert!(thought.channel_event.is_none());
+    }
+
+    #[test]
+    fn strict_stdout_accepts_only_json_rpc_shapes() {
+        assert!(is_json_rpc_like(&json!({"id": 1, "result": {}})));
+        assert!(is_json_rpc_like(&json!({"id": 1, "error": {"code": -1}})));
+        assert!(is_json_rpc_like(
+            &json!({"method": "session/update", "params": {}})
+        ));
+        assert!(!is_json_rpc_like(&json!({"id": 1, "message": "startup"})));
+        assert!(!is_json_rpc_like(&json!({"hello": "world"})));
+        assert!(!is_json_rpc_like(&json!("banner")));
     }
 
     #[tokio::test]

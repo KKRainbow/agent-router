@@ -104,6 +104,14 @@ impl TurnCancellation {
         self.inner.reason.lock().await.is_some()
     }
 
+    pub fn is_cancelled_now(&self) -> bool {
+        self.inner
+            .reason
+            .try_lock()
+            .map(|reason| reason.is_some())
+            .unwrap_or(false)
+    }
+
     pub async fn cancelled(&self) -> InterruptReason {
         let mut changed = self.inner.changed.subscribe();
         if let Some(reason) = *self.inner.reason.lock().await {

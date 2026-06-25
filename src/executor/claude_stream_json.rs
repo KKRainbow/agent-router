@@ -842,6 +842,15 @@ impl ClaudeSession {
 
         loop {
             tokio::select! {
+                _ = sleep(Duration::from_millis(50)) => {
+                    if !self.is_alive() {
+                        *self.active_user_id.lock().await = None;
+                        let reason = self.closed_reason().await.unwrap_or_else(|| {
+                            "Claude stream-json process closed before result".to_string()
+                        });
+                        return ExecutorPromptOutcome::Failed(anyhow::anyhow!(reason));
+                    }
+                }
                 _reason = cancel.cancelled() => {
                     *self.active_user_id.lock().await = None;
                     self.close().await;

@@ -992,7 +992,10 @@ where
                                 protocol: descriptor.protocol.clone(),
                                 machine_id: Some(descriptor.machine_id.clone()),
                                 health: ExecutorHealth::Unhealthy,
-                                ..binding_with_executor_cwd(latest_binding, failure_cwd.as_deref())
+                                ..binding_with_executor_cwd_or_clear(
+                                    latest_binding,
+                                    failure_cwd.as_deref(),
+                                )
                             },
                         );
                         self.store.save(latest).await;
@@ -1567,6 +1570,14 @@ fn binding_with_executor_cwd(mut binding: ExecutorBinding, cwd: Option<&str>) ->
     if let Some(cwd) = cwd {
         binding.cwd = Some(cwd.to_string());
     }
+    binding
+}
+
+fn binding_with_executor_cwd_or_clear(
+    mut binding: ExecutorBinding,
+    cwd: Option<&str>,
+) -> ExecutorBinding {
+    binding.cwd = cwd.map(ToOwned::to_owned);
     binding
 }
 
@@ -2401,6 +2412,23 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySessionStore::default());
+        let mut stale_state = SessionState::new("session-a", "kimi");
+        stale_state.executor_bindings.insert(
+            "kimi".to_string(),
+            ExecutorBinding {
+                protocol: "fake".to_string(),
+                machine_id: Some("remote-dev".to_string()),
+                cwd: Some(
+                    tmp.path()
+                        .join("router-workspaces/session-a")
+                        .display()
+                        .to_string(),
+                ),
+                health: ExecutorHealth::Healthy,
+                ..ExecutorBinding::default()
+            },
+        );
+        store.save(stale_state).await;
         let router = AgentRouter::new("kimi", store.clone(), Arc::new(FailingRemoteBackend))
             .with_workspace_root(Some(tmp.path().join("router-workspaces")));
         let mut output = CollectingRouterOutputSink::default();

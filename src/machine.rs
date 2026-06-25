@@ -172,7 +172,7 @@ impl MachineRegistry {
             let router_workspace = canonicalize_lossy(router_workspace);
             let workspace = canonicalize_lossy(workspace);
             if router_workspace != workspace {
-                sync_workspace_contents(&router_workspace, &workspace)?;
+                sync_workspace_contents(&router_workspace, &workspace, request.cancel)?;
                 MachineWorkspaceMaterialization::Materialized
             } else {
                 MachineWorkspaceMaterialization::NotNeeded
@@ -235,7 +235,7 @@ impl MachineRegistry {
                 .await;
             let _guard = lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
-            materialize_ssh_workspace(host, router_workspace, &remote_cwd).await?;
+            materialize_ssh_workspace(host, router_workspace, &remote_cwd, request.cancel).await?;
             MachineWorkspaceMaterialization::Materialized
         } else {
             MachineWorkspaceMaterialization::NotNeeded
@@ -378,7 +378,7 @@ fn layered_env(
 }
 
 async fn ensure_ssh_workspace(host: &str, remote_cwd: &str) -> anyhow::Result<()> {
-    let remote_command = format!("mkdir -p -- {}", shell_quote(remote_cwd));
+    let remote_command = create_remote_workspace_script(remote_cwd)?;
     let status = Command::new("ssh")
         .args(ssh_remote_args(host, &remote_command))
         .stdin(Stdio::null())
@@ -394,10 +394,28 @@ async fn ensure_ssh_workspace(host: &str, remote_cwd: &str) -> anyhow::Result<()
     Ok(())
 }
 
+fn create_remote_workspace_script(remote_cwd: &str) -> anyhow::Result<String> {
+    let parent = remote_parent_path(remote_cwd)
+        .ok_or_else(|| anyhow::anyhow!("remote workspace path has no parent: {remote_cwd}"))?;
+    let name = remote_basename(remote_cwd).ok_or_else(|| {
+        anyhow::anyhow!("remote workspace path has no final component: {remote_cwd}")
+    })?;
+    Ok(format!(
+        "mkdir -p -- {} && if [ -e {} ] || [ -L {} ]; then [ -d {} ] && [ ! -L {} ] || exit 73; else mkdir -- {}; fi",
+        shell_quote(&parent),
+        shell_quote(remote_cwd),
+        shell_quote(remote_cwd),
+        shell_quote(remote_cwd),
+        shell_quote(remote_cwd),
+        shell_quote(&join_remote_path(&parent, &name)),
+    ))
+}
+
 async fn materialize_ssh_workspace(
     host: &str,
     router_workspace: &Path,
     remote_cwd: &str,
+    cancel: Option<&TurnCancellation>,
 ) -> anyhow::Result<()> {
     let mut tar = Command::new("tar")
         .args(["cf", "-", "-C"])
@@ -433,8 +451,35 @@ async fn materialize_ssh_workspace(
         .stdin
         .take()
         .ok_or_else(|| anyhow::anyhow!("SSH materialization command did not expose stdin"))?;
-    let copy = tokio::io::copy(&mut tar_stdout, &mut ssh_stdin).await;
-    let shutdown = ssh_stdin.shutdown().await;
+    let copy = if let Some(cancel) = cancel {
+        tokio::select! {
+            result = tokio::io::copy(&mut tar_stdout, &mut ssh_stdin) => result,
+            _ = cancel.cancelled() => {
+                let _ = tar.start_kill();
+                let _ = ssh.start_kill();
+                let _ = tar.wait().await;
+                let _ = ssh.wait().await;
+                anyhow::bail!("machine prepare cancelled");
+            }
+        }
+    } else {
+        tokio::io::copy(&mut tar_stdout, &mut ssh_stdin).await
+    };
+    let shutdown = if let Some(cancel) = cancel {
+        tokio::select! {
+            result = ssh_stdin.shutdown() => result,
+            _ = cancel.cancelled() => {
+                let _ = tar.start_kill();
+                let _ = ssh.start_kill();
+                let _ = tar.wait().await;
+                let _ = ssh.wait().await;
+                anyhow::bail!("machine prepare cancelled");
+            }
+        }
+    } else {
+        ssh_stdin.shutdown().await
+    };
+    ensure_not_cancelled(cancel, "machine prepare cancelled").await?;
     let tar_status = tar.wait().await?;
     let ssh_status = ssh.wait().await?;
     copy?;
@@ -545,7 +590,11 @@ async fn read_remote_skill(host: &str, root: &str, relative_path: &str) -> anyho
         .map_err(|err| anyhow::anyhow!("remote skill `{skill_file}` was not utf-8: {err}"))
 }
 
-fn sync_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<()> {
+fn sync_workspace_contents(
+    source: &Path,
+    destination: &Path,
+    cancel: Option<&TurnCancellation>,
+) -> anyhow::Result<()> {
     ensure_dir_path_without_symlinks(destination)?;
     let mut source_names = std::collections::BTreeSet::new();
     for entry in std::fs::read_dir(source)
@@ -560,6 +609,11 @@ fn sync_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<
         let entry = entry?;
         if source_names.contains(&entry.file_name()) {
             continue;
+        }
+        if let Some(cancel) = cancel
+            && cancel.is_cancelled_now()
+        {
+            anyhow::bail!("machine prepare cancelled");
         }
         remove_workspace_entry(&entry.path())?;
     }
@@ -577,6 +631,11 @@ fn sync_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<
             );
         }
         if metadata.is_dir() {
+            if let Some(cancel) = cancel
+                && cancel.is_cancelled_now()
+            {
+                anyhow::bail!("machine prepare cancelled");
+            }
             if let Some(destination_metadata) = symlink_metadata_optional(&destination_path)? {
                 let destination_is_plain_dir =
                     destination_metadata.is_dir() && !destination_metadata.file_type().is_symlink();
@@ -584,8 +643,13 @@ fn sync_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<
                     remove_workspace_entry(&destination_path)?;
                 }
             }
-            sync_workspace_contents(&source_path, &destination_path)?;
+            sync_workspace_contents(&source_path, &destination_path, cancel)?;
         } else if metadata.is_file() {
+            if let Some(cancel) = cancel
+                && cancel.is_cancelled_now()
+            {
+                anyhow::bail!("machine prepare cancelled");
+            }
             if let Some(destination_metadata) = symlink_metadata_optional(&destination_path)?
                 && (destination_metadata.is_dir() || destination_metadata.file_type().is_symlink())
             {
@@ -738,6 +802,24 @@ fn join_remote_path(root: &str, child: &str) -> String {
     } else {
         format!("{}/{}", root.trim_end_matches('/'), child)
     }
+}
+
+fn remote_parent_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, _) = trimmed.rsplit_once('/')?;
+    if parent.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(parent.to_string())
+    }
+}
+
+fn remote_basename(path: &str) -> Option<String> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn ssh_stdio_command(host: &str, remote_script: String, remote_cwd: String) -> StdioCommand {
@@ -923,6 +1005,15 @@ mod tests {
         assert!(!stdio.args.iter().any(|arg| arg == "-t" || arg == "-tt"));
         assert_eq!(stdio.executor_cwd, "/remote/work/session");
         assert!(stdio.strict_json_stdout);
+    }
+
+    #[test]
+    fn remote_workspace_creation_rejects_symlink_workspace() {
+        let script = create_remote_workspace_script("/remote/work/session").unwrap();
+
+        assert!(script.contains("mkdir -p -- '/remote/work'"));
+        assert!(script.contains("[ ! -L '/remote/work/session' ]"));
+        assert!(script.contains("mkdir -- '/remote/work/session'"));
     }
 
     #[tokio::test]
