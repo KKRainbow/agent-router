@@ -898,7 +898,7 @@ Phase 5 is the required bridge before ACP can finish its Backend Session
 Manager refactor. Adapter code no longer needs to guess whether a cancelled
 prepare owns the Backend Session it touched.
 
-### Phase 6: Refactor ACP Backend Session Lifecycle `[partial]`
+### Phase 6: Refactor ACP Backend Session Lifecycle `[implemented]`
 
 - Implemented:
   - soft `session/cancel` for local prompt cancellation without closing the ACP
@@ -912,13 +912,22 @@ prepare owns the Backend Session it touched.
   - pending approvals are removed when their owning prompt is cancelled;
   - tests for active-prompt interrupt, stale interrupt isolation, late-update
     and late-permission isolation, soft cancel session reuse, cancelled stop
-    reason, and approval cleanup.
-- Remaining:
-  - introduce a named ACP Backend Session Manager instead of keeping the
-    manager behavior directly in `AcpExecutorManager`;
-  - make unhealthy process replacement an explicit handle-identity operation;
-  - add cancelled-prepare publication tests at the ACP adapter boundary;
-  - unhealthy session replacement does not remove a newer session.
+    reason, and approval cleanup;
+  - `AcpBackendSessionManager` owns ACP Backend Session publication, lookup,
+    reuse, and unhealthy-session removal instead of keeping those rules directly
+    in `AcpExecutorManager`;
+  - unhealthy ACP replacement removes a session only by handle identity, so a
+    stale cleanup path cannot remove a newer published session;
+  - cancelled ACP prepare after Backend Session publication no longer closes the
+    ACP process; lifecycle RPC cancellation waits for the response, updates
+    local session state, then reports a cancelled Turn;
+  - if a cancelled ACP lifecycle RPC never settles, the adapter closes that
+    process as unhealthy recovery and the next prepare replaces it through the
+    handle-identity session manager path;
+  - adapter-boundary tests cover cancelled prepare during `initialize`, after
+    `session/new`, cancelled lifecycle permission requests, stale mismatched
+    prepare after newer publication, and stale unhealthy-session removal after a
+    newer session has been published.
 
 ### Phase 7: Refactor Codex App-Server Backend Session Lifecycle `[implemented]`
 

@@ -13,6 +13,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::{Mutex, Notify, broadcast, oneshot},
+    time::{Duration, Instant, sleep},
 };
 
 use crate::{
@@ -37,6 +38,8 @@ type SharedAcpSession = Arc<Mutex<AcpSession>>;
 type SessionMap = HashMap<SessionKey, SharedAcpSession>;
 type SharedAcpCancelBarrier = Arc<AcpCancelBarrier>;
 type SharedActiveAcpPrompts = Arc<Mutex<HashMap<SessionKey, ActiveAcpPrompt>>>;
+
+const ACP_CANCELLED_LIFECYCLE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct AcpToolCallState {
@@ -102,8 +105,7 @@ impl JsonRpcClientHandle {
 #[derive(Debug)]
 pub struct AcpExecutorManager {
     executors: BTreeMap<String, ExecutorConfig>,
-    approvals: SharedApprovalBroker,
-    sessions: Mutex<SessionMap>,
+    session_manager: AcpBackendSessionManager,
     active_prompts: SharedActiveAcpPrompts,
 }
 
@@ -122,9 +124,23 @@ impl AcpExecutorManager {
             .collect();
         Self {
             executors,
+            session_manager: AcpBackendSessionManager::new(approvals),
+            active_prompts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AcpBackendSessionManager {
+    approvals: SharedApprovalBroker,
+    sessions: Mutex<SessionMap>,
+}
+
+impl AcpBackendSessionManager {
+    fn new(approvals: SharedApprovalBroker) -> Self {
+        Self {
             approvals,
             sessions: Mutex::new(HashMap::new()),
-            active_prompts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -134,45 +150,94 @@ impl AcpExecutorManager {
         executor: &str,
         cfg: &ExecutorConfig,
         session_cwd: Option<&Path>,
-    ) -> anyhow::Result<(Arc<Mutex<AcpSession>>, bool)> {
+        cancel: &TurnCancellation,
+    ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
         let key = (session_key.to_string(), executor.to_string());
         let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
-        let existing = self.sessions.lock().await.get(&key).cloned();
-        if let Some(existing) = existing {
-            let matches = existing.lock().await.matches(cfg, &cwd);
-            if matches {
-                return Ok((existing, false));
+        loop {
+            if cancel.is_cancelled().await {
+                anyhow::bail!("ACP prepare cancelled");
             }
+            let existing = self.sessions.lock().await.get(&key).cloned();
+            if let Some(existing) = existing.as_ref() {
+                let matches = existing.lock().await.matches(cfg, &cwd);
+                if matches {
+                    return Ok(existing.clone());
+                }
+                if cancel.is_cancelled().await {
+                    anyhow::bail!("ACP prepare cancelled");
+                }
+                if !self
+                    .remove_unhealthy_session_if_same(
+                        &key,
+                        existing,
+                        "ACP session no longer matches config",
+                    )
+                    .await
+                {
+                    continue;
+                }
+            }
+
+            let session = Arc::new(Mutex::new(
+                AcpSession::start(
+                    cfg.clone(),
+                    cwd.clone(),
+                    session_key.to_string(),
+                    executor.to_string(),
+                    self.approvals.clone(),
+                )
+                .await?,
+            ));
+            if cancel.is_cancelled().await {
+                session
+                    .lock()
+                    .await
+                    .client
+                    .close("ACP prepare cancelled before publication")
+                    .await;
+                anyhow::bail!("ACP prepare cancelled");
+            }
+            let mut sessions = self.sessions.lock().await;
+            if sessions.contains_key(&key) {
+                drop(sessions);
+                session
+                    .lock()
+                    .await
+                    .client
+                    .close("ACP session publication lost race")
+                    .await;
+                continue;
+            }
+            sessions.insert(key.clone(), session.clone());
+            return Ok(session);
         }
-        let session = Arc::new(Mutex::new(
-            AcpSession::start(
-                cfg.clone(),
-                cwd,
-                session_key.to_string(),
-                executor.to_string(),
-                self.approvals.clone(),
-            )
-            .await?,
-        ));
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(key, session.clone());
-        Ok((session, true))
     }
 
-    async fn discard_session_if_same(
+    async fn remove_unhealthy_session_if_same(
         &self,
-        session_key: &str,
-        executor: &str,
+        key: &SessionKey,
         session: &Arc<Mutex<AcpSession>>,
-    ) {
-        let key = (session_key.to_string(), executor.to_string());
-        let mut sessions = self.sessions.lock().await;
-        if sessions
-            .get(&key)
-            .is_some_and(|existing| Arc::ptr_eq(existing, session))
-        {
-            sessions.remove(&key);
+        reason: &str,
+    ) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(key)
+                .is_some_and(|existing| Arc::ptr_eq(existing, session))
+            {
+                sessions.remove(key);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            let mut session = session.lock().await;
+            session.client.close(reason).await;
+            session.session_id = None;
         }
+        removed
     }
 
     async fn existing_session(
@@ -230,26 +295,17 @@ impl ExecutorBackend for AcpExecutorManager {
             previous_session_id = ?request.previous_session_id,
             "preparing ACP executor session"
         );
-        let (session, created_session) = self
+        let session = self
+            .session_manager
             .get_or_create_session(
                 &request.turn.session_key,
                 &request.turn.executor,
                 cfg,
                 request.cwd.as_deref(),
+                &cancel,
             )
             .await?;
         if cancel.is_cancelled().await {
-            if created_session {
-                self.discard_session_if_same(
-                    &request.turn.session_key,
-                    &request.turn.executor,
-                    &session,
-                )
-                .await;
-                let mut session = session.lock().await;
-                session.client.close("ACP prepare cancelled").await;
-                session.session_id = None;
-            }
             anyhow::bail!("ACP prepare cancelled");
         }
         let mut session = session.lock().await;
@@ -279,7 +335,11 @@ impl ExecutorBackend for AcpExecutorManager {
         let session_key = request.turn.session_key.clone();
         let executor = request.turn.executor.clone();
         let active_key = (session_key.clone(), executor.clone());
-        let session = match self.existing_session(&session_key, &executor).await {
+        let session = match self
+            .session_manager
+            .existing_session(&session_key, &executor)
+            .await
+        {
             Ok(session) => session,
             Err(err) => return ExecutorPromptOutcome::Failed(err),
         };
@@ -450,8 +510,9 @@ impl AcpSession {
         if self.initialized {
             return Ok(());
         }
-        self.client
-            .request_until_cancelled(
+        let response = self
+            .client
+            .lifecycle_request_until_cancelled(
                 "initialize",
                 json!({
                     "protocolVersion": 1,
@@ -463,10 +524,12 @@ impl AcpSession {
                     },
                 }),
                 cancel,
-                "ACP initialize cancelled",
             )
             .await?;
         self.initialized = true;
+        if response.cancelled {
+            anyhow::bail!("ACP initialize cancelled");
+        }
         Ok(())
     }
 
@@ -477,14 +540,17 @@ impl AcpSession {
     ) -> anyhow::Result<(String, bool)> {
         self.initialize(cancel.clone()).await?;
         if let Some(session_id) = &self.session_id {
-            return Ok((session_id.clone(), false));
+            return Ok((
+                session_id.clone(),
+                preferred_session_id != Some(session_id.as_str()),
+            ));
         }
 
         if let Some(preferred) = preferred_session_id.filter(|value| !value.is_empty()) {
             for method in ["session/load", "session/resume"] {
-                let result = self
+                let response = self
                     .client
-                    .request_until_cancelled(
+                    .lifecycle_request_until_cancelled(
                         method,
                         json!({
                             "cwd": self.cwd,
@@ -492,13 +558,15 @@ impl AcpSession {
                             "mcpServers": [],
                         }),
                         cancel.clone(),
-                        "ACP session resume cancelled",
                     )
                     .await;
-                if let Ok(result) = result {
-                    let session_id =
-                        session_id_from_result(&result).unwrap_or_else(|| preferred.to_string());
+                if let Ok(response) = response {
+                    let session_id = session_id_from_result(&response.result)
+                        .unwrap_or_else(|| preferred.to_string());
                     self.session_id = Some(session_id.clone());
+                    if response.cancelled {
+                        anyhow::bail!("ACP session resume cancelled");
+                    }
                     return Ok((session_id, false));
                 }
                 if cancel.is_cancelled().await {
@@ -507,21 +575,23 @@ impl AcpSession {
             }
         }
 
-        let result = self
+        let response = self
             .client
-            .request_until_cancelled(
+            .lifecycle_request_until_cancelled(
                 "session/new",
                 json!({
                     "cwd": self.cwd,
                     "mcpServers": [],
                 }),
                 cancel,
-                "ACP session/new cancelled",
             )
             .await?;
-        let session_id = session_id_from_result(&result)
+        let session_id = session_id_from_result(&response.result)
             .ok_or_else(|| anyhow::anyhow!("ACP session/new did not return sessionId"))?;
         self.session_id = Some(session_id.clone());
+        if response.cancelled {
+            anyhow::bail!("ACP session/new cancelled");
+        }
         Ok((session_id, true))
     }
 
@@ -807,6 +877,12 @@ struct PendingJsonRpcRequest {
     response: oneshot::Receiver<anyhow::Result<Value>>,
 }
 
+#[derive(Debug)]
+struct AcpLifecycleResponse {
+    result: Value,
+    cancelled: bool,
+}
+
 #[derive(Debug, Clone)]
 struct JsonRpcServerContext {
     state: SharedJsonRpcState,
@@ -1053,41 +1129,70 @@ impl JsonRpcClient {
         })
     }
 
-    async fn request_until_cancelled(
+    async fn lifecycle_request_until_cancelled(
         &self,
         method: &str,
         params: Value,
         cancel: TurnCancellation,
-        close_reason: &str,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<AcpLifecycleResponse> {
+        self.set_active_turn_cancel(cancel.clone()).await;
+        let result = self
+            .lifecycle_request_until_cancelled_inner(method, params, cancel)
+            .await;
+        self.clear_active_turn_cancel().await;
+        result
+    }
+
+    async fn lifecycle_request_until_cancelled_inner(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: TurnCancellation,
+    ) -> anyhow::Result<AcpLifecycleResponse> {
         let request = self.request_started(method, params).await?;
-        tokio::select! {
-            response = request.response => {
-                let response = response
-                    .map_err(|_| anyhow::anyhow!("ACP response channel closed"))??;
-                if let Some(error) = response.get("error") {
+        let PendingJsonRpcRequest {
+            method, response, ..
+        } = request;
+        let mut response = response;
+        let mut cancelled = false;
+        let settle_timeout = sleep(ACP_CANCELLED_LIFECYCLE_SETTLE_TIMEOUT);
+        tokio::pin!(settle_timeout);
+        loop {
+            tokio::select! {
+                received = &mut response => {
+                    let response = received
+                        .map_err(|_| anyhow::anyhow!("ACP response channel closed"))??;
+                    if let Some(error) = response.get("error") {
+                        anyhow::bail!(
+                            "ACP `{}` failed: {}",
+                            method,
+                            summarize_json_rpc_error(error)
+                        );
+                    }
+                    return Ok(AcpLifecycleResponse {
+                        result: response.get("result").cloned().unwrap_or(Value::Null),
+                        cancelled,
+                    });
+                }
+                _ = cancel.cancelled(), if !cancelled => {
+                    cancelled = true;
+                    settle_timeout
+                        .as_mut()
+                        .reset(Instant::now() + ACP_CANCELLED_LIFECYCLE_SETTLE_TIMEOUT);
+                }
+                _ = &mut settle_timeout, if cancelled => {
+                    self.close("ACP lifecycle request did not settle after cancellation").await;
                     anyhow::bail!(
-                        "ACP `{}` failed: {}",
-                        request.method,
-                        summarize_json_rpc_error(error)
+                        "ACP `{method}` did not settle within {}s after cancellation",
+                        ACP_CANCELLED_LIFECYCLE_SETTLE_TIMEOUT.as_secs()
                     );
                 }
-                Ok(response.get("result").cloned().unwrap_or(Value::Null))
-            }
-            _ = cancel.cancelled() => {
-                self.cancel_pending(request.id).await;
-                self.close(close_reason).await;
-                anyhow::bail!("{close_reason}")
             }
         }
     }
 
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
         self.handle().notify(method, params).await
-    }
-
-    async fn cancel_pending(&self, id: u64) {
-        self.state.lock().await.pending.remove(&id);
     }
 
     async fn close(&self, reason: &str) {
@@ -1340,6 +1445,9 @@ async fn request_permission_until_turn_cancelled(
     let Some(turn_cancel) = turn_cancel else {
         return approvals.request(request).await;
     };
+    if turn_cancel.is_cancelled().await {
+        return ApprovalSelection::Cancelled;
+    }
     let approval_cancel = ApprovalCancellation::new();
     let approval_cancel_for_turn = approval_cancel.clone();
     let watcher = tokio::spawn(async move {
@@ -2116,11 +2224,491 @@ for line in sys.stdin:
             .await
             .unwrap();
 
-        let session = manager.existing_session("session-1", "kimi").await.unwrap();
+        let session = manager
+            .session_manager
+            .existing_session("session-1", "kimi")
+            .await
+            .unwrap();
         assert_eq!(
             session.lock().await.cwd,
             session_cwd.canonicalize().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn acp_cancelled_prepare_after_publication_keeps_session_reusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("prepare_cancel_acp.py");
+        let initialize_marker = tmp.path().join("initialize_started");
+        let initialize_gate = tmp.path().join("allow_initialize");
+        let initialize_marker_literal =
+            serde_json::to_string(&initialize_marker.display().to_string())
+                .expect("initialize marker path serializes");
+        let initialize_gate_literal = serde_json::to_string(&initialize_gate.display().to_string())
+            .expect("initialize gate path serializes");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json
+import os
+import sys
+import time
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        with open({initialize_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+        while not os.path.exists({initialize_gate_literal}):
+            time.sleep(0.01)
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+    elif method == "session/new":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"sessionId": "fake-session"}}}})
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let manager = Arc::new(AcpExecutorManager::new(executors));
+        let cancel = TurnCancellation::new();
+        let prepare_manager = manager.clone();
+        let prepare_cancel = cancel.clone();
+        let prepare_task = tokio::spawn(async move {
+            prepare_manager
+                .prepare(
+                    ExecutorPrepareRequest {
+                        turn: turn_ref("session-1", "kimi", 1),
+                        cwd: None,
+                        previous_session_id: None,
+                    },
+                    prepare_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if initialize_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(initialize_marker.exists());
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        fs::write(&initialize_gate, "go").unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), prepare_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("ACP initialize cancelled"));
+
+        let session_before = manager
+            .session_manager
+            .existing_session("session-1", "kimi")
+            .await
+            .unwrap();
+        {
+            let session = session_before.lock().await;
+            assert!(session.client.is_alive());
+            assert!(session.initialized);
+            assert_eq!(session.session_id, None);
+        }
+
+        let prepared = manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "kimi", 2),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let session_after = manager
+            .session_manager
+            .existing_session("session-1", "kimi")
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&session_before, &session_after));
+        assert_eq!(
+            prepared.external_session_id.as_deref(),
+            Some("fake-session")
+        );
+        assert!(prepared.started_new_session);
+    }
+
+    #[tokio::test]
+    async fn acp_cancelled_lifecycle_permission_request_does_not_create_pending_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("prepare_permission_after_cancel_acp.py");
+        let initialize_marker = tmp.path().join("initialize_started");
+        let permission_gate = tmp.path().join("send_permission");
+        let permission_cancelled_marker = tmp.path().join("permission_cancelled");
+        let initialize_marker_literal =
+            serde_json::to_string(&initialize_marker.display().to_string())
+                .expect("initialize marker path serializes");
+        let permission_gate_literal = serde_json::to_string(&permission_gate.display().to_string())
+            .expect("permission gate path serializes");
+        let permission_cancelled_marker_literal =
+            serde_json::to_string(&permission_cancelled_marker.display().to_string())
+                .expect("permission marker path serializes");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json
+import os
+import sys
+import time
+
+initialize_id = None
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        initialize_id = request_id
+        with open({initialize_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+        while not os.path.exists({permission_gate_literal}):
+            time.sleep(0.01)
+        send({{
+            "jsonrpc": "2.0",
+            "id": 900,
+            "method": "session/request_permission",
+            "params": {{
+                "sessionId": "fake-session",
+                "toolCall": {{
+                    "title": "Run shell command",
+                    "content": [{{"type": "text", "text": "$ cargo test"}}]
+                }},
+                "options": [
+                    {{"optionId": "allow_once", "kind": "allow_once", "name": "Allow once"}},
+                    {{"optionId": "deny", "kind": "reject_once", "name": "Deny"}}
+                ]
+            }}
+        }})
+    elif request_id == 900:
+        outcome = msg.get("result", {{}}).get("outcome", {{}}).get("outcome")
+        if outcome == "cancelled":
+            with open({permission_cancelled_marker_literal}, "w") as f:
+                f.write("cancelled")
+                f.flush()
+        send({{"jsonrpc": "2.0", "id": initialize_id, "result": {{}}}})
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(AcpExecutorManager::with_approvals(
+            executors,
+            approvals.clone(),
+        ));
+        let cancel = TurnCancellation::new();
+        let prepare_manager = manager.clone();
+        let prepare_cancel = cancel.clone();
+        let prepare_task = tokio::spawn(async move {
+            prepare_manager
+                .prepare(
+                    ExecutorPrepareRequest {
+                        turn: turn_ref("session-1", "kimi", 1),
+                        cwd: None,
+                        previous_session_id: None,
+                    },
+                    prepare_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if initialize_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(initialize_marker.exists());
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        fs::write(&permission_gate, "go").unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), prepare_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("ACP initialize cancelled"));
+        assert!(permission_cancelled_marker.exists());
+        assert!(!approvals.has_pending_for_session("session-1").await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), prompts.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_reused_cancelled_created_session_reports_started_new_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("prepare_cancel_after_new_acp.py");
+        let session_new_marker = tmp.path().join("session_new_started");
+        let session_new_count = tmp.path().join("session_new_count");
+        let session_new_gate = tmp.path().join("allow_session_new");
+        let session_new_marker_literal =
+            serde_json::to_string(&session_new_marker.display().to_string())
+                .expect("session/new marker path serializes");
+        let session_new_count_literal =
+            serde_json::to_string(&session_new_count.display().to_string())
+                .expect("session/new count path serializes");
+        let session_new_gate_literal =
+            serde_json::to_string(&session_new_gate.display().to_string())
+                .expect("session/new gate path serializes");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json
+import os
+import sys
+import time
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+    elif method == "session/new":
+        with open({session_new_count_literal}, "a") as f:
+            f.write("new\n")
+            f.flush()
+        with open({session_new_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+        while not os.path.exists({session_new_gate_literal}):
+            time.sleep(0.01)
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"sessionId": "cancelled-created-session"}}}})
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut executors = BTreeMap::new();
+        executors.insert(
+            "kimi".to_string(),
+            ExecutorConfig {
+                name: "kimi".to_string(),
+                protocol: ExecutorProtocol::Acp,
+                command: "python3".to_string(),
+                args: vec![script.display().to_string()],
+                cwd: Some(tmp.path().to_path_buf()),
+                env: BTreeMap::new(),
+            },
+        );
+        let manager = Arc::new(AcpExecutorManager::new(executors));
+        let cancel = TurnCancellation::new();
+        let prepare_manager = manager.clone();
+        let prepare_cancel = cancel.clone();
+        let prepare_task = tokio::spawn(async move {
+            prepare_manager
+                .prepare(
+                    ExecutorPrepareRequest {
+                        turn: turn_ref("session-1", "kimi", 1),
+                        cwd: None,
+                        previous_session_id: None,
+                    },
+                    prepare_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if session_new_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(session_new_marker.exists());
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        fs::write(&session_new_gate, "go").unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), prepare_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("ACP session/new cancelled"));
+
+        let prepared = manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "kimi", 2),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared.external_session_id.as_deref(),
+            Some("cancelled-created-session")
+        );
+        assert!(prepared.started_new_session);
+        assert_eq!(fs::read_to_string(session_new_count).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn acp_unhealthy_session_removal_does_not_remove_newer_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script_1 = tmp.path().join("first_acp.py");
+        let script_2 = tmp.path().join("second_acp.py");
+        let script_body = r#"
+import sys
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+"#;
+        fs::write(&script_1, script_body).unwrap();
+        fs::write(&script_2, script_body).unwrap();
+        let manager = AcpBackendSessionManager::new(Arc::new(ApprovalBroker::default()));
+        let cfg_1 = ExecutorConfig {
+            name: "kimi".to_string(),
+            protocol: ExecutorProtocol::Acp,
+            command: "python3".to_string(),
+            args: vec![script_1.display().to_string()],
+            cwd: Some(tmp.path().to_path_buf()),
+            env: BTreeMap::new(),
+        };
+        let cfg_2 = ExecutorConfig {
+            args: vec![script_2.display().to_string()],
+            ..cfg_1.clone()
+        };
+        let key = ("session-1".to_string(), "kimi".to_string());
+
+        let first_cancel = TurnCancellation::new();
+        let first = manager
+            .get_or_create_session("session-1", "kimi", &cfg_1, None, &first_cancel)
+            .await
+            .unwrap();
+        let second_cancel = TurnCancellation::new();
+        let second = manager
+            .get_or_create_session("session-1", "kimi", &cfg_2, None, &second_cancel)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        assert!(
+            !manager
+                .remove_unhealthy_session_if_same(&key, &first, "stale cleanup")
+                .await
+        );
+        let current = manager.existing_session("session-1", "kimi").await.unwrap();
+        assert!(Arc::ptr_eq(&current, &second));
+        second.lock().await.client.close("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn acp_cancelled_mismatched_prepare_does_not_remove_newer_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script_1 = tmp.path().join("old_acp.py");
+        let script_2 = tmp.path().join("new_acp.py");
+        let script_body = r#"
+import sys
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+"#;
+        fs::write(&script_1, script_body).unwrap();
+        fs::write(&script_2, script_body).unwrap();
+        let manager = AcpBackendSessionManager::new(Arc::new(ApprovalBroker::default()));
+        let cfg_1 = ExecutorConfig {
+            name: "kimi".to_string(),
+            protocol: ExecutorProtocol::Acp,
+            command: "python3".to_string(),
+            args: vec![script_1.display().to_string()],
+            cwd: Some(tmp.path().to_path_buf()),
+            env: BTreeMap::new(),
+        };
+        let cfg_2 = ExecutorConfig {
+            args: vec![script_2.display().to_string()],
+            ..cfg_1.clone()
+        };
+        let publish_cancel = TurnCancellation::new();
+        let newer = manager
+            .get_or_create_session("session-1", "kimi", &cfg_2, None, &publish_cancel)
+            .await
+            .unwrap();
+        let stale_cancel = TurnCancellation::new();
+        assert!(
+            stale_cancel
+                .cancel(InterruptReason::ReplacedByNewMessage)
+                .await
+        );
+
+        let err = manager
+            .get_or_create_session("session-1", "kimi", &cfg_1, None, &stale_cancel)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("ACP prepare cancelled"));
+        let current = manager.existing_session("session-1", "kimi").await.unwrap();
+        assert!(Arc::ptr_eq(&current, &newer));
+        newer.lock().await.client.close("test complete").await;
     }
 
     #[tokio::test]
@@ -2330,7 +2918,11 @@ for line in sys.stdin:
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(cancel_marker.exists());
-        let session = manager.existing_session("session-1", "kimi").await.unwrap();
+        let session = manager
+            .session_manager
+            .existing_session("session-1", "kimi")
+            .await
+            .unwrap();
         {
             let session = session.lock().await;
             assert!(session.client.is_alive());
