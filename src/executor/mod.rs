@@ -8,12 +8,14 @@ use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex as TokioMutex, watch};
 
+use crate::machine::MachineWorkspaceRecord;
 use crate::text::truncate_chars;
 
 #[derive(Debug, Clone)]
 pub struct ExecutorDescriptor {
     pub name: String,
     pub protocol: String,
+    pub machine_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +40,12 @@ pub struct PreparedExecutor {
     /// True when the adopted Backend Session is not the same identity as
     /// `ExecutorPrepareRequest::previous_session_id`.
     pub started_new_session: bool,
+    /// Machine id used for this backend session.
+    pub machine_id: Option<String>,
+    /// Cwd visible to the executor process on its Machine.
+    pub cwd: Option<String>,
+    /// Session workspace record for the Machine, when one was created.
+    pub machine_workspace: Option<MachineWorkspaceRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +378,7 @@ pub mod test_support {
             (name == "kimi").then(|| ExecutorDescriptor {
                 name: "kimi".to_string(),
                 protocol: "fake".to_string(),
+                machine_id: "local".to_string(),
             })
         }
 
@@ -377,6 +386,7 @@ pub mod test_support {
             vec![ExecutorDescriptor {
                 name: "kimi".to_string(),
                 protocol: "fake".to_string(),
+                machine_id: "local".to_string(),
             }]
         }
 
@@ -398,6 +408,9 @@ pub mod test_support {
                         .unwrap_or_else(|| "fake-session".to_string()),
                 ),
                 started_new_session,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
             })
         }
 
@@ -438,6 +451,7 @@ pub mod test_support {
             crate::config::ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: crate::config::ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "kimi".to_string(),
                 args: vec!["acp".to_string()],
                 cwd: None,

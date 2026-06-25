@@ -5,6 +5,7 @@ use agent_router::{
     channel::{qq::QqBotChannel, slack::SlackSocketModeChannel},
     config::{AppConfig, default_config_path, load_dotenv},
     executor::registry::ExecutorRegistry,
+    machine::MachineRegistry,
     router::{AgentRouter, RouterService, SessionApprovalPolicy},
     session::store::InMemorySessionStore,
 };
@@ -49,8 +50,9 @@ async fn main() -> anyhow::Result<()> {
             store.clone(),
         )),
     ));
-    let executor = Arc::new(ExecutorRegistry::new(
+    let executor = Arc::new(ExecutorRegistry::with_machines(
         config.executors.clone(),
+        MachineRegistry::new(config.machines.clone()),
         approvals.clone(),
     ));
     let router: Arc<dyn RouterService> = Arc::new(

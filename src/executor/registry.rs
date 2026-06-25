@@ -11,6 +11,7 @@ use crate::{
         TurnCancellation, acp::AcpExecutorManager, claude_stream_json::ClaudeStreamJsonManager,
         codex_app_server::CodexAppServerManager,
     },
+    machine::MachineRegistry,
 };
 
 #[derive(Debug)]
@@ -26,13 +27,30 @@ impl ExecutorRegistry {
         executors: BTreeMap<String, ExecutorConfig>,
         approvals: SharedApprovalBroker,
     ) -> Self {
+        Self::with_machines(executors, MachineRegistry::local_default(), approvals)
+    }
+
+    pub fn with_machines(
+        executors: BTreeMap<String, ExecutorConfig>,
+        machines: MachineRegistry,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
         Self {
-            acp: AcpExecutorManager::with_approvals(executors.clone(), approvals.clone()),
-            claude_stream_json: ClaudeStreamJsonManager::with_approvals(
+            acp: AcpExecutorManager::with_machines(
                 executors.clone(),
+                machines.clone(),
                 approvals.clone(),
             ),
-            codex_app_server: CodexAppServerManager::with_approvals(executors.clone(), approvals),
+            claude_stream_json: ClaudeStreamJsonManager::with_machines(
+                executors.clone(),
+                machines.clone(),
+                approvals.clone(),
+            ),
+            codex_app_server: CodexAppServerManager::with_machines(
+                executors.clone(),
+                machines.clone(),
+                approvals,
+            ),
             executors,
         }
     }
@@ -109,6 +127,7 @@ mod tests {
                 ExecutorConfig {
                     name: "claude".to_string(),
                     protocol: ExecutorProtocol::ClaudeStreamJson,
+                    machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                     command: "claude".to_string(),
                     args: Vec::new(),
                     cwd: None,
@@ -120,6 +139,7 @@ mod tests {
                 ExecutorConfig {
                     name: "codex".to_string(),
                     protocol: ExecutorProtocol::AppServer,
+                    machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                     command: "codex".to_string(),
                     args: Vec::new(),
                     cwd: Some(PathBuf::from(".")),
@@ -131,6 +151,7 @@ mod tests {
                 ExecutorConfig {
                     name: "kimi".to_string(),
                     protocol: ExecutorProtocol::Acp,
+                    machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                     command: "kimi".to_string(),
                     args: vec!["acp".to_string()],
                     cwd: None,

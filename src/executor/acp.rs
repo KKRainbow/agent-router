@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
+    process::{Child, ChildStdin},
     sync::{Mutex, Notify, broadcast, oneshot},
     time::{Duration, Instant, sleep},
 };
@@ -28,6 +28,7 @@ use crate::{
         ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
         TurnCancellation, summarize_json_rpc_error,
     },
+    machine::{MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand},
 };
 
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
@@ -118,13 +119,21 @@ impl AcpExecutorManager {
         executors: BTreeMap<String, ExecutorConfig>,
         approvals: SharedApprovalBroker,
     ) -> Self {
+        Self::with_machines(executors, MachineRegistry::local_default(), approvals)
+    }
+
+    pub fn with_machines(
+        executors: BTreeMap<String, ExecutorConfig>,
+        machines: MachineRegistry,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
         let executors = executors
             .into_iter()
             .filter(|(_, cfg)| cfg.protocol == ExecutorProtocol::Acp)
             .collect();
         Self {
             executors,
-            session_manager: AcpBackendSessionManager::new(approvals),
+            session_manager: AcpBackendSessionManager::new(approvals, machines),
             active_prompts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -133,13 +142,15 @@ impl AcpExecutorManager {
 #[derive(Debug)]
 struct AcpBackendSessionManager {
     approvals: SharedApprovalBroker,
+    machines: MachineRegistry,
     sessions: Mutex<SessionMap>,
 }
 
 impl AcpBackendSessionManager {
-    fn new(approvals: SharedApprovalBroker) -> Self {
+    fn new(approvals: SharedApprovalBroker, machines: MachineRegistry) -> Self {
         Self {
             approvals,
+            machines,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -149,18 +160,29 @@ impl AcpBackendSessionManager {
         session_key: &str,
         executor: &str,
         cfg: &ExecutorConfig,
-        session_cwd: Option<&Path>,
+        router_workspace: Option<&Path>,
         cancel: &TurnCancellation,
     ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
         let key = (session_key.to_string(), executor.to_string());
-        let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
         loop {
             if cancel.is_cancelled().await {
                 anyhow::bail!("ACP prepare cancelled");
             }
+            let prepared_command = self
+                .machines
+                .prepare_executor_command(MachinePrepareRequest {
+                    machine_id: &cfg.machine,
+                    session_key,
+                    router_workspace,
+                    executor_cwd: cfg.cwd.as_deref(),
+                    command: &cfg.command,
+                    args: &cfg.args,
+                    env: &cfg.env,
+                })
+                .await?;
             let existing = self.sessions.lock().await.get(&key).cloned();
             if let Some(existing) = existing.as_ref() {
-                let matches = existing.lock().await.matches(cfg, &cwd);
+                let matches = existing.lock().await.matches(cfg, &prepared_command.stdio);
                 if matches {
                     return Ok(existing.clone());
                 }
@@ -182,7 +204,8 @@ impl AcpBackendSessionManager {
             let session = Arc::new(Mutex::new(
                 AcpSession::start(
                     cfg.clone(),
-                    cwd.clone(),
+                    prepared_command.stdio,
+                    prepared_command.workspace,
                     session_key.to_string(),
                     executor.to_string(),
                     self.approvals.clone(),
@@ -264,6 +287,7 @@ impl ExecutorBackend for AcpExecutorManager {
         self.executors.get(name).map(|cfg| ExecutorDescriptor {
             name: cfg.name.clone(),
             protocol: "acp".to_string(),
+            machine_id: cfg.machine.clone(),
         })
     }
 
@@ -273,6 +297,7 @@ impl ExecutorBackend for AcpExecutorManager {
             .map(|cfg| ExecutorDescriptor {
                 name: cfg.name.clone(),
                 protocol: "acp".to_string(),
+                machine_id: cfg.machine.clone(),
             })
             .collect()
     }
@@ -323,6 +348,9 @@ impl ExecutorBackend for AcpExecutorManager {
         Ok(PreparedExecutor {
             external_session_id: Some(external_session_id),
             started_new_session,
+            machine_id: Some(session.machine_id().to_string()),
+            cwd: Some(session.cwd.clone()),
+            machine_workspace: session.workspace.clone(),
         })
     }
 
@@ -453,7 +481,9 @@ async fn clear_active_acp_prompt(
 #[derive(Debug)]
 struct AcpSession {
     cfg: ExecutorConfig,
-    cwd: PathBuf,
+    stdio: StdioCommand,
+    cwd: String,
+    workspace: Option<MachineWorkspaceRecord>,
     client: JsonRpcClient,
     session_id: Option<String>,
     initialized: bool,
@@ -462,7 +492,8 @@ struct AcpSession {
 impl AcpSession {
     async fn start(
         cfg: ExecutorConfig,
-        cwd: PathBuf,
+        stdio: StdioCommand,
+        workspace: Option<MachineWorkspaceRecord>,
         session_key: String,
         executor: String,
         approvals: SharedApprovalBroker,
@@ -470,20 +501,12 @@ impl AcpSession {
         tracing::info!(
             executor = %executor,
             session_key = %session_key,
-            command = %cfg.command,
-            cwd = %cwd.display(),
+            command = %stdio.program,
+            cwd = %stdio.executor_cwd,
             "starting ACP executor process"
         );
-        let client = JsonRpcClient::spawn(
-            &cfg.command,
-            &cfg.args,
-            &cwd,
-            &cfg.env,
-            session_key.clone(),
-            executor.clone(),
-            approvals,
-        )
-        .await?;
+        let client =
+            JsonRpcClient::spawn(&stdio, session_key.clone(), executor.clone(), approvals).await?;
         tracing::info!(
             executor = %executor,
             session_key = %session_key,
@@ -491,18 +514,25 @@ impl AcpSession {
         );
         Ok(Self {
             cfg,
-            cwd,
+            cwd: stdio.executor_cwd.clone(),
+            stdio,
+            workspace,
             client,
             session_id: None,
             initialized: false,
         })
     }
 
-    fn matches(&self, cfg: &ExecutorConfig, cwd: &Path) -> bool {
+    fn machine_id(&self) -> &str {
+        &self.cfg.machine
+    }
+
+    fn matches(&self, cfg: &ExecutorConfig, stdio: &StdioCommand) -> bool {
         self.cfg.command == cfg.command
             && self.cfg.args == cfg.args
             && self.cfg.env == cfg.env
-            && self.cwd == cwd
+            && self.cfg.machine == cfg.machine
+            && &self.stdio == stdio
             && self.client.is_alive()
     }
 
@@ -866,6 +896,7 @@ struct JsonRpcClient {
 #[derive(Debug, Default)]
 struct JsonRpcState {
     closed: bool,
+    closed_reason: Option<String>,
     pending: HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>,
     cancel_barrier_response_id: Option<u64>,
 }
@@ -899,10 +930,7 @@ struct JsonRpcServerContext {
 
 impl JsonRpcClient {
     async fn spawn(
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-        env: &BTreeMap<String, String>,
+        stdio: &StdioCommand,
         session_key: String,
         executor: String,
         approvals: SharedApprovalBroker,
@@ -911,29 +939,20 @@ impl JsonRpcClient {
             target: "agent_router::acp",
             executor = %executor,
             session_key = %session_key,
-            command = %command,
-            arg_count = args.len(),
-            cwd = %cwd.display(),
+            command = %stdio.program,
+            arg_count = stdio.args.len(),
+            cwd = %stdio.executor_cwd,
             "spawning ACP process"
         );
-        let mut cmd = Command::new(command);
-        cmd.args(args).current_dir(cwd);
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        cmd.kill_on_drop(true);
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .map_err(|err| anyhow::anyhow!("could not start ACP command `{command}`: {err}"))?;
+        let mut child = stdio.spawn().map_err(|err| {
+            anyhow::anyhow!("could not start ACP command `{}`: {err}", stdio.program)
+        })?;
         let pid = child.id();
         tracing::info!(
             target: "agent_router::acp",
             executor = %executor,
             session_key = %session_key,
-            command = %command,
+            command = %stdio.program,
             pid = ?pid,
             "spawned ACP process"
         );
@@ -968,7 +987,11 @@ impl JsonRpcClient {
             active_turn_cancel: active_turn_cancel.clone(),
         };
 
-        tokio::spawn(read_stdout(BufReader::new(stdout), server_context));
+        tokio::spawn(read_stdout(
+            BufReader::new(stdout),
+            server_context,
+            stdio.strict_json_stdout,
+        ));
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
@@ -1053,7 +1076,7 @@ impl JsonRpcClient {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
-            anyhow::ensure!(!state.closed, "ACP client stdout is closed");
+            ensure_stdout_open(&state)?;
             state.pending.insert(id, tx);
         }
         if let Err(err) = write_json(
@@ -1089,7 +1112,7 @@ impl JsonRpcClient {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
-            anyhow::ensure!(!state.closed, "ACP client stdout is closed");
+            ensure_stdout_open(&state)?;
             state.pending.insert(id, tx);
         }
         set_active_acp_prompt(
@@ -1216,13 +1239,29 @@ impl JsonRpcClient {
     }
 }
 
-async fn read_stdout<R>(reader: BufReader<R>, context: JsonRpcServerContext)
-where
+async fn read_stdout<R>(
+    reader: BufReader<R>,
+    context: JsonRpcServerContext,
+    strict_json_stdout: bool,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            if strict_json_stdout {
+                let reason =
+                    "ACP process emitted non-JSON stdout before protocol handshake".to_string();
+                tracing::warn!(
+                    target: "agent_router::acp",
+                    executor = %context.executor,
+                    session_key = %context.session_key,
+                    raw_stdout = %line,
+                    "closing ACP client after non-JSON stdout"
+                );
+                fail_all_pending(&context.state, &context.cancel_barrier, &reason).await;
+                return;
+            }
             tracing::debug!(target: "agent_router::acp", raw_stdout = %line, "ignoring non-json ACP stdout");
             continue;
         };
@@ -1250,6 +1289,7 @@ async fn fail_all_pending(
     let (drained, cleared_barrier) = {
         let mut guard = state.lock().await;
         guard.closed = true;
+        guard.closed_reason = Some(message.to_string());
         let cleared_barrier = guard.cancel_barrier_response_id.take().is_some();
         (guard.pending.drain().collect::<Vec<_>>(), cleared_barrier)
     };
@@ -1259,6 +1299,19 @@ async fn fail_all_pending(
     for (_, tx) in drained {
         let _ = tx.send(Err(anyhow::anyhow!("{message}")));
     }
+}
+
+fn ensure_stdout_open(state: &JsonRpcState) -> anyhow::Result<()> {
+    if state.closed {
+        anyhow::bail!(
+            "{}",
+            state
+                .closed_reason
+                .as_deref()
+                .unwrap_or("ACP client stdout is closed")
+        );
+    }
+    Ok(())
 }
 
 async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
@@ -1838,14 +1891,6 @@ fn acp_result_cancelled(result: &Value) -> bool {
         })
 }
 
-fn resolve_cwd(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let path = match cwd {
-        Some(cwd) => cwd.to_path_buf(),
-        None => std::env::current_dir()?,
-    };
-    Ok(path.canonicalize().unwrap_or(path))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2204,6 +2249,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(executor_cwd),
@@ -2285,6 +2331,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -2439,6 +2486,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -2550,6 +2598,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -2624,10 +2673,14 @@ for line in sys.stdin:
 "#;
         fs::write(&script_1, script_body).unwrap();
         fs::write(&script_2, script_body).unwrap();
-        let manager = AcpBackendSessionManager::new(Arc::new(ApprovalBroker::default()));
+        let manager = AcpBackendSessionManager::new(
+            Arc::new(ApprovalBroker::default()),
+            crate::machine::MachineRegistry::local_default(),
+        );
         let cfg_1 = ExecutorConfig {
             name: "kimi".to_string(),
             protocol: ExecutorProtocol::Acp,
+            machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
             command: "python3".to_string(),
             args: vec![script_1.display().to_string()],
             cwd: Some(tmp.path().to_path_buf()),
@@ -2675,10 +2728,14 @@ for line in sys.stdin:
 "#;
         fs::write(&script_1, script_body).unwrap();
         fs::write(&script_2, script_body).unwrap();
-        let manager = AcpBackendSessionManager::new(Arc::new(ApprovalBroker::default()));
+        let manager = AcpBackendSessionManager::new(
+            Arc::new(ApprovalBroker::default()),
+            crate::machine::MachineRegistry::local_default(),
+        );
         let cfg_1 = ExecutorConfig {
             name: "kimi".to_string(),
             protocol: ExecutorProtocol::Acp,
+            machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
             command: "python3".to_string(),
             args: vec![script_1.display().to_string()],
             cwd: Some(tmp.path().to_path_buf()),
@@ -2758,6 +2815,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -2861,6 +2919,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3033,6 +3092,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3225,6 +3285,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3378,6 +3439,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3497,6 +3559,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3602,6 +3665,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3687,6 +3751,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3819,6 +3884,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),
@@ -3910,6 +3976,7 @@ for line in sys.stdin:
             ExecutorConfig {
                 name: "kimi".to_string(),
                 protocol: ExecutorProtocol::Acp,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(tmp.path().to_path_buf()),

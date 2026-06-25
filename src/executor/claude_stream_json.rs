@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -10,7 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::time::{Instant, sleep};
 
@@ -24,6 +23,12 @@ use crate::executor::{
     ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest,
     ExecutorResponse, ExecutorUpdate, PreparedExecutor, TurnCancellation,
 };
+use crate::machine::{
+    MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand,
+};
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -399,9 +404,31 @@ mod outgoing_tests {
 type SessionKey = (String, String);
 type SharedClaudeSession = Arc<Mutex<ClaudeSession>>;
 
+fn claude_stream_json_args(base_args: &[String], previous_session_id: Option<&str>) -> Vec<String> {
+    let mut args = base_args.to_vec();
+    args.extend([
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--permission-prompt-tool".to_string(),
+        "stdio".to_string(),
+        "--replay-user-messages".to_string(),
+        // stream-json in non-TTY mode is treated as --print and requires
+        // --verbose to emit the JSON event stream.
+        "--verbose".to_string(),
+    ]);
+    if let Some(id) = previous_session_id.filter(|id| !id.is_empty()) {
+        args.push("--resume".to_string());
+        args.push(id.to_string());
+    }
+    args
+}
+
 #[derive(Debug)]
 pub struct ClaudeStreamJsonManager {
     executors: BTreeMap<String, ExecutorConfig>,
+    machines: MachineRegistry,
     approvals: SharedApprovalBroker,
     sessions: Mutex<HashMap<SessionKey, SharedClaudeSession>>,
 }
@@ -415,12 +442,21 @@ impl ClaudeStreamJsonManager {
         executors: BTreeMap<String, ExecutorConfig>,
         approvals: SharedApprovalBroker,
     ) -> Self {
+        Self::with_machines(executors, MachineRegistry::local_default(), approvals)
+    }
+
+    pub fn with_machines(
+        executors: BTreeMap<String, ExecutorConfig>,
+        machines: MachineRegistry,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
         let executors = executors
             .into_iter()
             .filter(|(_, cfg)| cfg.protocol == ExecutorProtocol::ClaudeStreamJson)
             .collect();
         Self {
             executors,
+            machines,
             approvals,
             sessions: Mutex::new(HashMap::new()),
         }
@@ -431,14 +467,31 @@ impl ClaudeStreamJsonManager {
         session_key: &str,
         executor: &str,
         cfg: &ExecutorConfig,
-        cwd: PathBuf,
+        router_workspace: Option<&Path>,
         previous_session_id: Option<String>,
     ) -> anyhow::Result<SharedClaudeSession> {
         let key = (session_key.to_string(), executor.to_string());
+        let args = claude_stream_json_args(&cfg.args, previous_session_id.as_deref());
+        let mut prepared_command = self
+            .machines
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: &cfg.machine,
+                session_key,
+                router_workspace,
+                executor_cwd: cfg.cwd.as_deref(),
+                command: &cfg.command,
+                args: &args,
+                env: &cfg.env,
+            })
+            .await?;
+        prepared_command
+            .stdio
+            .env_remove
+            .push("CLAUDECODE".to_string());
         let existing = self.sessions.lock().await.get(&key).cloned();
         if let Some(existing) = existing {
             let guard = existing.lock().await;
-            if guard.is_alive() && guard.matches(cfg, &cwd) {
+            if guard.is_alive() && guard.matches(cfg, &prepared_command.stdio) {
                 drop(guard);
                 return Ok(existing);
             }
@@ -446,11 +499,11 @@ impl ClaudeStreamJsonManager {
         let session = Arc::new(Mutex::new(
             ClaudeSession::start(
                 cfg.clone(),
-                cwd,
+                prepared_command.stdio,
+                prepared_command.workspace,
                 session_key.to_string(),
                 executor.to_string(),
                 self.approvals.clone(),
-                previous_session_id,
             )
             .await?,
         ));
@@ -482,6 +535,7 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
         self.executors.get(name).map(|cfg| ExecutorDescriptor {
             name: cfg.name.clone(),
             protocol: "claude_stream_json".to_string(),
+            machine_id: cfg.machine.clone(),
         })
     }
 
@@ -491,6 +545,7 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
             .map(|cfg| ExecutorDescriptor {
                 name: cfg.name.clone(),
                 protocol: "claude_stream_json".to_string(),
+                machine_id: cfg.machine.clone(),
             })
             .collect()
     }
@@ -513,18 +568,13 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
             previous_session_id = ?request.previous_session_id,
             "preparing Claude stream-json executor session"
         );
-        let cwd = request
-            .cwd
-            .clone()
-            .or_else(|| cfg.cwd.clone())
-            .unwrap_or_else(|| PathBuf::from("."));
         let previous_session_id = request.previous_session_id.clone();
         let session = self
             .get_or_create_session(
                 &request.turn.session_key,
                 &request.turn.executor,
                 cfg,
-                cwd,
+                request.cwd.as_deref(),
                 previous_session_id.clone(),
             )
             .await?;
@@ -554,9 +604,13 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
             started_new_session,
             "prepared Claude stream-json executor session"
         );
+        let session = session.lock().await;
         Ok(PreparedExecutor {
             external_session_id,
             started_new_session,
+            machine_id: Some(session.machine_id().to_string()),
+            cwd: Some(session.cwd.clone()),
+            machine_workspace: session.workspace.clone(),
         })
     }
 
@@ -636,7 +690,9 @@ type SharedStdin = Arc<Mutex<ChildStdin>>;
 #[derive(Debug)]
 pub struct ClaudeSession {
     cfg: ExecutorConfig,
-    cwd: PathBuf,
+    stdio: StdioCommand,
+    cwd: String,
+    workspace: Option<MachineWorkspaceRecord>,
     stdin: SharedStdin,
     child: Arc<Mutex<Child>>,
     updates: broadcast::Sender<ExecutorUpdate>,
@@ -653,40 +709,13 @@ pub struct ClaudeSession {
 impl ClaudeSession {
     pub async fn start(
         cfg: ExecutorConfig,
-        cwd: PathBuf,
+        stdio: StdioCommand,
+        workspace: Option<MachineWorkspaceRecord>,
         session_key: String,
         executor: String,
         approvals: SharedApprovalBroker,
-        previous_session_id: Option<String>,
     ) -> anyhow::Result<Self> {
-        let mut cmd = Command::new(&cfg.command);
-        cmd.args(&cfg.args)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--input-format")
-            .arg("stream-json")
-            .arg("--permission-prompt-tool")
-            .arg("stdio")
-            .arg("--replay-user-messages")
-            // stream-json in non-TTY mode is treated as --print and requires
-            // --verbose to emit the JSON event stream.
-            .arg("--verbose");
-        if let Some(id) = previous_session_id.filter(|id| !id.is_empty()) {
-            cmd.arg("--resume").arg(id);
-        }
-        cmd.kill_on_drop(true)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .current_dir(&cwd);
-        // Prevent Claude Code from detecting a nested session when this agent is
-        // spawned from within another Claude Code process.
-        cmd.env_remove("CLAUDECODE");
-        for (key, value) in &cfg.env {
-            cmd.env(key, value);
-        }
-
-        let mut child = cmd
+        let mut child = stdio
             .spawn()
             .with_context(|| format!("failed to spawn claude executor: {}", cfg.command))?;
         let stdin = Arc::new(Mutex::new(
@@ -720,7 +749,9 @@ impl ClaudeSession {
 
         Ok(Self {
             cfg,
-            cwd,
+            cwd: stdio.executor_cwd.clone(),
+            stdio,
+            workspace,
             stdin,
             child,
             updates,
@@ -747,11 +778,16 @@ impl ClaudeSession {
         self.alive.load(Ordering::Relaxed)
     }
 
-    pub fn matches(&self, cfg: &ExecutorConfig, cwd: &Path) -> bool {
+    pub fn machine_id(&self) -> &str {
+        &self.cfg.machine
+    }
+
+    pub fn matches(&self, cfg: &ExecutorConfig, stdio: &StdioCommand) -> bool {
         self.cfg.command == cfg.command
             && self.cfg.args == cfg.args
             && self.cfg.env == cfg.env
-            && self.cwd == cwd
+            && self.cfg.machine == cfg.machine
+            && &self.stdio == stdio
     }
 
     pub async fn send_prompt(&self, prompt: &str) -> anyhow::Result<()> {
@@ -1178,25 +1214,39 @@ mod session_tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    fn local_stdio(cfg: &ExecutorConfig, cwd: PathBuf) -> StdioCommand {
+        StdioCommand {
+            program: cfg.command.clone(),
+            args: claude_stream_json_args(&cfg.args, None),
+            current_dir: Some(cwd.clone()),
+            env: cfg.env.clone(),
+            env_remove: vec!["CLAUDECODE".to_string()],
+            executor_cwd: cwd.display().to_string(),
+            strict_json_stdout: false,
+        }
+    }
+
     #[tokio::test]
     async fn session_tracks_external_id_from_system_event() {
         let system_line = r#"{"type":"system","session_id":"sess-ext-123"}"#;
         let cfg = ExecutorConfig {
             name: "claude-test".to_string(),
             protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+            machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
             command: "printf".to_string(),
             args: vec!["%s\n".to_string(), system_line.to_string()],
             cwd: None,
             env: BTreeMap::new(),
         };
         let approvals = Arc::new(crate::approval::ApprovalBroker::default());
+        let stdio = local_stdio(&cfg, PathBuf::from("."));
         let session = ClaudeSession::start(
             cfg,
-            PathBuf::from("."),
+            stdio,
+            None,
             "test-key".to_string(),
             "claude".to_string(),
             approvals,
-            None,
         )
         .await
         .expect("start session");
@@ -1216,6 +1266,7 @@ mod session_tests {
         let cfg = ExecutorConfig {
             name: "fake-claude".to_string(),
             protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+            machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
             command: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fake_claude.sh")
                 .to_string_lossy()
@@ -1226,13 +1277,14 @@ mod session_tests {
         };
         let approvals = Arc::new(crate::approval::ApprovalBroker::default());
         let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let stdio = local_stdio(&cfg, temp_dir.path().to_path_buf());
         let session = ClaudeSession::start(
             cfg,
-            temp_dir.path().to_path_buf(),
+            stdio,
+            None,
             "fake-session".to_string(),
             "claude".to_string(),
             approvals,
-            None,
         )
         .await
         .expect("start session");
@@ -1281,6 +1333,7 @@ done
             ExecutorConfig {
                 name: "claude".to_string(),
                 protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "sh".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(temp_dir.path().to_path_buf()),
@@ -1373,6 +1426,18 @@ mod approval_bridge_tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    fn local_stdio(cfg: &ExecutorConfig, cwd: PathBuf) -> StdioCommand {
+        StdioCommand {
+            program: cfg.command.clone(),
+            args: claude_stream_json_args(&cfg.args, None),
+            current_dir: Some(cwd.clone()),
+            env: cfg.env.clone(),
+            env_remove: vec!["CLAUDECODE".to_string()],
+            executor_cwd: cwd.display().to_string(),
+            strict_json_stdout: false,
+        }
+    }
+
     #[test]
     fn control_request_builds_approval_request() {
         let request = serde_json::json!({
@@ -1404,6 +1469,7 @@ mod approval_bridge_tests {
         let cfg = ExecutorConfig {
             name: "claude-test".to_string(),
             protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+            machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
             command: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
@@ -1415,13 +1481,14 @@ mod approval_bridge_tests {
         };
         let approvals = Arc::new(crate::approval::ApprovalBroker::default());
         let mut prompts = approvals.subscribe();
+        let stdio = local_stdio(&cfg, PathBuf::from("."));
         let session = ClaudeSession::start(
             cfg,
-            PathBuf::from("."),
+            stdio,
+            None,
             "test-key".to_string(),
             "claude".to_string(),
             approvals.clone(),
-            None,
         )
         .await
         .expect("start session");

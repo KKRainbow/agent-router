@@ -10,18 +10,43 @@ workspace:
   # Optional. When set, each router session runs under a stable child directory.
   root: /data/project/agent-router-workspaces/
 
+machines:
+  local:
+    type: local
+    workspace_root: /data/project/agent-router-workspaces/
+    skill_roots:
+      - /home/admin/.codex/skills
+  # Remote execution environment. Executors reference this by `machine`.
+  # zbs-dev:
+  #   type: ssh
+  #   host: admin@172.17.0.2
+  #   workspace_root: /data/project/agent-router-workspaces/
+  #   env:
+  #     PATH: /home/admin/.nvm/versions/node/v24.14.0/bin:$PATH
+  #   skill_roots:
+  #     - /home/admin/.codex/skills
+  #     - /data/project/ai/skills
+
 executors:
   kimi:
     protocol: acp
+    machine: local
     command: kimi
     args: ["acp"]
   codex:
     protocol: app_server
+    machine: local
     command: codex
+  # Remote ACP over SSH. SSH details live on the Machine, not in command args.
+  # codex-zbs:
+  #   protocol: acp
+  #   machine: zbs-dev
+  #   command: /home/admin/.nvm/versions/node/v24.14.0/bin/codex-acp
   # Claude Code CLI via stream-json stdio protocol.
   # Requires `claude` installed and ANTHROPIC_API_KEY available.
   claude:
     protocol: claude_stream_json
+    machine: local
     command: claude
     args: []
 

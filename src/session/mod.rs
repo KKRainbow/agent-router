@@ -11,6 +11,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::machine::MachineWorkspaceRecord;
+
 pub use context::{ContextArtifactRecord, ContextSyncRequest};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,8 @@ pub enum ExecutorHealth {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutorBinding {
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +113,8 @@ pub struct SessionState {
     pub transcript: Vec<TranscriptMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_artifacts: Vec<ContextArtifactRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub machine_workspaces: BTreeMap<String, MachineWorkspaceRecord>,
     pub executor_bindings: BTreeMap<String, ExecutorBinding>,
 }
 
@@ -123,6 +129,7 @@ impl SessionState {
             cwd: None,
             transcript: Vec::new(),
             context_artifacts: Vec::new(),
+            machine_workspaces: BTreeMap::new(),
             executor_bindings: BTreeMap::new(),
         }
     }

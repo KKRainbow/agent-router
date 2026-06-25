@@ -5,6 +5,7 @@ pub mod approval;
 pub mod channel;
 pub mod config;
 pub mod executor;
+pub mod machine;
 pub mod router;
 pub mod session;
 mod text;

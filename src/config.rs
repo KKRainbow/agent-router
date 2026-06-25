@@ -6,6 +6,7 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::machine::{LOCAL_MACHINE_ID, MachineConfig, MachineKind, local_machine_config};
 use crate::session::ApprovalMode;
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,7 @@ pub struct AppConfig {
     pub workspace: WorkspaceConfig,
     pub slack: SlackConfig,
     pub qq: QqConfig,
+    pub machines: BTreeMap<String, MachineConfig>,
     pub executors: BTreeMap<String, ExecutorConfig>,
 }
 
@@ -87,6 +89,7 @@ pub enum ExecutorProtocol {
 pub struct ExecutorConfig {
     pub name: String,
     pub protocol: ExecutorProtocol,
+    pub machine: String,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -98,6 +101,7 @@ struct FileConfig {
     router: Option<FileRouterConfig>,
     approval: Option<FileApprovalConfig>,
     workspace: Option<FileWorkspaceConfig>,
+    machines: Option<BTreeMap<String, FileMachineConfig>>,
     slack: Option<FileSlackConfig>,
     qq: Option<FileQqConfig>,
     executors: Option<BTreeMap<String, FileExecutorConfig>>,
@@ -116,6 +120,16 @@ struct FileRouterConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileWorkspaceConfig {
     root: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileMachineConfig {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    host: Option<String>,
+    workspace_root: Option<String>,
+    env: Option<BTreeMap<String, String>>,
+    skill_roots: Option<StringList>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -176,6 +190,7 @@ impl StringList {
 #[derive(Debug, Deserialize)]
 struct FileExecutorConfig {
     protocol: Option<String>,
+    machine: Option<String>,
     command: Option<String>,
     args: Option<Vec<String>>,
     cwd: Option<PathBuf>,
@@ -222,6 +237,7 @@ impl AppConfig {
                 .root
                 .filter(|root| !root.as_os_str().is_empty()),
         };
+        let machines = parse_machine_configs(file_cfg.machines, workspace.root.as_deref())?;
 
         let slack_file = file_cfg.slack.unwrap_or_default();
         let slack_context_file = slack_file.context_sync.unwrap_or_default();
@@ -327,6 +343,7 @@ impl AppConfig {
                 ExecutorConfig {
                     name: "kimi".to_string(),
                     protocol: ExecutorProtocol::Acp,
+                    machine: LOCAL_MACHINE_ID.to_string(),
                     command: "kimi".to_string(),
                     args: vec!["acp".to_string()],
                     cwd: None,
@@ -339,6 +356,14 @@ impl AppConfig {
             executors.contains_key(&default_executor),
             "default executor `{default_executor}` is not configured"
         );
+        for cfg in executors.values() {
+            anyhow::ensure!(
+                machines.contains_key(&cfg.machine),
+                "executors.{}.machine `{}` is not configured",
+                cfg.name,
+                cfg.machine
+            );
+        }
 
         Ok(Self {
             router: RouterConfig { default_executor },
@@ -346,6 +371,7 @@ impl AppConfig {
             workspace,
             slack,
             qq,
+            machines,
             executors,
         })
     }
@@ -469,10 +495,79 @@ fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Resul
     Ok(ExecutorConfig {
         name,
         protocol,
+        machine: raw
+            .machine
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| LOCAL_MACHINE_ID.to_string()),
         command,
         args,
         cwd: raw.cwd,
         env: raw.env.unwrap_or_default(),
+    })
+}
+
+fn parse_machine_configs(
+    raw_machines: Option<BTreeMap<String, FileMachineConfig>>,
+    router_workspace_root: Option<&Path>,
+) -> anyhow::Result<BTreeMap<String, MachineConfig>> {
+    let mut machines = BTreeMap::new();
+    if let Some(raw_machines) = raw_machines {
+        for (id, raw) in raw_machines {
+            let cfg = parse_machine_config(id, raw, router_workspace_root)?;
+            machines.insert(cfg.id.clone(), cfg);
+        }
+    }
+    machines
+        .entry(LOCAL_MACHINE_ID.to_string())
+        .or_insert_with(|| {
+            let mut local = local_machine_config();
+            local.workspace_root = router_workspace_root.map(|root| root.display().to_string());
+            local
+        });
+    Ok(machines)
+}
+
+fn parse_machine_config(
+    id: String,
+    raw: FileMachineConfig,
+    router_workspace_root: Option<&Path>,
+) -> anyhow::Result<MachineConfig> {
+    let kind = match raw.kind.as_deref().unwrap_or("local") {
+        "local" => MachineKind::Local,
+        "ssh" => MachineKind::Ssh,
+        other => anyhow::bail!("machines.{id}.type `{other}` is not supported"),
+    };
+    let host = raw.host.filter(|value| !value.trim().is_empty());
+    let workspace_root = raw
+        .workspace_root
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (id == LOCAL_MACHINE_ID)
+                .then(|| router_workspace_root.map(|root| root.display().to_string()))
+                .flatten()
+        });
+    if kind == MachineKind::Ssh {
+        anyhow::ensure!(
+            host.is_some(),
+            "machines.{id}.host is required for ssh machines"
+        );
+        anyhow::ensure!(
+            workspace_root.is_some(),
+            "machines.{id}.workspace_root is required for ssh machines"
+        );
+    }
+    Ok(MachineConfig {
+        id,
+        kind,
+        host,
+        workspace_root,
+        env: raw.env.unwrap_or_default(),
+        skill_roots: raw
+            .skill_roots
+            .map(StringList::into_set)
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -542,8 +637,10 @@ mod tests {
         assert_eq!(cfg.router.default_executor, "kimi");
         let kimi = cfg.executors.get("kimi").unwrap();
         assert_eq!(kimi.protocol, ExecutorProtocol::Acp);
+        assert_eq!(kimi.machine, LOCAL_MACHINE_ID);
         assert_eq!(kimi.command, "kimi");
         assert_eq!(kimi.args, ["acp"]);
+        assert_eq!(cfg.machines[LOCAL_MACHINE_ID].kind, MachineKind::Local);
         assert_eq!(cfg.approval.default_mode, ApprovalMode::Normal);
         assert!(!cfg.slack.enabled);
         assert!(!cfg.qq.enabled);
@@ -605,6 +702,50 @@ executors:
             cfg.slack.free_response_channels,
             ["C3", "C4", "C5"].into_iter().map(str::to_string).collect()
         );
+    }
+
+    #[test]
+    fn parses_local_and_ssh_machines_and_executor_machine_refs() {
+        let raw = r#"
+router:
+  default_executor: local-kimi
+workspace:
+  root: /router/workspaces
+machines:
+  zbs-dev:
+    type: ssh
+    host: admin@172.17.0.2
+    workspace_root: /remote/workspaces
+    env:
+      PATH: /opt/node/bin:$PATH
+    skill_roots: ["/home/admin/.codex/skills", "/data/project/ai/skills"]
+executors:
+  local-kimi:
+    protocol: acp
+    command: kimi
+  remote-codex:
+    protocol: acp
+    machine: zbs-dev
+    command: /opt/node/bin/codex-acp
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert_eq!(
+            cfg.machines[LOCAL_MACHINE_ID].workspace_root.as_deref(),
+            Some("/router/workspaces")
+        );
+        let remote = &cfg.machines["zbs-dev"];
+        assert_eq!(remote.kind, MachineKind::Ssh);
+        assert_eq!(remote.host.as_deref(), Some("admin@172.17.0.2"));
+        assert_eq!(remote.workspace_root.as_deref(), Some("/remote/workspaces"));
+        assert_eq!(remote.env["PATH"], "/opt/node/bin:$PATH");
+        assert_eq!(
+            remote.skill_roots,
+            ["/data/project/ai/skills", "/home/admin/.codex/skills"]
+        );
+        assert_eq!(cfg.executors["local-kimi"].machine, LOCAL_MACHINE_ID);
+        assert_eq!(cfg.executors["remote-codex"].machine, "zbs-dev");
     }
 
     #[test]

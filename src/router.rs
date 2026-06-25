@@ -987,8 +987,15 @@ where
                             executor_name.clone(),
                             ExecutorBinding {
                                 protocol: descriptor.protocol.clone(),
+                                machine_id: Some(descriptor.machine_id.clone()),
                                 health: ExecutorHealth::Unhealthy,
-                                ..binding_with_session_cwd(latest_binding, session_cwd.as_deref())
+                                ..binding_with_executor_cwd(
+                                    latest_binding,
+                                    session_cwd
+                                        .as_ref()
+                                        .map(|cwd| cwd.display().to_string())
+                                        .as_deref(),
+                                )
                             },
                         );
                         self.store.save(latest).await;
@@ -1019,6 +1026,15 @@ where
             );
             return Ok(());
         }
+        let prepared_machine_id = prepared
+            .machine_id
+            .clone()
+            .unwrap_or_else(|| descriptor.machine_id.clone());
+        let prepared_cwd = prepared
+            .cwd
+            .clone()
+            .or_else(|| session_cwd.as_ref().map(|cwd| cwd.display().to_string()));
+        let prepared_machine_workspace = prepared.machine_workspace.clone();
 
         let projection = build_context_projection(ProjectionInput {
             transcript: &state.transcript,
@@ -1081,13 +1097,19 @@ where
                         let latest_binding = latest.binding_for(&executor_name);
                         latest.transcript.push(user_entry);
                         latest.transcript.push(assistant_entry);
+                        if let Some(machine_workspace) = prepared_machine_workspace.clone() {
+                            latest
+                                .machine_workspaces
+                                .insert(machine_workspace.machine_id.clone(), machine_workspace);
+                        }
                         latest.executor_bindings.insert(
                             executor_name.clone(),
                             update_binding_after_success(
                                 latest_binding,
                                 prepared.external_session_id,
                                 descriptor.protocol,
-                                session_cwd.as_deref(),
+                                prepared_machine_id,
+                                prepared_cwd.as_deref(),
                                 projection.acknowledged_fingerprints,
                                 new_fingerprints,
                             ),
@@ -1136,13 +1158,19 @@ where
                             .load_or_create(&session_key, &self.default_executor)
                             .await;
                         let latest_binding = latest.binding_for(&executor_name);
+                        if let Some(machine_workspace) = prepared_machine_workspace.clone() {
+                            latest
+                                .machine_workspaces
+                                .insert(machine_workspace.machine_id.clone(), machine_workspace);
+                        }
                         latest.executor_bindings.insert(
                             executor_name.clone(),
                             update_binding_after_prompt_failure(
                                 latest_binding,
                                 prepared.external_session_id,
                                 descriptor.protocol,
-                                session_cwd.as_deref(),
+                                prepared_machine_id,
+                                prepared_cwd.as_deref(),
                             ),
                         );
                         self.store.save(latest).await;
@@ -1503,14 +1531,16 @@ fn update_binding_after_success(
     mut binding: ExecutorBinding,
     external_session_id: Option<String>,
     protocol: String,
-    cwd: Option<&Path>,
+    machine_id: String,
+    cwd: Option<&str>,
     handoff_fingerprints: Vec<String>,
     new_message_fingerprints: Vec<String>,
 ) -> ExecutorBinding {
     binding.protocol = protocol;
+    binding.machine_id = Some(machine_id);
     binding.external_session_id = external_session_id;
     binding.health = ExecutorHealth::Healthy;
-    binding = binding_with_session_cwd(binding, cwd);
+    binding = binding_with_executor_cwd(binding, cwd);
     binding.seen_context = merge_seen_context(
         &binding.seen_context,
         &[handoff_fingerprints, new_message_fingerprints].concat(),
@@ -1522,11 +1552,13 @@ fn update_binding_after_prompt_failure(
     mut binding: ExecutorBinding,
     prepared_session_id: Option<String>,
     protocol: String,
-    cwd: Option<&Path>,
+    machine_id: String,
+    cwd: Option<&str>,
 ) -> ExecutorBinding {
     binding.protocol = protocol;
+    binding.machine_id = Some(machine_id);
     binding.health = ExecutorHealth::Unhealthy;
-    binding = binding_with_session_cwd(binding, cwd);
+    binding = binding_with_executor_cwd(binding, cwd);
     if prepared_session_id != binding.external_session_id {
         binding.external_session_id = prepared_session_id;
         binding.seen_context.clear();
@@ -1534,9 +1566,9 @@ fn update_binding_after_prompt_failure(
     binding
 }
 
-fn binding_with_session_cwd(mut binding: ExecutorBinding, cwd: Option<&Path>) -> ExecutorBinding {
+fn binding_with_executor_cwd(mut binding: ExecutorBinding, cwd: Option<&str>) -> ExecutorBinding {
     if let Some(cwd) = cwd {
-        binding.cwd = Some(cwd.display().to_string());
+        binding.cwd = Some(cwd.to_string());
     }
     binding
 }
@@ -2247,6 +2279,89 @@ mod tests {
         assert_eq!(
             saved.executor_bindings["kimi"].cwd.as_deref(),
             Some(first_cwd_text.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn stores_prepared_machine_workspace_and_executor_visible_cwd() {
+        #[derive(Debug)]
+        struct MachineAwareBackend;
+
+        #[async_trait::async_trait]
+        impl ExecutorBackend for MachineAwareBackend {
+            fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+                (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                    name: "kimi".to_string(),
+                    protocol: "fake".to_string(),
+                    machine_id: "remote-dev".to_string(),
+                })
+            }
+
+            fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+                self.get("kimi").into_iter().collect()
+            }
+
+            async fn prepare(
+                &self,
+                _request: ExecutorPrepareRequest,
+                _cancel: TurnCancellation,
+            ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+                Ok(crate::executor::PreparedExecutor {
+                    external_session_id: Some("remote-session".to_string()),
+                    started_new_session: true,
+                    machine_id: Some("remote-dev".to_string()),
+                    cwd: Some("/remote/work/session-a".to_string()),
+                    machine_workspace: Some(crate::machine::MachineWorkspaceRecord {
+                        machine_id: "remote-dev".to_string(),
+                        cwd: "/remote/work/session-a".to_string(),
+                        materialization:
+                            crate::machine::MachineWorkspaceMaterialization::Materialized,
+                        artifact_fingerprint: Some("fingerprint".to_string()),
+                    }),
+                })
+            }
+
+            async fn prompt(
+                &self,
+                _request: ExecutorPromptRequest,
+                _events: &mut dyn ExecutorEventSink,
+                _cancel: TurnCancellation,
+            ) -> ExecutorPromptOutcome {
+                ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
+                    final_text: "done".to_string(),
+                })
+            }
+        }
+
+        let store = Arc::new(InMemorySessionStore::default());
+        let router = AgentRouter::new("kimi", store.clone(), Arc::new(MachineAwareBackend));
+        let mut output = CollectingRouterOutputSink::default();
+
+        router
+            .handle(
+                RouterInput {
+                    session_key: "session-a".to_string(),
+                    text: "hello".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        let saved = store.load_or_create("session-a", "kimi").await;
+        let binding = &saved.executor_bindings["kimi"];
+        assert_eq!(binding.machine_id.as_deref(), Some("remote-dev"));
+        assert_eq!(binding.cwd.as_deref(), Some("/remote/work/session-a"));
+        assert_eq!(
+            binding.external_session_id.as_deref(),
+            Some("remote-session")
+        );
+        let workspace = &saved.machine_workspaces["remote-dev"];
+        assert_eq!(workspace.cwd, "/remote/work/session-a");
+        assert_eq!(
+            workspace.materialization,
+            crate::machine::MachineWorkspaceMaterialization::Materialized
         );
     }
 
@@ -3245,6 +3360,7 @@ mod tests {
                 (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                     name: "kimi".to_string(),
                     protocol: "fake".to_string(),
+                    machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 })
             }
 
@@ -3260,6 +3376,9 @@ mod tests {
                 Ok(crate::executor::PreparedExecutor {
                     external_session_id: Some("stream-session".to_string()),
                     started_new_session: true,
+                    machine_id: None,
+                    cwd: None,
+                    machine_workspace: None,
                 })
             }
 
@@ -3367,6 +3486,7 @@ mod tests {
                 (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                     name: "kimi".to_string(),
                     protocol: "fake".to_string(),
+                    machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 })
             }
 
@@ -3382,6 +3502,9 @@ mod tests {
                 Ok(crate::executor::PreparedExecutor {
                     external_session_id: Some("tool-session".to_string()),
                     started_new_session: true,
+                    machine_id: None,
+                    cwd: None,
+                    machine_workspace: None,
                 })
             }
 
@@ -3500,6 +3623,7 @@ mod tests {
             (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                 name: "kimi".to_string(),
                 protocol: "fake".to_string(),
+                machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
             })
         }
 
@@ -3549,6 +3673,9 @@ mod tests {
             Ok(crate::executor::PreparedExecutor {
                 external_session_id: Some(external_session_id),
                 started_new_session,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
             })
         }
 
@@ -3700,6 +3827,7 @@ mod tests {
             (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                 name: "kimi".to_string(),
                 protocol: "fake".to_string(),
+                machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
             })
         }
 
@@ -3721,6 +3849,9 @@ mod tests {
             Ok(crate::executor::PreparedExecutor {
                 external_session_id: Some(external_session_id),
                 started_new_session,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
             })
         }
 
@@ -3773,6 +3904,7 @@ mod tests {
             "kimi".to_string(),
             ExecutorBinding {
                 protocol: "fake".to_string(),
+                machine_id: Some(crate::machine::LOCAL_MACHINE_ID.to_string()),
                 external_session_id: Some("existing-session".to_string()),
                 health: ExecutorHealth::Healthy,
                 ..ExecutorBinding::default()
@@ -3899,6 +4031,7 @@ mod tests {
             (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                 name: "kimi".to_string(),
                 protocol: "fake".to_string(),
+                machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
             })
         }
 
@@ -3917,6 +4050,9 @@ mod tests {
             Ok(crate::executor::PreparedExecutor {
                 external_session_id: Some(format!("{}-session", request.turn.executor)),
                 started_new_session: request.previous_session_id.is_none(),
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
             })
         }
 
@@ -4055,6 +4191,7 @@ mod tests {
             (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                 name: "kimi".to_string(),
                 protocol: "fake".to_string(),
+                machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
             })
         }
 
@@ -4070,6 +4207,9 @@ mod tests {
             Ok(crate::executor::PreparedExecutor {
                 external_session_id: Some(format!("{}-session", request.turn.executor)),
                 started_new_session: request.previous_session_id.is_none(),
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
             })
         }
 
@@ -4220,6 +4360,7 @@ mod tests {
             (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                 name: "kimi".to_string(),
                 protocol: "fake".to_string(),
+                machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
             })
         }
 
@@ -4235,6 +4376,9 @@ mod tests {
             Ok(crate::executor::PreparedExecutor {
                 external_session_id: Some(format!("{}-session", request.turn.executor)),
                 started_new_session: request.previous_session_id.is_none(),
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
             })
         }
 
@@ -4985,6 +5129,7 @@ mod tests {
                 (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
                     name: "kimi".to_string(),
                     protocol: "fake".to_string(),
+                    machine_id: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 })
             }
 
@@ -5001,6 +5146,9 @@ mod tests {
                 Ok(crate::executor::PreparedExecutor {
                     external_session_id: Some("replacement-session".to_string()),
                     started_new_session: true,
+                    machine_id: None,
+                    cwd: None,
+                    machine_workspace: None,
                 })
             }
 

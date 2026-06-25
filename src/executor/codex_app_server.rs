@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
+    process::{Child, ChildStdin},
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Duration, sleep},
@@ -29,6 +29,7 @@ use crate::{
         ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
         TurnCancellation, summarize_json_rpc_error,
     },
+    machine::{MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand},
 };
 
 type SessionKey = (String, String);
@@ -385,6 +386,7 @@ impl Default for CodexRuntimeLimits {
 #[derive(Debug)]
 pub struct CodexAppServerManager {
     executors: BTreeMap<String, ExecutorConfig>,
+    machines: MachineRegistry,
     approvals: SharedApprovalBroker,
     limits: CodexRuntimeLimits,
     sessions: Mutex<SessionMap>,
@@ -400,11 +402,25 @@ impl CodexAppServerManager {
         executors: BTreeMap<String, ExecutorConfig>,
         approvals: SharedApprovalBroker,
     ) -> Self {
-        Self::with_limits(executors, approvals, CodexRuntimeLimits::default())
+        Self::with_machines(executors, MachineRegistry::local_default(), approvals)
+    }
+
+    pub fn with_machines(
+        executors: BTreeMap<String, ExecutorConfig>,
+        machines: MachineRegistry,
+        approvals: SharedApprovalBroker,
+    ) -> Self {
+        Self::with_limits(
+            executors,
+            machines,
+            approvals,
+            CodexRuntimeLimits::default(),
+        )
     }
 
     fn with_limits(
         executors: BTreeMap<String, ExecutorConfig>,
+        machines: MachineRegistry,
         approvals: SharedApprovalBroker,
         limits: CodexRuntimeLimits,
     ) -> Self {
@@ -414,6 +430,7 @@ impl CodexAppServerManager {
             .collect();
         Self {
             executors,
+            machines,
             approvals,
             limits,
             sessions: Mutex::new(HashMap::new()),
@@ -426,13 +443,24 @@ impl CodexAppServerManager {
         session_key: &str,
         executor: &str,
         cfg: &ExecutorConfig,
-        session_cwd: Option<&Path>,
+        router_workspace: Option<&Path>,
     ) -> anyhow::Result<(SharedCodexSession, bool)> {
         let key = (session_key.to_string(), executor.to_string());
-        let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
+        let prepared_command = self
+            .machines
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: &cfg.machine,
+                session_key,
+                router_workspace,
+                executor_cwd: cfg.cwd.as_deref(),
+                command: &cfg.command,
+                args: &cfg.args,
+                env: &cfg.env,
+            })
+            .await?;
         let existing = self.sessions.lock().await.get(&key).cloned();
         if let Some(existing) = existing {
-            let matches = existing.lock().await.matches(cfg, &cwd);
+            let matches = existing.lock().await.matches(cfg, &prepared_command.stdio);
             if matches {
                 return Ok((existing, false));
             }
@@ -440,7 +468,8 @@ impl CodexAppServerManager {
         let session = Arc::new(Mutex::new(
             CodexAppServerSession::start(
                 cfg.clone(),
-                cwd,
+                prepared_command.stdio,
+                prepared_command.workspace,
                 session_key.to_string(),
                 executor.to_string(),
                 self.approvals.clone(),
@@ -476,6 +505,7 @@ impl ExecutorBackend for CodexAppServerManager {
         self.executors.get(name).map(|cfg| ExecutorDescriptor {
             name: cfg.name.clone(),
             protocol: "app_server".to_string(),
+            machine_id: cfg.machine.clone(),
         })
     }
 
@@ -485,6 +515,7 @@ impl ExecutorBackend for CodexAppServerManager {
             .map(|cfg| ExecutorDescriptor {
                 name: cfg.name.clone(),
                 protocol: "app_server".to_string(),
+                machine_id: cfg.machine.clone(),
             })
             .collect()
     }
@@ -532,6 +563,9 @@ impl ExecutorBackend for CodexAppServerManager {
         Ok(PreparedExecutor {
             external_session_id: Some(thread_id),
             started_new_session,
+            machine_id: Some(session.machine_id().to_string()),
+            cwd: Some(session.cwd.clone()),
+            machine_workspace: session.workspace.clone(),
         })
     }
 
@@ -797,7 +831,9 @@ async fn clear_active_codex_turn(registration: &CodexTurnRegistration, stream_ge
 #[derive(Debug)]
 struct CodexAppServerSession {
     cfg: ExecutorConfig,
-    cwd: PathBuf,
+    stdio: StdioCommand,
+    cwd: String,
+    workspace: Option<MachineWorkspaceRecord>,
     client: CodexJsonRpcClient,
     session_key: String,
     executor: String,
@@ -811,7 +847,8 @@ struct CodexAppServerSession {
 impl CodexAppServerSession {
     async fn start(
         cfg: ExecutorConfig,
-        cwd: PathBuf,
+        stdio: StdioCommand,
+        workspace: Option<MachineWorkspaceRecord>,
         session_key: String,
         executor: String,
         approvals: SharedApprovalBroker,
@@ -820,19 +857,12 @@ impl CodexAppServerSession {
         tracing::info!(
             executor = %executor,
             session_key = %session_key,
-            command = %cfg.command,
-            cwd = %cwd.display(),
+            command = %stdio.program,
+            cwd = %stdio.executor_cwd,
             "starting Codex app-server process"
         );
-        let client = CodexJsonRpcClient::spawn(
-            &cfg.command,
-            &cfg.args,
-            &cwd,
-            &cfg.env,
-            session_key.clone(),
-            executor.clone(),
-        )
-        .await?;
+        let client =
+            CodexJsonRpcClient::spawn(&stdio, session_key.clone(), executor.clone()).await?;
         tracing::info!(
             executor = %executor,
             session_key = %session_key,
@@ -840,7 +870,9 @@ impl CodexAppServerSession {
         );
         Ok(Self {
             cfg,
-            cwd,
+            cwd: stdio.executor_cwd.clone(),
+            stdio,
+            workspace,
             client,
             session_key,
             executor,
@@ -852,11 +884,16 @@ impl CodexAppServerSession {
         })
     }
 
-    fn matches(&self, cfg: &ExecutorConfig, cwd: &Path) -> bool {
+    fn machine_id(&self) -> &str {
+        &self.cfg.machine
+    }
+
+    fn matches(&self, cfg: &ExecutorConfig, stdio: &StdioCommand) -> bool {
         self.cfg.command == cfg.command
             && self.cfg.args == cfg.args
             && self.cfg.env == cfg.env
-            && self.cwd == cwd
+            && self.cfg.machine == cfg.machine
+            && &self.stdio == stdio
             && self.client.is_alive()
     }
 
@@ -1538,6 +1575,7 @@ struct CodexLifecycleResponse {
 #[derive(Debug, Default)]
 struct JsonRpcState {
     closed: bool,
+    closed_reason: Option<String>,
     pending: HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>,
 }
 
@@ -1565,10 +1603,7 @@ impl CodexJsonRpcClientHandle {
 
 impl CodexJsonRpcClient {
     async fn spawn(
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-        env: &BTreeMap<String, String>,
+        stdio: &StdioCommand,
         session_key: String,
         executor: String,
     ) -> anyhow::Result<Self> {
@@ -1576,29 +1611,23 @@ impl CodexJsonRpcClient {
             target: "agent_router::codex_app_server",
             executor = %executor,
             session_key = %session_key,
-            command = %command,
-            arg_count = args.len(),
-            cwd = %cwd.display(),
+            command = %stdio.program,
+            arg_count = stdio.args.len(),
+            cwd = %stdio.executor_cwd,
             "spawning Codex app-server process"
         );
-        let mut cmd = Command::new(command);
-        cmd.args(args).current_dir(cwd);
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        cmd.kill_on_drop(true);
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().map_err(|err| {
-            anyhow::anyhow!("could not start codex app-server command `{command}`: {err}")
+        let mut child = stdio.spawn().map_err(|err| {
+            anyhow::anyhow!(
+                "could not start codex app-server command `{}`: {err}",
+                stdio.program
+            )
         })?;
         let pid = child.id();
         tracing::info!(
             target: "agent_router::codex_app_server",
             executor = %executor,
             session_key = %session_key,
-            command = %command,
+            command = %stdio.program,
             pid = ?pid,
             "spawned Codex app-server process"
         );
@@ -1626,6 +1655,7 @@ impl CodexJsonRpcClient {
             closed.clone(),
             session_key.clone(),
             executor.clone(),
+            stdio.strict_json_stdout,
         ));
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
@@ -1841,7 +1871,7 @@ async fn start_json_rpc_request(
     let (tx, rx) = oneshot::channel();
     {
         let mut state = state.lock().await;
-        anyhow::ensure!(!state.closed, "codex app-server stdout is closed");
+        ensure_stdout_open(&state)?;
         state.pending.insert(id, tx);
     }
     if let Err(err) = write_json(
@@ -1905,12 +1935,27 @@ async fn read_codex_stdout<R>(
     closed: broadcast::Sender<String>,
     session_key: String,
     executor: String,
+    strict_json_stdout: bool,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            if strict_json_stdout {
+                let reason = "codex app-server emitted non-JSON stdout before protocol handshake"
+                    .to_string();
+                tracing::warn!(
+                    target: "agent_router::codex_app_server",
+                    executor = %executor,
+                    session_key = %session_key,
+                    bytes = line.len(),
+                    "closing Codex app-server client after non-JSON stdout"
+                );
+                fail_all_pending(&state, &reason).await;
+                let _ = closed.send(reason);
+                return;
+            }
             tracing::debug!(
                 target: "agent_router::codex_app_server",
                 bytes = line.len(),
@@ -1976,11 +2021,25 @@ async fn fail_all_pending(state: &SharedJsonRpcState, message: &str) {
     let drained = {
         let mut guard = state.lock().await;
         guard.closed = true;
+        guard.closed_reason = Some(message.to_string());
         guard.pending.drain().collect::<Vec<_>>()
     };
     for (_, tx) in drained {
         let _ = tx.send(Err(anyhow::anyhow!("{message}")));
     }
+}
+
+fn ensure_stdout_open(state: &JsonRpcState) -> anyhow::Result<()> {
+    if state.closed {
+        anyhow::bail!(
+            "{}",
+            state
+                .closed_reason
+                .as_deref()
+                .unwrap_or("codex app-server stdout is closed")
+        );
+    }
+    Ok(())
 }
 
 async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
@@ -2367,14 +2426,6 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn resolve_cwd(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let path = match cwd {
-        Some(cwd) => cwd.to_path_buf(),
-        None => std::env::current_dir()?,
-    };
-    Ok(path.canonicalize().unwrap_or(path))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
@@ -2407,6 +2458,7 @@ mod tests {
             ExecutorConfig {
                 name: "codex".to_string(),
                 protocol: ExecutorProtocol::AppServer,
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
                 command: "python3".to_string(),
                 args: vec![script.display().to_string()],
                 cwd: Some(cwd.to_path_buf()),
@@ -3971,6 +4023,7 @@ for line in sys.stdin:
         );
         let manager = CodexAppServerManager::with_limits(
             executor_config(&script, tmp.path()),
+            crate::machine::MachineRegistry::local_default(),
             Arc::new(ApprovalBroker::default()),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_millis(50),
@@ -4023,6 +4076,7 @@ for line in sys.stdin:
         );
         let manager = CodexAppServerManager::with_limits(
             executor_config(&script, tmp.path()),
+            crate::machine::MachineRegistry::local_default(),
             Arc::new(ApprovalBroker::new(Duration::from_secs(5))),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_millis(100),
@@ -4079,6 +4133,7 @@ for line in sys.stdin:
         );
         let manager = CodexAppServerManager::with_limits(
             executor_config(&script, tmp.path()),
+            crate::machine::MachineRegistry::local_default(),
             Arc::new(ApprovalBroker::new(Duration::from_secs(5))),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_millis(100),
@@ -4156,6 +4211,7 @@ for line in sys.stdin:
         let mut prompts = approvals.subscribe();
         let manager = Arc::new(CodexAppServerManager::with_limits(
             executor_config(&script, tmp.path()),
+            crate::machine::MachineRegistry::local_default(),
             approvals.clone(),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_secs(5),
@@ -4232,6 +4288,7 @@ for line in sys.stdin:
         );
         let manager = CodexAppServerManager::with_limits(
             executor_config(&script, tmp.path()),
+            crate::machine::MachineRegistry::local_default(),
             Arc::new(ApprovalBroker::default()),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_millis(50),
@@ -4273,6 +4330,7 @@ for line in sys.stdin:
         write_fake_codex_script(&script, "");
         let manager = CodexAppServerManager::with_limits(
             executor_config(&script, tmp.path()),
+            crate::machine::MachineRegistry::local_default(),
             Arc::new(ApprovalBroker::default()),
             CodexRuntimeLimits {
                 rpc_timeout: Duration::from_secs(1),
