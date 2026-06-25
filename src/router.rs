@@ -977,9 +977,7 @@ where
                 let committed_failure = {
                     let lock = self.session_lock(&session_key).await;
                     let _guard = lock.lock().await;
-                    if !turn.finish_if_current().await {
-                        false
-                    } else {
+                    turn.commit_if_current(|| async {
                         let mut latest = self
                             .store
                             .load_or_create(&session_key, &self.default_executor)
@@ -994,8 +992,9 @@ where
                             },
                         );
                         self.store.save(latest).await;
-                        true
-                    }
+                    })
+                    .await
+                    .is_some()
                 };
                 if !committed_failure {
                     tracing::debug!(
@@ -1074,9 +1073,7 @@ where
                 let committed = {
                     let lock = self.session_lock(&session_key).await;
                     let _guard = lock.lock().await;
-                    if !turn.finish_if_current().await {
-                        false
-                    } else {
+                    turn.commit_if_current(|| async {
                         let mut latest = self
                             .store
                             .load_or_create(&session_key, &self.default_executor)
@@ -1096,8 +1093,9 @@ where
                             ),
                         );
                         self.store.save(latest).await;
-                        true
-                    }
+                    })
+                    .await
+                    .is_some()
                 };
                 if !committed {
                     tracing::debug!(
@@ -1132,9 +1130,7 @@ where
                 let committed_failure = {
                     let lock = self.session_lock(&session_key).await;
                     let _guard = lock.lock().await;
-                    if !turn.finish_if_current().await {
-                        false
-                    } else {
+                    turn.commit_if_current(|| async {
                         let mut latest = self
                             .store
                             .load_or_create(&session_key, &self.default_executor)
@@ -1150,8 +1146,9 @@ where
                             ),
                         );
                         self.store.save(latest).await;
-                        true
-                    }
+                    })
+                    .await
+                    .is_some()
                 };
                 if !committed_failure {
                     tracing::debug!(
@@ -4021,6 +4018,180 @@ mod tests {
                 .transcript
                 .iter()
                 .any(|message| message.content == "first")
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum StaleFirstOutcome {
+        Completed,
+        Failed,
+    }
+
+    struct StaleOutcomeExecutorBackend {
+        outcome: StaleFirstOutcome,
+        prompts: tokio::sync::Mutex<Vec<String>>,
+        first_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        first_finished: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl StaleOutcomeExecutorBackend {
+        fn new(
+            outcome: StaleFirstOutcome,
+            first_started: tokio::sync::oneshot::Sender<()>,
+            first_finished: tokio::sync::oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                outcome,
+                prompts: tokio::sync::Mutex::new(Vec::new()),
+                first_started: tokio::sync::Mutex::new(Some(first_started)),
+                first_finished: tokio::sync::Mutex::new(Some(first_finished)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for StaleOutcomeExecutorBackend {
+        fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+            (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "fake".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+            Ok(crate::executor::PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
+                started_new_session: request.previous_session_id.is_none(),
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let prompt_index = {
+                let mut prompts = self.prompts.lock().await;
+                prompts.push(request.prompt);
+                prompts.len()
+            };
+            if prompt_index == 1 {
+                if let Some(started) = self.first_started.lock().await.take() {
+                    let _ = started.send(());
+                }
+                let _ = cancel.cancelled().await;
+                if let Some(finished) = self.first_finished.lock().await.take() {
+                    let _ = finished.send(());
+                }
+                return match self.outcome {
+                    StaleFirstOutcome::Completed => {
+                        ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
+                            final_text: "stale response".to_string(),
+                        })
+                    }
+                    StaleFirstOutcome::Failed => {
+                        ExecutorPromptOutcome::Failed(anyhow::anyhow!("stale failure"))
+                    }
+                };
+            }
+            ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
+                final_text: "fresh response".to_string(),
+            })
+        }
+    }
+
+    async fn run_stale_first_outcome_test(outcome: StaleFirstOutcome) -> SessionState {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(StaleOutcomeExecutorBackend::new(
+            outcome,
+            started_tx,
+            finished_tx,
+        ));
+        let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor));
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .ok();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut second_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                &mut second_output,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = first.await.unwrap();
+
+        assert!(first_output.events.is_empty());
+        assert_eq!(second_output.final_reply(), "fresh response");
+        store.load_or_create("slack:C1:T1", "kimi").await
+    }
+
+    #[tokio::test]
+    async fn stale_successful_turn_cannot_commit_after_replacement() {
+        let saved = run_stale_first_outcome_test(StaleFirstOutcome::Completed).await;
+
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[0].content, "second");
+        assert!(saved.transcript[1].content.contains("fresh response"));
+        assert!(
+            !saved
+                .transcript
+                .iter()
+                .any(|message| message.content.contains("stale response"))
+        );
+        assert_eq!(
+            saved.executor_bindings["kimi"].health,
+            ExecutorHealth::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_failed_turn_cannot_mark_binding_unhealthy_after_replacement() {
+        let saved = run_stale_first_outcome_test(StaleFirstOutcome::Failed).await;
+
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[0].content, "second");
+        assert_eq!(
+            saved.executor_bindings["kimi"].health,
+            ExecutorHealth::Healthy
         );
     }
 

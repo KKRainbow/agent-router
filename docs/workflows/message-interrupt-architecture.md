@@ -797,22 +797,25 @@ Remaining work:
 Already present:
 
 - success, cancellation, and stale paths use `TurnGuard` currentness checks;
+- successful Turn commits and failure-to-unhealthy binding commits now run
+  through `TurnGuard::commit_if_current()`;
 - old Turn events and final replies are gated against currentness;
 - route errors clear reserved placeholder Turns instead of leaving stale active
   records.
 
 Remaining work:
 
-- replace remaining manual commit sequencing with typed `TurnGuard` operations;
+- move cancellation cleanup and remaining context commit sequencing behind typed
+  `TurnGuard` operations;
 - separate the Turn Runner from command/intake code;
-- make failure-to-unhealthy binding updates require a current `TurnGuard`;
 - centralize stream event and final reply projection in one Turn-scoped output
   Module.
 
 Required tests:
 
-- old successful Turn cannot commit after replacement;
-- old failed Turn cannot mark Executor Binding unhealthy after replacement;
+- old successful Turn cannot commit after replacement `[covered]`;
+- old failed Turn cannot mark Executor Binding unhealthy after replacement
+  `[covered]`;
 - old stream events are dropped after replacement;
 - final reply belongs to the latest Turn only;
 - route validation failures never create ghost active Turns.

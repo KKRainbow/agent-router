@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -227,6 +228,17 @@ impl TurnGuard {
             .discard_if_current(&self.session_key, self.generation)
             .await
     }
+
+    pub(crate) async fn commit_if_current<F, Fut, T>(&self, commit: F) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        if !self.finish_if_current().await {
+            return None;
+        }
+        Some(commit().await)
+    }
 }
 
 impl InterruptedTurn {
@@ -293,6 +305,48 @@ mod tests {
         assert!(!stale.finish_if_current().await);
         assert!(current.finish_if_current().await);
         assert!(!turns.has_current("session").await);
+    }
+
+    #[tokio::test]
+    async fn stale_guard_cannot_run_commit() {
+        let turns = TurnRegistry::new();
+        let stale = turns.begin("session", "kimi".to_string()).await.guard;
+        let current = turns.begin("session", "kimi".to_string()).await.guard;
+        let committed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let result = stale
+            .commit_if_current({
+                let committed = committed.clone();
+                || async move {
+                    committed.lock().await.push("stale");
+                }
+            })
+            .await;
+
+        assert!(result.is_none());
+        assert!(committed.lock().await.is_empty());
+        assert!(current.finish_if_current().await);
+    }
+
+    #[tokio::test]
+    async fn current_guard_runs_commit_once() {
+        let turns = TurnRegistry::new();
+        let current = turns.begin("session", "kimi".to_string()).await.guard;
+        let committed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let result = current
+            .commit_if_current({
+                let committed = committed.clone();
+                || async move {
+                    committed.lock().await.push("current");
+                    7
+                }
+            })
+            .await;
+
+        assert_eq!(result, Some(7));
+        assert_eq!(*committed.lock().await, vec!["current"]);
+        assert!(!current.finish_if_current().await);
     }
 
     #[tokio::test]
