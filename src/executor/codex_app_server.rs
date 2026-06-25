@@ -444,6 +444,7 @@ impl CodexAppServerManager {
         executor: &str,
         cfg: &ExecutorConfig,
         router_workspace: Option<&Path>,
+        cancel: &TurnCancellation,
     ) -> anyhow::Result<(SharedCodexSession, bool)> {
         let key = (session_key.to_string(), executor.to_string());
         let prepared_command = self
@@ -456,6 +457,7 @@ impl CodexAppServerManager {
                 command: &cfg.command,
                 args: &cfg.args,
                 env: &cfg.env,
+                cancel: Some(cancel),
             })
             .await?;
         let existing = self.sessions.lock().await.get(&key).cloned();
@@ -543,6 +545,7 @@ impl ExecutorBackend for CodexAppServerManager {
                 &request.turn.executor,
                 cfg,
                 request.cwd.as_deref(),
+                &cancel,
             )
             .await?;
         if cancel.is_cancelled().await {
@@ -1963,6 +1966,21 @@ async fn read_codex_stdout<R>(
             );
             continue;
         };
+        if strict_json_stdout && !is_json_rpc_like(&message) {
+            let reason =
+                "codex app-server emitted non-protocol JSON stdout before protocol handshake"
+                    .to_string();
+            tracing::warn!(
+                target: "agent_router::codex_app_server",
+                executor = %executor,
+                session_key = %session_key,
+                bytes = line.len(),
+                "closing Codex app-server client after non-protocol JSON stdout"
+            );
+            fail_all_pending(&state, &reason).await;
+            let _ = closed.send(reason);
+            return;
+        }
         dispatch_codex_message(message, &state, &event_streams).await;
     }
     tracing::warn!(
@@ -2040,6 +2058,10 @@ fn ensure_stdout_open(state: &JsonRpcState) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_json_rpc_like(message: &Value) -> bool {
+    message.get("method").is_some() || message.get("id").is_some()
 }
 
 async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {

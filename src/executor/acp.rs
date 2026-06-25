@@ -178,6 +178,7 @@ impl AcpBackendSessionManager {
                     command: &cfg.command,
                     args: &cfg.args,
                     env: &cfg.env,
+                    cancel: Some(cancel),
                 })
                 .await?;
             let existing = self.sessions.lock().await.get(&key).cloned();
@@ -1265,6 +1266,19 @@ async fn read_stdout<R>(
             tracing::debug!(target: "agent_router::acp", raw_stdout = %line, "ignoring non-json ACP stdout");
             continue;
         };
+        if strict_json_stdout && !is_json_rpc_like(&message) {
+            let reason = "ACP process emitted non-protocol JSON stdout before protocol handshake"
+                .to_string();
+            tracing::warn!(
+                target: "agent_router::acp",
+                executor = %context.executor,
+                session_key = %context.session_key,
+                raw_stdout = %line,
+                "closing ACP client after non-protocol JSON stdout"
+            );
+            fail_all_pending(&context.state, &context.cancel_barrier, &reason).await;
+            return;
+        }
         dispatch_message(message, &context).await;
     }
     tracing::warn!(
@@ -1312,6 +1326,10 @@ fn ensure_stdout_open(state: &JsonRpcState) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_json_rpc_like(message: &Value) -> bool {
+    message.get("method").is_some() || message.get("id").is_some()
 }
 
 async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {

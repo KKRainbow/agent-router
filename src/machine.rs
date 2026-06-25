@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,10 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
+    sync::Mutex,
 };
+
+use crate::executor::TurnCancellation;
 
 pub const LOCAL_MACHINE_ID: &str = "local";
 
@@ -30,9 +34,10 @@ pub enum MachineKind {
     Ssh,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MachineRegistry {
     machines: BTreeMap<String, MachineConfig>,
+    materialization_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +49,7 @@ pub struct MachinePrepareRequest<'a> {
     pub command: &'a str,
     pub args: &'a [String],
     pub env: &'a BTreeMap<String, String>,
+    pub cancel: Option<&'a TurnCancellation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +101,10 @@ impl MachineRegistry {
         machines
             .entry(LOCAL_MACHINE_ID.to_string())
             .or_insert_with(local_machine_config);
-        Self { machines }
+        Self {
+            machines,
+            materialization_locks: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     pub fn local_default() -> Self {
@@ -117,11 +126,12 @@ impl MachineRegistry {
         &self,
         request: MachinePrepareRequest<'_>,
     ) -> anyhow::Result<PreparedMachineCommand> {
+        ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
         let machine = self
             .get(request.machine_id)
             .ok_or_else(|| anyhow::anyhow!("machine `{}` is not configured", request.machine_id))?;
         match machine.kind {
-            MachineKind::Local => self.prepare_local_command(machine, request),
+            MachineKind::Local => self.prepare_local_command(machine, request).await,
             MachineKind::Ssh => self.prepare_ssh_command(machine, request).await,
         }
     }
@@ -137,7 +147,7 @@ impl MachineRegistry {
         skills
     }
 
-    fn prepare_local_command(
+    async fn prepare_local_command(
         &self,
         machine: &MachineConfig,
         request: MachinePrepareRequest<'_>,
@@ -154,10 +164,15 @@ impl MachineRegistry {
         let materialization = if let (Some(router_workspace), Some(workspace)) =
             (request.router_workspace, workspace.as_ref())
         {
+            let lock = self
+                .materialization_lock(&machine.id, request.session_key)
+                .await;
+            let _guard = lock.lock().await;
+            ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
             let router_workspace = canonicalize_lossy(router_workspace);
             let workspace = canonicalize_lossy(workspace);
             if router_workspace != workspace {
-                copy_workspace_contents(&router_workspace, &workspace)?;
+                sync_workspace_contents(&router_workspace, &workspace)?;
                 MachineWorkspaceMaterialization::Materialized
             } else {
                 MachineWorkspaceMaterialization::NotNeeded
@@ -165,6 +180,7 @@ impl MachineRegistry {
         } else {
             MachineWorkspaceMaterialization::NotNeeded
         };
+        ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
         let artifact_fingerprint = request
             .router_workspace
@@ -207,17 +223,24 @@ impl MachineRegistry {
             .ok_or_else(|| anyhow::anyhow!("ssh machine `{}` has no workspace_root", machine.id))?;
         let remote_cwd = join_remote_path(root, &session_workspace_dir_name(request.session_key));
         ensure_ssh_workspace(host, &remote_cwd).await?;
+        ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
         let artifact_fingerprint = request
             .router_workspace
             .map(workspace_fingerprint)
             .transpose()?;
         let materialization = if let Some(router_workspace) = request.router_workspace {
+            let lock = self
+                .materialization_lock(&machine.id, request.session_key)
+                .await;
+            let _guard = lock.lock().await;
+            ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
             materialize_ssh_workspace(host, router_workspace, &remote_cwd).await?;
             MachineWorkspaceMaterialization::Materialized
         } else {
             MachineWorkspaceMaterialization::NotNeeded
         };
+        ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
         let remote_env = layered_env(&machine.env, request.env);
         let remote_script =
@@ -232,6 +255,15 @@ impl MachineRegistry {
             }),
             stdio: ssh_stdio_command(host, remote_script, remote_cwd),
         })
+    }
+
+    async fn materialization_lock(&self, machine_id: &str, session_key: &str) -> Arc<Mutex<()>> {
+        let key = format!("{machine_id}:{}", session_workspace_dir_name(session_key));
+        let mut locks = self.materialization_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -348,7 +380,7 @@ fn layered_env(
 async fn ensure_ssh_workspace(host: &str, remote_cwd: &str) -> anyhow::Result<()> {
     let remote_command = format!("mkdir -p -- {}", shell_quote(remote_cwd));
     let status = Command::new("ssh")
-        .args(["-T", host, remote_command.as_str()])
+        .args(ssh_remote_args(host, &remote_command))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -383,9 +415,13 @@ async fn materialize_ssh_workspace(
     let mut tar_stdout = tar.stdout.take().ok_or_else(|| {
         anyhow::anyhow!("workspace materialization archive did not expose stdout")
     })?;
-    let remote_command = format!("tar xf - -C {}", shell_quote(remote_cwd));
+    let remote_command = format!(
+        "find {} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + && tar xf - -C {}",
+        shell_quote(remote_cwd),
+        shell_quote(remote_cwd)
+    );
     let mut ssh = Command::new("ssh")
-        .args(["-T", host, remote_command.as_str()])
+        .args(ssh_remote_args(host, &remote_command))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -470,7 +506,7 @@ async fn list_remote_skill_paths(host: &str, root: &str) -> anyhow::Result<Vec<S
         shell_quote(root)
     );
     let output = Command::new("ssh")
-        .args(["-T", host, "sh", "-lc", script.as_str()])
+        .args(ssh_remote_args(host, &script))
         .stdin(Stdio::null())
         .output()
         .await
@@ -495,7 +531,7 @@ async fn read_remote_skill(host: &str, root: &str, relative_path: &str) -> anyho
     let skill_file = join_remote_path(&skill_path, "SKILL.md");
     let script = format!("cat -- {}", shell_quote(&skill_file));
     let output = Command::new("ssh")
-        .args(["-T", host, "sh", "-lc", script.as_str()])
+        .args(ssh_remote_args(host, &script))
         .stdin(Stdio::null())
         .output()
         .await
@@ -509,8 +545,24 @@ async fn read_remote_skill(host: &str, root: &str, relative_path: &str) -> anyho
         .map_err(|err| anyhow::anyhow!("remote skill `{skill_file}` was not utf-8: {err}"))
 }
 
-fn copy_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<()> {
+fn sync_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<()> {
     ensure_dir_path_without_symlinks(destination)?;
+    let mut source_names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(source)
+        .map_err(|err| anyhow::anyhow!("read router workspace {}: {err}", source.display()))?
+    {
+        let entry = entry?;
+        source_names.insert(entry.file_name());
+    }
+    for entry in std::fs::read_dir(destination)
+        .map_err(|err| anyhow::anyhow!("read machine workspace {}: {err}", destination.display()))?
+    {
+        let entry = entry?;
+        if source_names.contains(&entry.file_name()) {
+            continue;
+        }
+        remove_workspace_entry(&entry.path())?;
+    }
     for entry in std::fs::read_dir(source)
         .map_err(|err| anyhow::anyhow!("read router workspace {}: {err}", source.display()))?
     {
@@ -525,8 +577,20 @@ fn copy_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<
             );
         }
         if metadata.is_dir() {
-            copy_workspace_contents(&source_path, &destination_path)?;
+            if let Some(destination_metadata) = symlink_metadata_optional(&destination_path)? {
+                let destination_is_plain_dir =
+                    destination_metadata.is_dir() && !destination_metadata.file_type().is_symlink();
+                if !destination_is_plain_dir {
+                    remove_workspace_entry(&destination_path)?;
+                }
+            }
+            sync_workspace_contents(&source_path, &destination_path)?;
         } else if metadata.is_file() {
+            if let Some(destination_metadata) = symlink_metadata_optional(&destination_path)?
+                && (destination_metadata.is_dir() || destination_metadata.file_type().is_symlink())
+            {
+                remove_workspace_entry(&destination_path)?;
+            }
             std::fs::copy(&source_path, &destination_path).map_err(|err| {
                 anyhow::anyhow!(
                     "copy workspace file {} to {}: {err}",
@@ -542,6 +606,28 @@ fn copy_workspace_contents(source: &Path, destination: &Path) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+fn symlink_metadata_optional(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::anyhow!(
+            "stat workspace entry {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn remove_workspace_entry(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+            .map_err(|err| anyhow::anyhow!("remove stale workspace dir {}: {err}", path.display()))
+    } else {
+        std::fs::remove_file(path)
+            .map_err(|err| anyhow::anyhow!("remove stale workspace file {}: {err}", path.display()))
+    }
 }
 
 fn workspace_fingerprint(root: &Path) -> anyhow::Result<String> {
@@ -657,13 +743,7 @@ fn join_remote_path(root: &str, child: &str) -> String {
 fn ssh_stdio_command(host: &str, remote_script: String, remote_cwd: String) -> StdioCommand {
     StdioCommand {
         program: "ssh".to_string(),
-        args: vec![
-            "-T".to_string(),
-            host.to_string(),
-            "sh".to_string(),
-            "-lc".to_string(),
-            remote_script,
-        ],
+        args: ssh_remote_args(host, &remote_script),
         current_dir: None,
         env: BTreeMap::new(),
         env_remove: Vec::new(),
@@ -672,11 +752,35 @@ fn ssh_stdio_command(host: &str, remote_script: String, remote_cwd: String) -> S
     }
 }
 
+fn ssh_remote_args(host: &str, script: &str) -> Vec<String> {
+    vec![
+        "-T".to_string(),
+        host.to_string(),
+        remote_shell_command(script),
+    ]
+}
+
+fn remote_shell_command(script: &str) -> String {
+    format!("sh -lc {}", shell_quote(script))
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+async fn ensure_not_cancelled(
+    cancel: Option<&TurnCancellation>,
+    message: &'static str,
+) -> anyhow::Result<()> {
+    if let Some(cancel) = cancel
+        && cancel.is_cancelled().await
+    {
+        anyhow::bail!(message);
+    }
+    Ok(())
 }
 
 fn shell_quote_env_value(value: &str) -> String {
@@ -812,6 +916,10 @@ mod tests {
         let stdio = ssh_stdio_command("admin@example", script, "/remote/work/session".to_string());
         assert_eq!(stdio.program, "ssh");
         assert_eq!(stdio.args[0], "-T");
+        assert_eq!(stdio.args[1], "admin@example");
+        assert_eq!(stdio.args.len(), 3);
+        assert!(stdio.args[2].starts_with("sh -lc '"));
+        assert!(stdio.args[2].contains("cd --"));
         assert!(!stdio.args.iter().any(|arg| arg == "-t" || arg == "-tt"));
         assert_eq!(stdio.executor_cwd, "/remote/work/session");
         assert!(stdio.strict_json_stdout);
@@ -824,6 +932,9 @@ mod tests {
         let machine_root = tmp.path().join("machine");
         std::fs::create_dir_all(router_workspace.join("slack")).unwrap();
         std::fs::write(router_workspace.join("slack/current-thread.md"), "thread").unwrap();
+        let stale_workspace = machine_root.join(session_workspace_dir_name("session-1"));
+        std::fs::create_dir_all(stale_workspace.join("slack")).unwrap();
+        std::fs::write(stale_workspace.join("slack/old.md"), "old").unwrap();
         let registry = MachineRegistry::new(BTreeMap::from([(
             "local".to_string(),
             MachineConfig {
@@ -846,6 +957,7 @@ mod tests {
                 command: "agent",
                 args: &[],
                 env: &executor_env,
+                cancel: None,
             })
             .await
             .unwrap();
@@ -860,6 +972,7 @@ mod tests {
                 .join("slack/current-thread.md")
                 .is_file()
         );
+        assert!(!Path::new(&workspace.cwd).join("slack/old.md").exists());
         assert_eq!(prepared.stdio.env["A"], "executor");
     }
 

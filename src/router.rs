@@ -974,6 +974,9 @@ where
                     );
                     return Ok(());
                 }
+                let failure_cwd = (descriptor.machine_id == crate::machine::LOCAL_MACHINE_ID)
+                    .then(|| session_cwd.as_ref().map(|cwd| cwd.display().to_string()))
+                    .flatten();
                 let committed_failure = {
                     let lock = self.session_lock(&session_key).await;
                     let _guard = lock.lock().await;
@@ -989,13 +992,7 @@ where
                                 protocol: descriptor.protocol.clone(),
                                 machine_id: Some(descriptor.machine_id.clone()),
                                 health: ExecutorHealth::Unhealthy,
-                                ..binding_with_executor_cwd(
-                                    latest_binding,
-                                    session_cwd
-                                        .as_ref()
-                                        .map(|cwd| cwd.display().to_string())
-                                        .as_deref(),
-                                )
+                                ..binding_with_executor_cwd(latest_binding, failure_cwd.as_deref())
                             },
                         );
                         self.store.save(latest).await;
@@ -2363,6 +2360,69 @@ mod tests {
             workspace.materialization,
             crate::machine::MachineWorkspaceMaterialization::Materialized
         );
+    }
+
+    #[tokio::test]
+    async fn remote_prepare_failure_does_not_store_router_workspace_as_executor_cwd() {
+        #[derive(Debug)]
+        struct FailingRemoteBackend;
+
+        #[async_trait::async_trait]
+        impl ExecutorBackend for FailingRemoteBackend {
+            fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+                (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                    name: "kimi".to_string(),
+                    protocol: "fake".to_string(),
+                    machine_id: "remote-dev".to_string(),
+                })
+            }
+
+            fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+                self.get("kimi").into_iter().collect()
+            }
+
+            async fn prepare(
+                &self,
+                _request: ExecutorPrepareRequest,
+                _cancel: TurnCancellation,
+            ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+                anyhow::bail!("remote prepare failed")
+            }
+
+            async fn prompt(
+                &self,
+                _request: ExecutorPromptRequest,
+                _events: &mut dyn ExecutorEventSink,
+                _cancel: TurnCancellation,
+            ) -> ExecutorPromptOutcome {
+                unreachable!("prepare failed")
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let router = AgentRouter::new("kimi", store.clone(), Arc::new(FailingRemoteBackend))
+            .with_workspace_root(Some(tmp.path().join("router-workspaces")));
+        let mut output = CollectingRouterOutputSink::default();
+
+        let err = router
+            .handle(
+                RouterInput {
+                    session_key: "session-a".to_string(),
+                    text: "hello".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "remote prepare failed");
+        let saved = store.load_or_create("session-a", "kimi").await;
+        let binding = &saved.executor_bindings["kimi"];
+        assert_eq!(binding.machine_id.as_deref(), Some("remote-dev"));
+        assert_eq!(binding.cwd, None);
+        assert_eq!(binding.health, ExecutorHealth::Unhealthy);
     }
 
     #[cfg(unix)]

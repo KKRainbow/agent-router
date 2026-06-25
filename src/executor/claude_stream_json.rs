@@ -469,6 +469,7 @@ impl ClaudeStreamJsonManager {
         cfg: &ExecutorConfig,
         router_workspace: Option<&Path>,
         previous_session_id: Option<String>,
+        cancel: &TurnCancellation,
     ) -> anyhow::Result<SharedClaudeSession> {
         let key = (session_key.to_string(), executor.to_string());
         let args = claude_stream_json_args(&cfg.args, previous_session_id.as_deref());
@@ -482,6 +483,7 @@ impl ClaudeStreamJsonManager {
                 command: &cfg.command,
                 args: &args,
                 env: &cfg.env,
+                cancel: Some(cancel),
             })
             .await?;
         prepared_command
@@ -576,6 +578,7 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
                 cfg,
                 request.cwd.as_deref(),
                 previous_session_id.clone(),
+                &cancel,
             )
             .await?;
         if cancel.is_cancelled().await {
@@ -587,10 +590,18 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
                 if cancel.is_cancelled().await {
                     anyhow::bail!("Claude stream-json prepare cancelled");
                 }
-                let id = session.lock().await.session_id().await;
+                let session = session.lock().await;
+                let id = session.session_id().await;
                 if id.is_some() || Instant::now() >= deadline {
                     break id;
                 }
+                if !session.is_alive() {
+                    let reason = session.closed_reason().await.unwrap_or_else(|| {
+                        "Claude stream-json process closed before session id".to_string()
+                    });
+                    anyhow::bail!(reason);
+                }
+                drop(session);
                 sleep(Duration::from_millis(10)).await;
             }
         };
@@ -702,6 +713,7 @@ pub struct ClaudeSession {
     session_key: String,
     executor: String,
     alive: Arc<AtomicBool>,
+    closed_reason: Arc<Mutex<Option<String>>>,
     pending_approvals: Arc<Mutex<HashMap<String, ApprovalCancellation>>>,
     _shutdown_tx: oneshot::Sender<()>,
 }
@@ -729,6 +741,7 @@ impl ClaudeSession {
         let active_user_id = Arc::new(Mutex::new(None));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));
+        let closed_reason = Arc::new(Mutex::new(None));
         let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(read_stdout(
@@ -743,8 +756,10 @@ impl ClaudeSession {
             stdin.clone(),
             child.clone(),
             alive.clone(),
+            closed_reason.clone(),
             pending_approvals.clone(),
             shutdown_rx,
+            stdio.strict_json_stdout,
         ));
 
         Ok(Self {
@@ -761,6 +776,7 @@ impl ClaudeSession {
             session_key,
             executor,
             alive,
+            closed_reason,
             pending_approvals,
             _shutdown_tx: shutdown_tx,
         })
@@ -776,6 +792,10 @@ impl ClaudeSession {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    pub async fn closed_reason(&self) -> Option<String> {
+        self.closed_reason.lock().await.clone()
     }
 
     pub fn machine_id(&self) -> &str {
@@ -909,8 +929,10 @@ async fn read_stdout<R, E>(
     stdin: SharedStdin,
     child: Arc<Mutex<Child>>,
     alive: Arc<AtomicBool>,
+    closed_reason: Arc<Mutex<Option<String>>>,
     pending_approvals: Arc<Mutex<HashMap<String, ApprovalCancellation>>>,
     mut shutdown: oneshot::Receiver<()>,
+    strict_json_stdout: bool,
 ) where
     R: AsyncBufReadExt + Unpin,
     E: AsyncBufReadExt + Unpin,
@@ -931,7 +953,7 @@ async fn read_stdout<R, E>(
                     Ok(0) => break,
                     Ok(_) => {
                         let user_id = active_user_id.lock().await.clone();
-                        handle_event_line(
+                        let handled = handle_event_line(
                             &stdout_line,
                             updates.clone(),
                             &session_id,
@@ -943,6 +965,18 @@ async fn read_stdout<R, E>(
                             &pending_approvals,
                         )
                         .await;
+                        if strict_json_stdout && !handled {
+                            let reason = "Claude stream-json emitted non-protocol stdout before session handshake".to_string();
+                            tracing::warn!(
+                                target: "agent_router::claude",
+                                executor = %executor,
+                                session_key = %session_key,
+                                bytes = stdout_line.len(),
+                                "closing Claude stream-json after non-protocol stdout"
+                            );
+                            *closed_reason.lock().await = Some(reason);
+                            break;
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(target: "agent_router::claude", error = %err, "stdout read error");
@@ -987,9 +1021,9 @@ async fn handle_event_line(
     user_id: Option<String>,
     stdin: &SharedStdin,
     pending_approvals: &Arc<Mutex<HashMap<String, ApprovalCancellation>>>,
-) {
+) -> bool {
     let Some(event) = parse_event_line(line) else {
-        return;
+        return false;
     };
 
     if let ClaudeEvent::System { session_id: id, .. } | ClaudeEvent::Result { session_id: id, .. } =
@@ -1015,7 +1049,7 @@ async fn handle_event_line(
                     subtype = ?subtype,
                     "ignoring non-tool control request"
                 );
-                return;
+                return true;
             }
             let approval_req = build_approval_request(
                 session_key,
@@ -1089,6 +1123,7 @@ async fn handle_event_line(
             }
         }
     }
+    true
 }
 
 fn build_approval_request(
