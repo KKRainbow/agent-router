@@ -446,6 +446,8 @@ Slack app scopes 需要覆盖当前部署的 channel 类型。至少需要：
 
 - thread/history 读取相关 scopes，例如 public channel、private channel、DM、MPIM 对应
   history scopes。
+- user profile 读取所需的 `users:read`，用于通过 `users.info` 把 message user id
+  解析成可读作者名。
 - file metadata/download 所需的 file read scope。
 
 实际 scope 名称应以 Slack 官方文档和 app 当前安装方式为准。添加 scope 后需要重新

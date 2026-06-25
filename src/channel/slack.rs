@@ -1034,7 +1034,81 @@ impl SlackSocketModeChannel {
                 break;
             }
         }
+        self.resolve_thread_message_authors(&mut messages).await;
         Ok(messages)
+    }
+
+    async fn resolve_thread_message_authors(&self, messages: &mut [SlackThreadMessage]) {
+        let user_ids = messages
+            .iter()
+            .filter(|message| message.author_name.is_none())
+            .filter_map(|message| message.user.as_deref())
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        if user_ids.is_empty() {
+            return;
+        }
+
+        let mut resolved = BTreeMap::new();
+        let mut missing = Vec::new();
+        {
+            let cache = self.context_cache.lock().await;
+            for user_id in user_ids {
+                if let Some(name) = cache.user_names.get(&user_id) {
+                    resolved.insert(user_id, name.clone());
+                } else {
+                    missing.push(user_id);
+                }
+            }
+        }
+
+        let mut fetched = BTreeMap::new();
+        for user_id in missing {
+            match self.fetch_user_display_name(&user_id).await {
+                Ok(Some(name)) => {
+                    fetched.insert(user_id.clone(), name.clone());
+                    resolved.insert(user_id, name);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::info!(
+                        user_id = %user_id,
+                        reason = %context_error_reason(&err),
+                        "failed to resolve Slack user display name"
+                    );
+                }
+            }
+        }
+        if !fetched.is_empty() {
+            let mut cache = self.context_cache.lock().await;
+            cache.user_names.extend(fetched);
+        }
+
+        apply_slack_user_author_names(messages, &resolved);
+    }
+
+    async fn fetch_user_display_name(&self, user_id: &str) -> anyhow::Result<Option<String>> {
+        let response = self
+            .http
+            .get("https://slack.com/api/users.info")
+            .bearer_auth(&self.cfg.bot_token)
+            .query(&[("user", user_id)])
+            .send()
+            .await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(SlackApiError::new("users.info", "rate_limited").into());
+        }
+        let response = response.json::<SlackUserInfoResponse>().await?;
+        if !response.ok {
+            return Err(SlackApiError::new(
+                "users.info",
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        Ok(response.user.as_ref().and_then(slack_user_display_name))
     }
 
     async fn download_slack_file(&self, file: SlackFileRef) -> anyhow::Result<DownloadedSlackFile> {
@@ -1186,6 +1260,7 @@ impl SlackSocketModeChannel {
 struct SlackContextCache {
     latest_context_generations: BTreeMap<String, u64>,
     threads: BTreeMap<String, CachedSlackThreadMessages>,
+    user_names: BTreeMap<String, String>,
     synced_files: BTreeSet<String>,
     failed_files: BTreeSet<String>,
 }
@@ -1610,6 +1685,13 @@ struct SlackFileInfoResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct SlackUserInfoResponse {
+    ok: bool,
+    user: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SlackResponseMetadata {
     next_cursor: Option<String>,
 }
@@ -1718,6 +1800,7 @@ fn cached_thread_fetch_after_error(
 struct SlackThreadMessage {
     ts: String,
     user: Option<String>,
+    author_name: Option<String>,
     bot_id: Option<String>,
     text: String,
     files: Vec<SlackFileRef>,
@@ -1872,6 +1955,7 @@ fn parse_slack_thread_message(raw: Value) -> Option<SlackThreadMessage> {
             .get("user")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        author_name: slack_message_author_name(&raw),
         bot_id: raw
             .get("bot_id")
             .and_then(Value::as_str)
@@ -1879,6 +1963,67 @@ fn parse_slack_thread_message(raw: Value) -> Option<SlackThreadMessage> {
         text,
         files: parse_slack_file_refs(&raw),
     })
+}
+
+fn slack_message_author_name(message: &Value) -> Option<String> {
+    message
+        .get("user_profile")
+        .and_then(slack_profile_display_name)
+        .or_else(|| {
+            message
+                .get("bot_profile")
+                .and_then(slack_profile_display_name)
+        })
+        .or_else(|| {
+            message
+                .get("username")
+                .and_then(Value::as_str)
+                .and_then(clean_slack_author_name)
+        })
+}
+
+fn slack_user_display_name(user: &Value) -> Option<String> {
+    user.get("profile")
+        .and_then(slack_profile_display_name)
+        .or_else(|| {
+            user.get("real_name")
+                .and_then(Value::as_str)
+                .and_then(clean_slack_author_name)
+        })
+        .or_else(|| {
+            user.get("name")
+                .and_then(Value::as_str)
+                .and_then(clean_slack_author_name)
+        })
+}
+
+fn slack_profile_display_name(profile: &Value) -> Option<String> {
+    ["display_name", "real_name", "name"]
+        .into_iter()
+        .find_map(|field| {
+            profile
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(clean_slack_author_name)
+        })
+}
+
+fn clean_slack_author_name(raw: &str) -> Option<String> {
+    let name = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!name.is_empty()).then_some(name)
+}
+
+fn apply_slack_user_author_names(
+    messages: &mut [SlackThreadMessage],
+    names: &BTreeMap<String, String>,
+) {
+    for message in messages {
+        if message.author_name.is_none() {
+            if let Some(user_id) = &message.user {
+                message.author_name = names.get(user_id).cloned();
+            }
+        }
+    }
 }
 
 fn parse_slack_file_refs(message: &Value) -> Vec<SlackFileRef> {
@@ -1992,6 +2137,7 @@ fn context_link_messages(
         messages.push(SlackThreadMessage {
             ts: event.ts.clone(),
             user: Some(event.user.clone()),
+            author_name: None,
             bot_id: None,
             text: event.text.clone(),
             files: event.files.clone(),
@@ -2481,11 +2627,7 @@ fn render_slack_thread_markdown(
 ) -> String {
     let mut lines = vec![format!("# Slack thread {channel} {thread_ts}")];
     for message in messages {
-        let author = message
-            .user
-            .as_deref()
-            .or(message.bot_id.as_deref())
-            .unwrap_or("unknown");
+        let author = slack_thread_message_author_label(message);
         lines.push(String::new());
         lines.push(format!("## {message_ts} {author}", message_ts = message.ts));
         if message.text.trim().is_empty() {
@@ -2528,6 +2670,7 @@ fn render_slack_thread_jsonl(messages: &[SlackThreadMessage]) -> String {
             json!({
                 "ts": message.ts,
                 "user": message.user,
+                "author_name": message.author_name,
                 "bot_id": message.bot_id,
                 "text": message.text,
                 "files": files,
@@ -2539,6 +2682,16 @@ fn render_slack_thread_jsonl(messages: &[SlackThreadMessage]) -> String {
         String::new()
     } else {
         format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn slack_thread_message_author_label(message: &SlackThreadMessage) -> String {
+    let author_id = message.user.as_deref().or(message.bot_id.as_deref());
+    match (message.author_name.as_deref(), author_id) {
+        (Some(name), Some(id)) => format!("{name} ({id})"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(id)) => id.to_string(),
+        (None, None) => "unknown".to_string(),
     }
 }
 
@@ -2697,6 +2850,100 @@ mod tests {
             url_private: None,
             url_private_download: Some(format!("https://files.example/{id}")),
         }
+    }
+
+    #[test]
+    fn parses_slack_thread_message_author_name_from_inline_profile() {
+        let message = parse_slack_thread_message(json!({
+            "ts": "111.000",
+            "user": "U1",
+            "user_profile": {
+                "display_name": "Alice",
+                "real_name": "Alice Smith",
+                "name": "asmith"
+            },
+            "text": "hello"
+        }))
+        .unwrap();
+
+        assert_eq!(message.author_name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn slack_user_display_name_falls_back_to_real_name_and_username() {
+        let user_with_real_name = json!({
+            "id": "U1",
+            "name": "asmith",
+            "profile": {
+                "display_name": "",
+                "real_name": "Alice Smith"
+            }
+        });
+        let user_with_username = json!({
+            "id": "U2",
+            "name": "bjones",
+            "profile": {
+                "display_name": "",
+                "real_name": ""
+            }
+        });
+
+        assert_eq!(
+            slack_user_display_name(&user_with_real_name).as_deref(),
+            Some("Alice Smith")
+        );
+        assert_eq!(
+            slack_user_display_name(&user_with_username).as_deref(),
+            Some("bjones")
+        );
+    }
+
+    #[test]
+    fn applies_resolved_slack_user_author_names_without_overwriting_inline_names() {
+        let mut messages = vec![
+            SlackThreadMessage {
+                ts: "111.000".to_string(),
+                user: Some("U1".to_string()),
+                author_name: None,
+                bot_id: None,
+                text: "hello".to_string(),
+                files: Vec::new(),
+            },
+            SlackThreadMessage {
+                ts: "112.000".to_string(),
+                user: Some("U1".to_string()),
+                author_name: Some("Inline Alice".to_string()),
+                bot_id: None,
+                text: "hello again".to_string(),
+                files: Vec::new(),
+            },
+        ];
+        let names = BTreeMap::from([("U1".to_string(), "Alice Smith".to_string())]);
+
+        apply_slack_user_author_names(&mut messages, &names);
+
+        assert_eq!(messages[0].author_name.as_deref(), Some("Alice Smith"));
+        assert_eq!(messages[1].author_name.as_deref(), Some("Inline Alice"));
+    }
+
+    #[test]
+    fn rendered_slack_thread_includes_author_name() {
+        let messages = vec![SlackThreadMessage {
+            ts: "111.000".to_string(),
+            user: Some("U1".to_string()),
+            author_name: Some("Alice Smith".to_string()),
+            bot_id: None,
+            text: "hello".to_string(),
+            files: Vec::new(),
+        }];
+
+        let markdown = render_slack_thread_markdown("C1", "111.000", &messages);
+        let jsonl = render_slack_thread_jsonl(&messages);
+        let record: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+
+        assert!(markdown.contains("## 111.000 Alice Smith (U1)"));
+        assert_eq!(record["author_name"].as_str(), Some("Alice Smith"));
+        assert_eq!(record["user"].as_str(), Some("U1"));
     }
 
     #[test]
@@ -2879,6 +3126,7 @@ mod tests {
         let current = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "root".to_string(),
             files: Vec::new(),
@@ -2894,6 +3142,7 @@ mod tests {
             messages: vec![SlackThreadMessage {
                 ts: "222.000".to_string(),
                 user: Some("U2".to_string()),
+                author_name: None,
                 bot_id: None,
                 text: "linked".to_string(),
                 files: Vec::new(),
@@ -2955,6 +3204,7 @@ mod tests {
         let current = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "root".to_string(),
             files: Vec::new(),
@@ -2970,6 +3220,7 @@ mod tests {
             messages: vec![SlackThreadMessage {
                 ts: "222.000".to_string(),
                 user: Some("U2".to_string()),
+                author_name: None,
                 bot_id: None,
                 text: "linked".to_string(),
                 files: Vec::new(),
@@ -3208,6 +3459,7 @@ mod tests {
         let message = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "看 <https://smartx1.slack.com/archives/C6KFDTA49/p1782253434835649> 这个"
                 .to_string(),
@@ -3313,6 +3565,7 @@ mod tests {
         let current_cache = vec![SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "cached".to_string(),
             files: Vec::new(),
@@ -3371,6 +3624,7 @@ mod tests {
                 messages: Some(vec![SlackThreadMessage {
                     ts: "111.000".to_string(),
                     user: Some("U1".to_string()),
+                    author_name: None,
                     bot_id: None,
                     text: "stale".to_string(),
                     files: Vec::new(),
@@ -3422,6 +3676,7 @@ mod tests {
                 messages: Some(vec![SlackThreadMessage {
                     ts: "111.000".to_string(),
                     user: Some("U1".to_string()),
+                    author_name: None,
                     bot_id: None,
                     text: "fresh context".to_string(),
                     files: Vec::new(),
@@ -3436,6 +3691,7 @@ mod tests {
         let message = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "stale context".to_string(),
             files: Vec::new(),
@@ -3471,6 +3727,7 @@ mod tests {
                 messages: Some(vec![SlackThreadMessage {
                     ts: "111.000".to_string(),
                     user: Some("U1".to_string()),
+                    author_name: None,
                     bot_id: None,
                     text: "fresh context".to_string(),
                     files: Vec::new(),
@@ -3534,6 +3791,7 @@ mod tests {
         let stale_message = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "stale context".to_string(),
             files: Vec::new(),
@@ -3723,6 +3981,7 @@ mod tests {
             SlackThreadMessage {
                 ts: "111.000".to_string(),
                 user: Some("U_OTHER_BOT".to_string()),
+                author_name: None,
                 bot_id: Some("B_OTHER".to_string()),
                 text: "root from another bot".to_string(),
                 files: Vec::new(),
@@ -3730,6 +3989,7 @@ mod tests {
             SlackThreadMessage {
                 ts: "112.000".to_string(),
                 user: Some("BOT".to_string()),
+                author_name: None,
                 bot_id: Some("B_SELF".to_string()),
                 text: "[codex] Activity\nTools: 1 step: Bash".to_string(),
                 files: Vec::new(),
@@ -3737,6 +3997,7 @@ mod tests {
             SlackThreadMessage {
                 ts: "113.000".to_string(),
                 user: Some("BOT".to_string()),
+                author_name: None,
                 bot_id: Some("B_SELF".to_string()),
                 text: "[codex] Progress\nI will inspect the config first.".to_string(),
                 files: Vec::new(),
@@ -3744,6 +4005,7 @@ mod tests {
             SlackThreadMessage {
                 ts: "114.000".to_string(),
                 user: Some("BOT".to_string()),
+                author_name: None,
                 bot_id: Some("B_SELF".to_string()),
                 text: "[codex] Progress report for the release".to_string(),
                 files: Vec::new(),
@@ -3762,6 +4024,7 @@ mod tests {
         let messages = vec![SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("BOT".to_string()),
+            author_name: None,
             bot_id: Some("B_SELF".to_string()),
             text: "普通回答应该保留".to_string(),
             files: Vec::new(),
@@ -3820,6 +4083,7 @@ mod tests {
         let current = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "see <https://example.slack.com/archives/C2/p1782253434835649>".to_string(),
             files: Vec::new(),
@@ -3835,6 +4099,7 @@ mod tests {
             messages: vec![SlackThreadMessage {
                 ts: "1782253434.835649".to_string(),
                 user: Some("U2".to_string()),
+                author_name: None,
                 bot_id: None,
                 text: "linked context".to_string(),
                 files: Vec::new(),
@@ -3884,6 +4149,7 @@ mod tests {
         let current = SlackThreadMessage {
             ts: "111.000".to_string(),
             user: Some("U1".to_string()),
+            author_name: None,
             bot_id: None,
             text: "cached current".to_string(),
             files: Vec::new(),
@@ -3899,6 +4165,7 @@ mod tests {
             messages: vec![SlackThreadMessage {
                 ts: "222.000".to_string(),
                 user: Some("U2".to_string()),
+                author_name: None,
                 bot_id: None,
                 text: "cached linked".to_string(),
                 files: Vec::new(),
