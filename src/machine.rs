@@ -221,7 +221,7 @@ impl MachineRegistry {
             .workspace_root
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("ssh machine `{}` has no workspace_root", machine.id))?;
-        let remote_cwd = join_remote_path(root, &session_workspace_dir_name(request.session_key));
+        let remote_cwd = remote_machine_workspace_path(root, &machine.id, request.session_key);
         ensure_ssh_workspace(host, &remote_cwd).await?;
         ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
@@ -303,7 +303,15 @@ pub fn local_machine_config() -> MachineConfig {
 }
 
 pub fn session_workspace_dir_name(session_key: &str) -> String {
-    let raw_prefix = session_key
+    stable_path_component(session_key, "session", 48)
+}
+
+fn machine_workspace_machine_dir_name(machine_id: &str) -> String {
+    stable_path_component(machine_id, "machine", 48)
+}
+
+fn stable_path_component(value: &str, fallback: &str, max_prefix_len: usize) -> String {
+    let raw_prefix = value
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
@@ -319,16 +327,16 @@ pub fn session_workspace_dir_name(session_key: &str) -> String {
         .collect::<Vec<_>>()
         .join("-");
     if prefix.is_empty() {
-        prefix = "session".to_string();
+        prefix = fallback.to_string();
     }
-    if prefix.len() > 48 {
-        prefix.truncate(48);
+    if prefix.len() > max_prefix_len {
+        prefix.truncate(max_prefix_len);
         prefix = prefix.trim_end_matches('-').to_string();
         if prefix.is_empty() {
-            prefix = "session".to_string();
+            prefix = fallback.to_string();
         }
     }
-    let digest = Sha256::digest(session_key.as_bytes());
+    let digest = Sha256::digest(value.as_bytes());
     let hash = digest[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -361,11 +369,23 @@ fn local_workspace_path(
     request: &MachinePrepareRequest<'_>,
 ) -> anyhow::Result<Option<PathBuf>> {
     if let Some(root) = &machine.workspace_root {
-        return Ok(Some(
-            PathBuf::from(root).join(session_workspace_dir_name(request.session_key)),
-        ));
+        return Ok(Some(machine_workspace_path(
+            Path::new(root),
+            &machine.id,
+            request.session_key,
+        )));
     }
     Ok(request.router_workspace.map(Path::to_path_buf))
+}
+
+fn machine_workspace_path(root: &Path, machine_id: &str, session_key: &str) -> PathBuf {
+    root.join(machine_workspace_machine_dir_name(machine_id))
+        .join(session_workspace_dir_name(session_key))
+}
+
+fn remote_machine_workspace_path(root: &str, machine_id: &str, session_key: &str) -> String {
+    let machine_root = join_remote_path(root, &machine_workspace_machine_dir_name(machine_id));
+    join_remote_path(&machine_root, &session_workspace_dir_name(session_key))
 }
 
 fn layered_env(
@@ -1061,7 +1081,7 @@ mod tests {
         let machine_root = tmp.path().join("machine");
         std::fs::create_dir_all(router_workspace.join("slack")).unwrap();
         std::fs::write(router_workspace.join("slack/current-thread.md"), "thread").unwrap();
-        let stale_workspace = machine_root.join(session_workspace_dir_name("session-1"));
+        let stale_workspace = machine_workspace_path(&machine_root, "local", "session-1");
         std::fs::create_dir_all(stale_workspace.join("slack")).unwrap();
         std::fs::write(stale_workspace.join("slack/old.md"), "old").unwrap();
         let registry = MachineRegistry::new(BTreeMap::from([(
@@ -1104,22 +1124,23 @@ mod tests {
     #[tokio::test]
     async fn machine_workspace_names_are_stable_per_session_and_machine() {
         let tmp = tempfile::tempdir().unwrap();
-        let root_a = tmp.path().join("machine-a");
-        let root_b = tmp.path().join("machine-b");
+        let shared_root = tmp.path().join("machines");
         let registry = MachineRegistry::new(BTreeMap::from([
             (
                 "machine-a".to_string(),
-                test_local_machine("machine-a", Some(&root_a), Vec::new()),
+                test_local_machine("machine-a", Some(&shared_root), Vec::new()),
             ),
             (
                 "machine-b".to_string(),
-                test_local_machine("machine-b", Some(&root_b), Vec::new()),
+                test_local_machine("machine-b", Some(&shared_root), Vec::new()),
             ),
         ]));
         let env = BTreeMap::new();
         let args = Vec::new();
         let session_a = "slack:channel:C1:111.000";
         let session_b = "slack:channel:C1:222.000";
+        let machine_a_dir = machine_workspace_machine_dir_name("machine-a");
+        let machine_b_dir = machine_workspace_machine_dir_name("machine-b");
         let session_a_dir = session_workspace_dir_name(session_a);
         let session_b_dir = session_workspace_dir_name(session_b);
 
@@ -1190,21 +1211,33 @@ mod tests {
         assert_eq!(first_a.machine_id, "machine-a");
         assert_eq!(other_session_a.machine_id, "machine-a");
         assert_eq!(first_b.machine_id, "machine-b");
+        let shared_root = shared_root.canonicalize().unwrap();
         assert_eq!(
-            Path::new(&first_a.cwd)
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some(session_a_dir.as_str())
+            Path::new(&first_a.cwd).strip_prefix(&shared_root).unwrap(),
+            Path::new(&machine_a_dir).join(&session_a_dir).as_path()
         );
         assert_eq!(
             Path::new(&other_session_a.cwd)
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some(session_b_dir.as_str())
+                .strip_prefix(&shared_root)
+                .unwrap(),
+            Path::new(&machine_a_dir).join(&session_b_dir).as_path()
         );
-        assert!(Path::new(&first_a.cwd).starts_with(root_a.canonicalize().unwrap()));
-        assert!(Path::new(&other_session_a.cwd).starts_with(root_a.canonicalize().unwrap()));
-        assert!(Path::new(&first_b.cwd).starts_with(root_b.canonicalize().unwrap()));
+        assert_eq!(
+            Path::new(&first_b.cwd).strip_prefix(&shared_root).unwrap(),
+            Path::new(&machine_b_dir).join(&session_a_dir).as_path()
+        );
+    }
+
+    #[test]
+    fn remote_machine_workspace_path_is_machine_scoped() {
+        let session = "slack:channel:C1:111.000";
+        let machine_dir = machine_workspace_machine_dir_name("zbs-dev");
+        let session_dir = session_workspace_dir_name(session);
+
+        assert_eq!(
+            remote_machine_workspace_path("/remote/workspaces", "zbs-dev", session),
+            format!("/remote/workspaces/{machine_dir}/{session_dir}")
+        );
     }
 
     #[tokio::test]
