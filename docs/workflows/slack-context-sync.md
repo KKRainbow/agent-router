@@ -511,6 +511,16 @@ Context sync 失败不应该默认阻塞 bot 回复。
   - 一个文本文件
 - 验证 session workspace 布局、manifest、executor prompt 和最终回复。
 
+## 已知问题
+
+- 当前实现每次 routed Slack message 触发 context sync 时，都会通过
+  `conversations.replies` 重新拉取完整 current thread，而不是按上次已同步位置做增量。
+  这保证了 workspace 中的 thread context 始终完整且新鲜，但在长 thread 中会增加 Slack
+  API 成本、rate limit 风险和 turn 启动延迟。后续修复应记录 thread-level cursor 或
+  message fingerprint，只同步新增/变更消息；本地已有 `current-thread.md/jsonl` 和
+  manifest 应作为增量合并的基线。Slack rate limit 时可继续使用缓存，但缓存不应替代
+  正常成功路径的增量同步。
+
 ## 实施阶段
 
 ### Phase 1: Workspace artifact 基础设施
