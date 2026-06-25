@@ -774,7 +774,7 @@ the owning Module.
 - Treat every newly discovered race as a missing Module invariant first, not as
   a missing `if stale { return }` branch.
 
-### Phase 1: Add Turn Lifecycle Module `[mostly implemented]`
+### Phase 1: Add Turn Lifecycle Module `[implemented]`
 
 Already present:
 
@@ -784,16 +784,15 @@ Already present:
 - `TurnGuard` exposes typed router lifecycle operations for context commit
   eligibility, output eligibility, abandoned Turns, and guarded commits instead
   of exposing generic currentness checks to route code;
+- raw Turn generation exposure from router flow is limited to logging and
+  Executor correlation;
 - tests for replacement cancellation, stale reservation behavior, and command
   cancellation.
 
-Remaining work:
+The remaining `src/router.rs` route-flow size is an organization issue, not an
+ownership-rule gap. A dedicated Turn Runner is tracked as an Open Decision.
 
-- keep raw generation exposure limited to logging and Executor correlation;
-- move repeated route-flow sequencing out of `src/router.rs` once the Turn
-  Runner exists.
-
-### Phase 2: Move Router Commit Paths Behind Turn Guard `[partial]`
+### Phase 2: Move Router Commit Paths Behind Turn Guard `[implemented]`
 
 Already present:
 
@@ -807,20 +806,19 @@ Already present:
 - route errors clear reserved placeholder Turns instead of leaving stale active
   records.
 
-Remaining work:
-
-- separate the Turn Runner from command/intake code;
-- centralize stream event and final reply projection in one Turn-scoped output
-  Module.
+The projection code still lives in `src/router.rs`, but Turn-owned output
+eligibility is centralized behind `TurnGuard::is_output_allowed()`. Splitting
+the Turn Runner and output projection into smaller files is deferred to the
+module-organization Open Decision.
 
 Required tests:
 
 - old successful Turn cannot commit after replacement `[covered]`;
 - old failed Turn cannot mark Executor Binding unhealthy after replacement
   `[covered]`;
-- old stream events are dropped after replacement;
-- final reply belongs to the latest Turn only;
-- route validation failures never create ghost active Turns.
+- old stream events are dropped after replacement `[covered]`;
+- final reply belongs to the latest Turn only `[covered]`;
+- route validation failures never create ghost active Turns `[covered]`.
 
 ### Phase 3: Replace Channel Raw Generation Interface `[implemented]`
 
@@ -845,7 +843,7 @@ Required tests:
 - stale adapter cache updates cannot update router Session state or adapter
   reply/cache targets.
 
-### Phase 4: Make Context Commit Turn-Guarded `[mostly implemented]`
+### Phase 4: Make Context Commit Turn-Guarded `[implemented]`
 
 Already present:
 
@@ -854,23 +852,21 @@ Already present:
 - route errors discard reserved placeholder Turns.
 - stale after file install rolls back files without saving new context state;
 - stale after Session state save rolls back files and restores old Session
-  state.
-
-Remaining work:
-
-- decide whether `PreparedContextSync` should move into a dedicated context
-  commit Module instead of living in `src/router.rs`;
-- add any missing lower-level failed-install coverage that is not already
-  covered by `src/session/context.rs`;
-- keep context rollback semantics independent from Channel Adapter cache
+  state;
+- lower-level failed install coverage lives in `src/session/context.rs`, keeping
+  filesystem rollback independent from router Turn currentness;
+- context rollback semantics are independent from Channel Adapter cache
   ordering.
+
+Moving `PreparedContextSync` into a dedicated context commit Module remains a
+module-organization Open Decision, not an interrupt correctness gap.
 
 Required tests:
 
-- stale before install;
+- stale before install `[covered]`;
 - stale after install before state save `[covered]`;
 - stale after state save before finalization `[covered]`;
-- failed install restores replaced files and old state;
+- failed install restores replaced files and old state `[covered]`;
 - reserved context validation failure clears placeholder active Turns
   `[covered]`.
 
@@ -980,7 +976,7 @@ Codex coverage now includes:
   reusable;
 - interrupted backend completion maps to `ExecutorPromptOutcome::Cancelled`.
 
-### Phase 8: Delete Old Scattered State Rules `[pending]`
+### Phase 8: Delete Old Scattered State Rules `[implemented]`
 
 - Implemented:
   - removed `created_session` cancellation cleanup from Executor adapters; ACP,
@@ -993,12 +989,14 @@ Codex coverage now includes:
     terminology: Slack uses context cache sequences and QQ uses reply-context
     sequences, so adapter-local ordering cannot be confused with router Turn
     generation.
-- Remaining:
-- Remove duplicated context-cache currentness code that the Turn Guard replaces.
-- Remove any fallback path where cancellation is handled as ordinary backend
-  failure.
+  - kept adapter-local cache/reply ordering only where it protects platform
+    cache state; it no longer uses router generation terminology and does not
+    participate in router Turn lifecycle decisions.
+  - cancellation paths now map to cancellation outcomes or cancelled prepare
+    abandonment rather than ordinary backend failure. Process close remains
+    isolated to unhealthy recovery paths.
 
-### Phase 9: Final Verification `[per phase and final]`
+### Phase 9: Final Verification `[in progress]`
 
 - Run formatting and all local tests.
 - Add race-focused tests before fixing each newly discovered race.
@@ -1015,9 +1013,10 @@ Codex coverage now includes:
 Architecture is acceptable when:
 
 - Channel Adapters never inspect router generation values.
-- router state commits require a `TurnGuard`.
-- context sync finalization requires a current `TurnGuard`.
-- final replies and channel events go through Turn-scoped output gating.
+- Turn-result router state commits require a `TurnGuard`.
+- Turn-owned context sync finalization requires a current `TurnGuard`.
+- Turn-owned final replies and channel events go through Turn-scoped output
+  gating.
 - ACP and Codex prepare cancellation cannot close a Backend Session that a
   replacement Turn may reuse.
 - Executor interrupt can send soft cancel without waiting for the long prompt
@@ -1040,17 +1039,10 @@ Do not fix interrupt by:
 
 ## Open Decisions
 
-1. Whether to split the route execution path into `src/router/runner.rs` or keep
-   it in `src/router.rs` until Executor Backend Session Managers are done.
+1. Whether to split the route execution path into `src/router/runner.rs` after
+   the ownership rules have settled.
 2. Whether `TurnGuard::commit_session()` should take a closure over
    `SessionState` or expose narrower typed operations for transcript, binding,
    and context commits.
-3. Whether channel-side cache updates should keep local platform sequence
-   numbers or use an opaque Turn token directly when cache mutation is tied to
-   router lifecycle.
-4. Codex app-server's true soft-cancel protocol. If it has no turn cancel
-   method, close/recreate must be isolated as documented technical debt.
-5. How much of Backend Session Manager should be shared between ACP and Codex
-   versus duplicated initially for clarity.
-6. Whether context commit should remain as `PreparedContextSync` in the router
+3. Whether context commit should remain as `PreparedContextSync` in the router
    or move into `src/session/context.rs` behind a router-facing commit type.
