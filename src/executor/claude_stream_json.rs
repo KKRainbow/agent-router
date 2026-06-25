@@ -690,7 +690,10 @@ impl ClaudeSession {
             .arg("stream-json")
             .arg("--permission-prompt-tool")
             .arg("stdio")
-            .arg("--replay-user-messages");
+            .arg("--replay-user-messages")
+            // stream-json in non-TTY mode is treated as --print and requires
+            // --verbose to emit the JSON event stream.
+            .arg("--verbose");
         if let Some(id) = previous_session_id.filter(|id| !id.is_empty()) {
             cmd.arg("--resume").arg(id);
         }
@@ -699,6 +702,9 @@ impl ClaudeSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(&cwd);
+        // Prevent Claude Code from detecting a nested session when this agent is
+        // spawned from within another Claude Code process.
+        cmd.env_remove("CLAUDECODE");
         for (key, value) in &cfg.env {
             cmd.env(key, value);
         }
@@ -985,6 +991,19 @@ async fn handle_event_line(
             request_id,
             request,
         } => {
+            let subtype = request
+                .as_ref()
+                .and_then(|r| r.get("subtype"))
+                .and_then(Value::as_str);
+            if subtype != Some("can_use_tool") {
+                tracing::debug!(
+                    target: "agent_router::claude",
+                    request_id,
+                    subtype = ?subtype,
+                    "ignoring non-tool control request"
+                );
+                return;
+            }
             let approval_req = build_approval_request(
                 session_key,
                 executor,
@@ -1161,10 +1180,13 @@ fn event_to_updates(event: ClaudeEvent) -> Vec<ExecutorUpdate> {
         ClaudeEvent::Result {
             result, subtype, ..
         } => {
-            if !is_compaction_result(subtype.as_deref())
-                && let Some(text) = result
-            {
-                updates.push(ExecutorUpdate::new("result", "Result", text, ""));
+            if !is_compaction_result(subtype.as_deref()) {
+                updates.push(ExecutorUpdate::new(
+                    "result",
+                    "Result",
+                    result.as_deref().unwrap_or(""),
+                    "",
+                ));
             }
         }
         ClaudeEvent::ControlRequest { .. } | ClaudeEvent::ControlCancelRequest { .. } => {}
@@ -1260,6 +1282,7 @@ mod approval_bridge_tests {
     #[test]
     fn control_request_builds_approval_request() {
         let request = serde_json::json!({
+            "subtype": "can_use_tool",
             "tool": "bash",
             "description": "Run `cargo test` in /workspace"
         });
@@ -1290,7 +1313,7 @@ mod approval_bridge_tests {
             command: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                r#"read line; printf '{"type":"control_request","request_id":"req-1"}\n'; cat"#
+                r#"read line; printf '{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool":"bash"}}\n'; cat"#
                     .to_string(),
             ],
             cwd: None,

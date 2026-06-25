@@ -8,7 +8,7 @@ approval:
 
 workspace:
   # Optional. When set, each router session runs under a stable child directory.
-  # root: /path/to/workspaces
+  root: /data/project/agent-router-workspaces/
 
 executors:
   kimi:
@@ -20,11 +20,10 @@ executors:
     command: codex
   # Claude Code CLI via stream-json stdio protocol.
   # Requires `claude` installed and ANTHROPIC_API_KEY available.
-  # claude:
-  #   protocol: claude_stream_json
-  #   command: claude
-  #   args: []
-  #   cwd: /data/project/hermes
+  claude:
+    protocol: claude_stream_json
+    command: claude
+    args: []
 
 slack:
   # Optional. When omitted, Slack is enabled if both tokens are configured.
