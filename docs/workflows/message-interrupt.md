@@ -229,31 +229,50 @@ the adapter cannot guarantee that the private session remains usable.
 
 ## Codex App-Server Backend
 
-Codex app-server needs a real backend turn interruption path. The existing
-`cancel_pending()` helper is insufficient because it only removes a local
-pending JSON-RPC response.
+Codex app-server interruption uses the real app-server protocol:
 
-The adapter should support the real protocol in this priority order:
+```json
+{
+  "method": "turn/interrupt",
+  "params": {
+    "threadId": "<thread id>",
+    "turnId": "<turn id>"
+  }
+}
+```
 
-1. If app-server supports turn-level cancellation, send the cancel request using
-   the active `turnId`.
-2. If only thread-level cancellation exists, cancel the active turn for the
-   current `threadId`.
-3. If no soft-cancel protocol exists, close and recreate the app-server process
-   as an explicit fallback. This should be treated as technical debt, not the
-   target architecture.
+The adapter stores active turn metadata in a manager-level map outside the long
+`run_turn()` session lock. `interrupt()` looks up that metadata, checks the
+interrupted generation, and sends `turn/interrupt` without waiting for the
+prompt lock. If the interrupt arrives before `turn/start` has returned a
+`turnId`, the adapter records a pending interrupt and sends `turn/interrupt`
+as soon as the `turnId` is known. The active turn registry is also the
+at-most-once gate for `turn/interrupt`, so router cancellation and direct
+backend `interrupt()` cannot send duplicate interrupts for the same turn.
 
-Implementation requirements:
+Important constraints:
 
-- Store the active `turnId` once `turn/start` acknowledges it.
-- Make the active `turnId` visible to `interrupt()` without waiting for
-  `run_turn()` to finish.
-- Send the real cancel RPC from `interrupt()`.
-- Make `run_turn()` select on the cancellation handle.
-- Finish turn streams on cancellation.
-- Stop server request workers on cancellation.
-- Remove pending approval requests on cancellation.
-- Return `ExecutorPromptOutcome::Cancelled` instead of a generic failure.
+- `cancel_pending()` only removes a local JSON-RPC pending response; it is not
+  a backend interrupt.
+- Prompt cancellation sends `turn/interrupt`; it does not close a healthy
+  app-server process.
+- Direct `interrupt()` cancels the local turn scope, so pending approval
+  prompts are removed even before the backend emits `turn/completed`.
+- If Codex sends approval requests before `turn/start` returns a `turnId`,
+  cancellation still answers those requests with `decline` so Codex can finish
+  `turn/start` and receive the pending `turn/interrupt`.
+- `turn/completed` statuses `interrupted`, `cancelled`, and `canceled` map to
+  `ExecutorPromptOutcome::Cancelled`.
+- Cancelled prepare calls do not remove or close an already published shared
+  Codex session. Lifecycle RPCs such as `initialize` and `thread/start` are
+  still driven to their response while the session lock is held, so the shared
+  session is not left in an unknown initialization state.
+- Codex reports `started_new_session` by comparing the actual `threadId` with
+  the router's `previous_session_id`, not by whether the adapter happened to
+  create the thread during the current prepare call. This prevents a cancelled
+  prepare from making the next prompt drop required context.
+- Process close remains reserved for unhealthy paths such as startup failure or
+  request timeout, not normal message interrupt.
 
 ## Transcript and Context Cursor Rules
 

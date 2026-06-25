@@ -923,18 +923,47 @@ Backend Session it touched.
   - add cancelled-prepare publication tests at the ACP adapter boundary;
   - unhealthy session replacement does not remove a newer session.
 
-### Phase 7: Refactor Codex App-Server Backend Session Lifecycle `[pending]`
+### Phase 7: Refactor Codex App-Server Backend Session Lifecycle `[implemented]`
 
-- Introduce Codex Backend Session Manager matching the ACP ownership model.
-- Store active `turnId` or thread cancel identity outside the long prompt lock.
-- Use the real cancel protocol if available.
-- If no soft cancel exists, isolate close/recreate as documented technical debt
-  under unhealthy recovery.
-- Add Codex tests for:
-  - interrupt sends real cancel when turn identity exists;
-  - local pending-response cancellation is not treated as backend interrupt;
-  - cancelled prepare after publication keeps replacement thread alive;
-  - process close fallback cannot close a newer published session.
+- Codex stores active turn metadata in a manager-owned registry outside the
+  long `run_turn()` session lock.
+- `interrupt()` generation-checks that active turn and sends the real
+  `turn/interrupt` JSON-RPC request with `{ threadId, turnId }`.
+- Interrupts that arrive before `turn/start` returns a `turnId` are recorded
+  and sent as soon as the `turnId` is available.
+- The active turn registry is an at-most-once gate for `turn/interrupt`, so the
+  router's local cancellation token and backend `interrupt()` cannot send
+  duplicate backend interrupts for the same Codex turn.
+- Direct backend `interrupt()` cancels the local turn scope, which clears
+  pending approval prompts while the backend turn is being interrupted.
+- Cancellation still answers pre-`turnId` Codex approval requests with
+  `decline`, allowing Codex to complete `turn/start` and receive the pending
+  `turn/interrupt` instead of wedging behind an unanswered request.
+- Local `cancel_pending()` is treated only as JSON-RPC bookkeeping, not as
+  backend interruption.
+- Prompt cancellation and router interruption no longer close a healthy Codex
+  app-server process.
+- Cancelled prepare calls do not close or remove an already published shared
+  Backend Session. Lifecycle RPCs such as `initialize` and `thread/start` are
+  driven to their response under the session lock before the cancelled prepare
+  returns, so the shared session is not left in an unknown state.
+- `started_new_session` is derived from actual `threadId` versus router
+  `previous_session_id`, so a thread created by a cancelled prepare is still
+  treated as a new session on the next successful prepare.
+- Process close remains isolated to unhealthy recovery paths such as startup
+  failure and request timeout.
+
+Codex coverage now includes:
+
+- interrupt sends `turn/interrupt` while the prompt holds the session lock;
+- prompt cancellation sends `turn/interrupt` and keeps the app-server reusable;
+- router cancellation plus backend interrupt sends only one `turn/interrupt`;
+- direct backend interrupt clears pending approval scope;
+- pre-`turnId` interrupt declines early approval requests before sending the
+  pending backend interrupt;
+- cancelled prepare after Backend Session publication keeps the same session
+  reusable;
+- interrupted backend completion maps to `ExecutorPromptOutcome::Cancelled`.
 
 ### Phase 8: Delete Old Scattered State Rules `[pending]`
 

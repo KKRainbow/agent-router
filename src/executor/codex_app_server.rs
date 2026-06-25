@@ -35,9 +35,12 @@ type SessionKey = (String, String);
 type SharedCodexSession = Arc<Mutex<CodexAppServerSession>>;
 type SessionMap = HashMap<SessionKey, SharedCodexSession>;
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
+type SharedJsonRpcNextId = Arc<AtomicU64>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 type SharedCodexEventStreams = Arc<StdMutex<CodexEventStreams>>;
+type SharedActiveCodexTurns = Arc<Mutex<HashMap<SessionKey, ActiveCodexTurn>>>;
 const MAX_READY_NOTIFICATIONS_BEFORE_REQUEST: usize = 1024;
+const CODEX_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct CodexEventStreams {
@@ -187,8 +190,76 @@ impl Drop for CodexTurnScope {
     }
 }
 
-async fn wait_turn_cancelled(cancelled: ApprovalCancellation) {
-    cancelled.cancelled().await;
+#[derive(Debug, Clone)]
+struct ActiveCodexTurn {
+    thread_id: String,
+    turn_id: Option<String>,
+    stream_generation: u64,
+    request_id: Option<u64>,
+    generation: u64,
+    client: CodexJsonRpcClientHandle,
+    turn_cancelled: ApprovalCancellation,
+    interrupt_state: CodexInterruptState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexInterruptState {
+    NotRequested,
+    PendingTurnId,
+    Sent,
+}
+
+#[derive(Debug, Clone)]
+struct CodexTurnRegistration {
+    active_turns: SharedActiveCodexTurns,
+    key: SessionKey,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CodexInterruptTarget {
+    thread_id: String,
+    turn_id: String,
+    generation: u64,
+    request_id: Option<u64>,
+    client: CodexJsonRpcClientHandle,
+}
+
+#[derive(Debug)]
+enum CodexInterruptAction {
+    Send(CodexInterruptTarget),
+    AwaitTurnId,
+    AlreadySent,
+}
+
+impl CodexInterruptTarget {
+    async fn issue(&self) -> anyhow::Result<()> {
+        self.client
+            .request_until_timeout(
+                "turn/interrupt",
+                json!({
+                    "threadId": self.thread_id,
+                    "turnId": self.turn_id,
+                }),
+                CODEX_INTERRUPT_TIMEOUT,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn issue_in_background(self) -> anyhow::Result<()> {
+        self.client
+            .request_in_background(
+                "turn/interrupt",
+                json!({
+                    "threadId": self.thread_id,
+                    "turnId": self.turn_id,
+                }),
+                CODEX_INTERRUPT_TIMEOUT,
+                "codex app-server turn/interrupt",
+            )
+            .await
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +281,7 @@ pub struct CodexAppServerManager {
     approvals: SharedApprovalBroker,
     limits: CodexRuntimeLimits,
     sessions: Mutex<SessionMap>,
+    active_turns: SharedActiveCodexTurns,
 }
 
 impl CodexAppServerManager {
@@ -238,6 +310,7 @@ impl CodexAppServerManager {
             approvals,
             limits,
             sessions: Mutex::new(HashMap::new()),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -270,22 +343,6 @@ impl CodexAppServerManager {
         ));
         self.sessions.lock().await.insert(key, session.clone());
         Ok((session, true))
-    }
-
-    async fn discard_session_if_same(
-        &self,
-        session_key: &str,
-        executor: &str,
-        session: &SharedCodexSession,
-    ) {
-        let key = (session_key.to_string(), executor.to_string());
-        let mut sessions = self.sessions.lock().await;
-        if sessions
-            .get(&key)
-            .is_some_and(|existing| Arc::ptr_eq(existing, session))
-        {
-            sessions.remove(&key);
-        }
     }
 
     async fn existing_session(
@@ -342,7 +399,7 @@ impl ExecutorBackend for CodexAppServerManager {
             generation = request.turn.generation,
             "preparing Codex app-server executor session"
         );
-        let (session, created_session) = self
+        let (session, _) = self
             .get_or_create_session(
                 &request.turn.session_key,
                 &request.turn.executor,
@@ -351,23 +408,12 @@ impl ExecutorBackend for CodexAppServerManager {
             )
             .await?;
         if cancel.is_cancelled().await {
-            if created_session {
-                self.discard_session_if_same(
-                    &request.turn.session_key,
-                    &request.turn.executor,
-                    &session,
-                )
-                .await;
-                let session = session.lock().await;
-                session
-                    .client
-                    .close("Codex app-server prepare cancelled")
-                    .await;
-            }
             anyhow::bail!("Codex app-server prepare cancelled");
         }
         let mut session = session.lock().await;
-        let (thread_id, started_new_session) = session.ensure_thread(cancel).await?;
+        let (thread_id, started_new_session) = session
+            .ensure_thread(request.previous_session_id.as_deref(), cancel)
+            .await?;
         tracing::info!(
             executor = %request.turn.executor,
             session_key = %request.turn.session_key,
@@ -398,6 +444,7 @@ impl ExecutorBackend for CodexAppServerManager {
         let mut session = session.lock().await;
         let session_key = request.turn.session_key.clone();
         let executor = request.turn.executor.clone();
+        let active_key = (session_key.clone(), executor.clone());
         let generation = request.turn.generation;
         let prompt_len = request.prompt.len();
         tracing::info!(
@@ -407,8 +454,19 @@ impl ExecutorBackend for CodexAppServerManager {
             prompt_len,
             "starting Codex app-server turn"
         );
+        let active_turn = CodexTurnRegistration {
+            active_turns: self.active_turns.clone(),
+            key: active_key,
+            generation,
+        };
         let result = session
-            .run_turn(&request.prompt, request.user_id, events, cancel)
+            .run_turn(
+                &request.prompt,
+                request.user_id,
+                events,
+                cancel,
+                active_turn,
+            )
             .await;
         match &result {
             ExecutorPromptOutcome::Completed(response) => tracing::info!(
@@ -436,22 +494,158 @@ impl ExecutorBackend for CodexAppServerManager {
     }
 
     async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
-        let session = self
-            .sessions
-            .lock()
-            .await
-            .get(&(
-                request.turn.session_key.clone(),
-                request.turn.executor.clone(),
-            ))
-            .cloned();
-        let Some(session) = session else {
-            return Ok(());
+        let key = (
+            request.turn.session_key.clone(),
+            request.turn.executor.clone(),
+        );
+        let target = {
+            let mut active_turns = self.active_turns.lock().await;
+            let Some(active_turn) = active_turns.get_mut(&key) else {
+                return Ok(());
+            };
+            if active_turn.generation != request.turn.generation {
+                tracing::debug!(
+                    target: "agent_router::codex_app_server",
+                    executor = %request.turn.executor,
+                    session_key = %request.turn.session_key,
+                    interrupted_generation = request.turn.generation,
+                    active_generation = active_turn.generation,
+                    active_request_id = ?active_turn.request_id,
+                    reason = ?request.reason,
+                    "ignoring stale Codex interrupt for newer active turn"
+                );
+                return Ok(());
+            }
+            active_turn.turn_cancelled.cancel();
+            match request_codex_interrupt_action(active_turn) {
+                CodexInterruptAction::Send(target) => Some(target),
+                CodexInterruptAction::AwaitTurnId => {
+                    tracing::debug!(
+                        target: "agent_router::codex_app_server",
+                        executor = %request.turn.executor,
+                        session_key = %request.turn.session_key,
+                        generation = request.turn.generation,
+                        active_request_id = ?active_turn.request_id,
+                        reason = ?request.reason,
+                        "recorded pending Codex interrupt before turn/start acknowledged"
+                    );
+                    None
+                }
+                CodexInterruptAction::AlreadySent => None,
+            }
         };
-        if let Ok(session) = session.try_lock() {
-            session.client.close("codex app-server interrupted").await;
+        if let Some(target) = target {
+            tracing::debug!(
+                target: "agent_router::codex_app_server",
+                executor = %request.turn.executor,
+                session_key = %request.turn.session_key,
+                generation = target.generation,
+                request_id = ?target.request_id,
+                turn_id = %target.turn_id,
+                reason = ?request.reason,
+                "requesting Codex active turn interruption"
+            );
+            target.issue_in_background().await?;
         }
         Ok(())
+    }
+}
+
+async fn set_active_codex_turn(registration: &CodexTurnRegistration, turn: ActiveCodexTurn) {
+    registration
+        .active_turns
+        .lock()
+        .await
+        .insert(registration.key.clone(), turn);
+}
+
+async fn set_active_codex_turn_request_id(
+    registration: &CodexTurnRegistration,
+    stream_generation: u64,
+    request_id: u64,
+) {
+    let mut active_turns = registration.active_turns.lock().await;
+    let Some(active_turn) = active_turns.get_mut(&registration.key) else {
+        return;
+    };
+    if active_turn.generation == registration.generation
+        && active_turn.stream_generation == stream_generation
+    {
+        active_turn.request_id = Some(request_id);
+    }
+}
+
+async fn set_active_codex_turn_id(
+    registration: &CodexTurnRegistration,
+    stream_generation: u64,
+    turn_id: String,
+) -> Option<CodexInterruptTarget> {
+    let mut active_turns = registration.active_turns.lock().await;
+    let active_turn = active_turns.get_mut(&registration.key)?;
+    if active_turn.generation != registration.generation
+        || active_turn.stream_generation != stream_generation
+    {
+        return None;
+    }
+    active_turn.turn_id = Some(turn_id.clone());
+    if active_turn.interrupt_state == CodexInterruptState::PendingTurnId {
+        active_turn.interrupt_state = CodexInterruptState::Sent;
+        return Some(codex_interrupt_target(active_turn, turn_id));
+    }
+    None
+}
+
+async fn request_active_codex_turn_interrupt(
+    registration: &CodexTurnRegistration,
+    stream_generation: u64,
+) -> Option<CodexInterruptAction> {
+    let mut active_turns = registration.active_turns.lock().await;
+    let active_turn = active_turns.get_mut(&registration.key)?;
+    if active_turn.generation != registration.generation
+        || active_turn.stream_generation != stream_generation
+    {
+        return None;
+    }
+    active_turn.turn_cancelled.cancel();
+    Some(request_codex_interrupt_action(active_turn))
+}
+
+fn request_codex_interrupt_action(active_turn: &mut ActiveCodexTurn) -> CodexInterruptAction {
+    match active_turn.interrupt_state {
+        CodexInterruptState::NotRequested => {
+            if let Some(turn_id) = active_turn.turn_id.clone() {
+                active_turn.interrupt_state = CodexInterruptState::Sent;
+                CodexInterruptAction::Send(codex_interrupt_target(active_turn, turn_id))
+            } else {
+                active_turn.interrupt_state = CodexInterruptState::PendingTurnId;
+                CodexInterruptAction::AwaitTurnId
+            }
+        }
+        CodexInterruptState::PendingTurnId => CodexInterruptAction::AwaitTurnId,
+        CodexInterruptState::Sent => CodexInterruptAction::AlreadySent,
+    }
+}
+
+fn codex_interrupt_target(active_turn: &ActiveCodexTurn, turn_id: String) -> CodexInterruptTarget {
+    CodexInterruptTarget {
+        thread_id: active_turn.thread_id.clone(),
+        turn_id,
+        generation: active_turn.generation,
+        request_id: active_turn.request_id,
+        client: active_turn.client.clone(),
+    }
+}
+
+async fn clear_active_codex_turn(registration: &CodexTurnRegistration, stream_generation: u64) {
+    let mut active_turns = registration.active_turns.lock().await;
+    if active_turns
+        .get(&registration.key)
+        .is_some_and(|active_turn| {
+            active_turn.generation == registration.generation
+                && active_turn.stream_generation == stream_generation
+        })
+    {
+        active_turns.remove(&registration.key);
     }
 }
 
@@ -527,7 +721,7 @@ impl CodexAppServerSession {
         }
         let initialized = self
             .client
-            .request_until_cancelled(
+            .lifecycle_request_until_cancelled(
                 "initialize",
                 json!({
                     "clientInfo": {
@@ -538,34 +732,45 @@ impl CodexAppServerSession {
                     "capabilities": {},
                 }),
                 self.limits.rpc_timeout,
-                cancel,
-                "codex app-server initialize cancelled",
+                cancel.clone(),
             )
             .await;
-        if let Err(err) = initialized {
-            self.client
-                .close("codex app-server initialize failed")
-                .await;
-            return Err(err);
-        }
+        let initialized = match initialized {
+            Ok(initialized) => initialized,
+            Err(err) => {
+                self.client
+                    .close("codex app-server initialize failed")
+                    .await;
+                return Err(err);
+            }
+        };
         self.client.notify("initialized", json!({})).await?;
         self.initialized = true;
+        if initialized.cancelled || cancel.is_cancelled().await {
+            anyhow::bail!("codex app-server initialize cancelled");
+        }
         Ok(())
     }
 
-    async fn ensure_thread(&mut self, cancel: TurnCancellation) -> anyhow::Result<(String, bool)> {
+    async fn ensure_thread(
+        &mut self,
+        previous_session_id: Option<&str>,
+        cancel: TurnCancellation,
+    ) -> anyhow::Result<(String, bool)> {
         self.initialize(cancel.clone()).await?;
         if let Some(thread_id) = &self.thread_id {
-            return Ok((thread_id.clone(), false));
+            return Ok((
+                thread_id.clone(),
+                previous_session_id != Some(thread_id.as_str()),
+            ));
         }
         let result = self
             .client
-            .request_until_cancelled(
+            .lifecycle_request_until_cancelled(
                 "thread/start",
                 json!({ "cwd": self.cwd }),
                 self.limits.rpc_timeout,
-                cancel,
-                "codex app-server thread/start cancelled",
+                cancel.clone(),
             )
             .await;
         let result = match result {
@@ -577,10 +782,14 @@ impl CodexAppServerSession {
                 return Err(err);
             }
         };
-        let thread_id = thread_id_from_result(&result)
+        let thread_id = thread_id_from_result(&result.result)
             .ok_or_else(|| anyhow::anyhow!("codex thread/start did not return thread id"))?;
         self.thread_id = Some(thread_id.clone());
-        Ok((thread_id, true))
+        if result.cancelled || cancel.is_cancelled().await {
+            anyhow::bail!("codex app-server thread/start cancelled");
+        }
+        let started_new_session = previous_session_id != Some(thread_id.as_str());
+        Ok((thread_id, started_new_session))
     }
 
     async fn run_turn(
@@ -589,6 +798,7 @@ impl CodexAppServerSession {
         user_id: Option<String>,
         events: &mut dyn ExecutorEventSink,
         cancel: TurnCancellation,
+        active_turn: CodexTurnRegistration,
     ) -> ExecutorPromptOutcome {
         let thread_id = match self.thread_id.clone() {
             Some(thread_id) => thread_id,
@@ -607,8 +817,22 @@ impl CodexAppServerSession {
             mut server_requests,
             _guard: _turn_stream_guard,
         } = self.client.open_turn_streams(thread_id.clone());
-        let mut closed = self.client.subscribe_closed();
         let turn_scope = CodexTurnScope::new();
+        set_active_codex_turn(
+            &active_turn,
+            ActiveCodexTurn {
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                stream_generation: turn_generation,
+                request_id: None,
+                generation: active_turn.generation,
+                client: self.client.handle(),
+                turn_cancelled: turn_scope.subscribe(),
+                interrupt_state: CodexInterruptState::NotRequested,
+            },
+        )
+        .await;
+        let mut closed = self.client.subscribe_closed();
         let (server_response_tx, mut server_responses) = mpsc::channel(64);
         let (server_request_tx, server_request_rx) = mpsc::unbounded_channel();
         let server_request_handler = self.spawn_server_request_worker(
@@ -628,9 +852,15 @@ impl CodexAppServerSession {
             )
             .await
         {
-            Ok(turn_start) => turn_start,
+            Ok(turn_start) => {
+                set_active_codex_turn_request_id(&active_turn, turn_generation, turn_start.id)
+                    .await;
+                turn_start
+            }
             Err(err) => {
+                clear_active_codex_turn(&active_turn, turn_generation).await;
                 drop(server_request_tx);
+                drop(server_responses);
                 turn_scope.cancel();
                 let _ = server_request_handler.await;
                 return ExecutorPromptOutcome::Failed(err);
@@ -639,6 +869,8 @@ impl CodexAppServerSession {
 
         let mut active_turn_id = None;
         let mut cancelled = false;
+        let mut cancellation_requested = false;
+        let mut backend_interrupted = false;
         let result: anyhow::Result<ExecutorResponse> = async {
             let mut final_text = String::new();
             let mut turn_start_acknowledged = false;
@@ -653,7 +885,25 @@ impl CodexAppServerSession {
                     if let Some(turn_id) = turn_id_from_turn_start_result(&result) {
                         self.client
                             .set_turn_stream_turn_id(turn_generation, turn_id.clone());
+                        let pending_interrupt =
+                            set_active_codex_turn_id(&active_turn, turn_generation, turn_id.clone())
+                                .await;
                         active_turn_id = Some(turn_id);
+                        if let Some(target) = pending_interrupt {
+                            if let Err(err) = target.issue().await {
+                                tracing::debug!(
+                                    target: "agent_router::codex_app_server",
+                                    error = %err,
+                                    generation = target.generation,
+                                    request_id = ?target.request_id,
+                                    turn_id = %target.turn_id,
+                                    "Codex turn/interrupt request failed after pending interrupt"
+                                );
+                            }
+                            cancelled = true;
+                            turn_scope.cancel();
+                            break;
+                        }
                     }
                     if turn_completed {
                         break;
@@ -667,6 +917,7 @@ impl CodexAppServerSession {
                                 &mut final_text,
                                 events,
                                 &mut turn_completed,
+                                &mut backend_interrupted,
                             ).await?;
                             if turn_completed {
                                 if turn_start_acknowledged {
@@ -697,6 +948,7 @@ impl CodexAppServerSession {
                             &mut final_text,
                             events,
                             &mut turn_completed,
+                            &mut backend_interrupted,
                         ).await?;
                         if turn_completed {
                             if turn_start_acknowledged {
@@ -723,6 +975,7 @@ impl CodexAppServerSession {
                                 &mut final_text,
                                 events,
                                 &mut turn_completed,
+                                &mut backend_interrupted,
                             ).await?;
                             if turn_completed && turn_start_acknowledged {
                                 break;
@@ -745,19 +998,46 @@ impl CodexAppServerSession {
                         self.limits.rpc_timeout.as_secs()
                     );
                 }
-                _ = cancel.cancelled() => {
+                _ = cancel.cancelled(), if !cancellation_requested => {
+                    cancellation_requested = true;
                     cancelled = true;
-                    self.client.cancel_pending(turn_start.id).await;
-                    self.client.close("codex app-server turn cancelled").await;
-                    break;
+                    turn_scope.cancel();
+                    match request_active_codex_turn_interrupt(&active_turn, turn_generation).await {
+                        Some(CodexInterruptAction::Send(target)) => {
+                            if let Err(err) = target.issue().await {
+                                tracing::debug!(
+                                    target: "agent_router::codex_app_server",
+                                    error = %err,
+                                    generation = target.generation,
+                                    request_id = ?target.request_id,
+                                    turn_id = %target.turn_id,
+                                    "Codex turn/interrupt request failed after local cancellation"
+                                );
+                            }
+                            break;
+                        }
+                        Some(CodexInterruptAction::AlreadySent) => break,
+                        Some(CodexInterruptAction::AwaitTurnId) | None => {}
+                    }
                 }
                 }
             }
 
             if !cancelled && cancel.is_cancelled().await {
                 cancelled = true;
-                self.client.cancel_pending(turn_start.id).await;
-                self.client.close("codex app-server turn cancelled").await;
+                if let Some(CodexInterruptAction::Send(target)) =
+                    request_active_codex_turn_interrupt(&active_turn, turn_generation).await
+                    && let Err(err) = target.issue().await
+                {
+                    tracing::debug!(
+                        target: "agent_router::codex_app_server",
+                        error = %err,
+                        generation = target.generation,
+                        request_id = ?target.request_id,
+                        turn_id = %target.turn_id,
+                        "Codex turn/interrupt request failed after observed cancellation"
+                    );
+                }
             }
             self.client
                 .finish_turn_streams(turn_generation, active_turn_id.as_deref());
@@ -770,14 +1050,27 @@ impl CodexAppServerSession {
                 .finish_turn_streams(turn_generation, active_turn_id.as_deref());
         }
         drop(server_request_tx);
+        drop(server_responses);
         turn_scope.cancel();
         let _ = server_request_handler.await;
         if !cancelled && cancel.is_cancelled().await {
             cancelled = true;
-            self.client.cancel_pending(turn_start.id).await;
-            self.client.close("codex app-server turn cancelled").await;
+            if let Some(CodexInterruptAction::Send(target)) =
+                request_active_codex_turn_interrupt(&active_turn, turn_generation).await
+                && let Err(err) = target.issue().await
+            {
+                tracing::debug!(
+                    target: "agent_router::codex_app_server",
+                    error = %err,
+                    generation = target.generation,
+                    request_id = ?target.request_id,
+                    turn_id = %target.turn_id,
+                    "Codex turn/interrupt request failed while finishing cancellation"
+                );
+            }
         }
-        if cancelled {
+        clear_active_codex_turn(&active_turn, turn_generation).await;
+        if cancelled || backend_interrupted {
             ExecutorPromptOutcome::Cancelled
         } else {
             match result {
@@ -793,12 +1086,19 @@ impl CodexAppServerSession {
         final_text: &mut String,
         events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
+        backend_interrupted: &mut bool,
     ) -> anyhow::Result<()> {
         for _ in 0..MAX_READY_NOTIFICATIONS_BEFORE_REQUEST {
             match notifications.try_recv() {
                 Ok(notification) => {
-                    self.handle_notification(notification, final_text, events, turn_completed)
-                        .await?;
+                    self.handle_notification(
+                        notification,
+                        final_text,
+                        events,
+                        turn_completed,
+                        backend_interrupted,
+                    )
+                    .await?;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -815,6 +1115,7 @@ impl CodexAppServerSession {
         final_text: &mut String,
         events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
+        backend_interrupted: &mut bool,
     ) -> anyhow::Result<()> {
         self.track_pending_file_change(&notification);
         let collected = collect_codex_notification(notification, final_text)?;
@@ -823,7 +1124,10 @@ impl CodexAppServerSession {
         }
         match collected.outcome {
             CodexNotificationOutcome::Pending => {}
-            CodexNotificationOutcome::TurnCompleted => *turn_completed = true,
+            CodexNotificationOutcome::TurnCompleted { interrupted } => {
+                *turn_completed = true;
+                *backend_interrupted |= interrupted;
+            }
         }
         Ok(())
     }
@@ -841,15 +1145,8 @@ impl CodexAppServerSession {
 
         tokio::spawn(async move {
             loop {
-                let request = tokio::select! {
-                    biased;
-                    _ = wait_turn_cancelled(turn_cancelled.clone()) => break,
-                    request = requests.recv() => {
-                        let Some(request) = request else {
-                            break;
-                        };
-                        request
-                    }
+                let Some(request) = requests.recv().await else {
+                    break;
                 };
                 match Self::handle_server_request(
                     approvals.clone(),
@@ -863,14 +1160,8 @@ impl CodexAppServerSession {
                 .await
                 {
                     Ok(Some(response)) => {
-                        tokio::select! {
-                            biased;
-                            _ = wait_turn_cancelled(turn_cancelled.clone()) => {}
-                            result = responses.send(response) => {
-                                if result.is_err() {
-                                    tracing::debug!("dropping Codex app-server response for closed turn");
-                                }
-                            }
+                        if responses.send(response).await.is_err() {
+                            tracing::debug!("dropping Codex app-server response for closed turn");
                         }
                     }
                     Ok(None) => {}
@@ -908,7 +1199,10 @@ impl CodexAppServerSession {
                     .request_until_cancelled(request, turn_cancelled)
                     .await
                 else {
-                    return Ok(None);
+                    return Ok(Some(codex_result_response(
+                        id,
+                        json!({ "decision": "decline" }),
+                    )));
                 };
                 let decision = match selection {
                     ApprovalSelection::Selected(option_id) if option_id == "accept" => "accept",
@@ -1048,12 +1342,19 @@ fn codex_approval_request(
 struct CodexJsonRpcClient {
     stdin: SharedStdin,
     state: SharedJsonRpcState,
-    next_id: AtomicU64,
+    next_id: SharedJsonRpcNextId,
     event_streams: SharedCodexEventStreams,
     closed: broadcast::Sender<String>,
     child: Arc<Mutex<Child>>,
     session_key: String,
     executor: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexJsonRpcClientHandle {
+    stdin: SharedStdin,
+    state: SharedJsonRpcState,
+    next_id: SharedJsonRpcNextId,
 }
 
 #[derive(Debug)]
@@ -1063,10 +1364,115 @@ struct PendingJsonRpcRequest {
     response: oneshot::Receiver<anyhow::Result<Value>>,
 }
 
+#[derive(Debug)]
+struct CodexLifecycleResponse {
+    result: Value,
+    cancelled: bool,
+}
+
 #[derive(Debug, Default)]
 struct JsonRpcState {
     closed: bool,
     pending: HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>,
+}
+
+impl CodexJsonRpcClientHandle {
+    async fn request_until_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Duration,
+    ) -> anyhow::Result<Value> {
+        let request = self.request_started(method, params).await?;
+        let id = request.id;
+        let method = request.method;
+        let timeout_fut = sleep(timeout_duration);
+        tokio::pin!(timeout_fut);
+        tokio::select! {
+            response = request.response => {
+                let response = match response {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => anyhow::bail!("codex app-server response channel closed"),
+                };
+                json_rpc_result(&method, response)
+            }
+            _ = &mut timeout_fut => {
+                cancel_pending_request(&self.state, id).await;
+                anyhow::bail!(
+                    "codex app-server `{method}` timed out after {}s",
+                    timeout_duration.as_secs()
+                );
+            }
+        }
+    }
+
+    async fn request_in_background(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Duration,
+        description: &'static str,
+    ) -> anyhow::Result<()> {
+        let request = self.request_started(method, params).await?;
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let id = request.id;
+            let method = request.method;
+            let timeout_fut = sleep(timeout_duration);
+            tokio::pin!(timeout_fut);
+            tokio::select! {
+                response = request.response => {
+                    match response {
+                        Ok(Ok(response)) => {
+                            if let Err(err) = json_rpc_result(&method, response) {
+                                tracing::debug!(
+                                    target: "agent_router::codex_app_server",
+                                    error = %err,
+                                    description,
+                                    "Codex background JSON-RPC request returned an error"
+                                );
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            tracing::debug!(
+                                target: "agent_router::codex_app_server",
+                                error = %err,
+                                description,
+                                "Codex background JSON-RPC request failed"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                target: "agent_router::codex_app_server",
+                                description,
+                                "Codex background JSON-RPC response channel closed"
+                            );
+                        }
+                    }
+                }
+                _ = &mut timeout_fut => {
+                    cancel_pending_request(&state, id).await;
+                    tracing::warn!(
+                        target: "agent_router::codex_app_server",
+                        method,
+                        timeout_secs = timeout_duration.as_secs(),
+                        description,
+                        "Codex background JSON-RPC request timed out"
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn request_started(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<PendingJsonRpcRequest> {
+        start_json_rpc_request(&self.stdin, &self.state, &self.next_id, method, params).await
+    }
 }
 
 impl CodexJsonRpcClient {
@@ -1120,6 +1526,7 @@ impl CodexJsonRpcClient {
 
         let stdin = Arc::new(Mutex::new(stdin));
         let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let next_id = Arc::new(AtomicU64::new(1));
         let event_streams = Arc::new(StdMutex::new(CodexEventStreams::default()));
         let (closed, _) = broadcast::channel(8);
         let child = Arc::new(Mutex::new(child));
@@ -1148,7 +1555,7 @@ impl CodexJsonRpcClient {
         Ok(Self {
             stdin,
             state,
-            next_id: AtomicU64::new(1),
+            next_id,
             event_streams,
             closed,
             child,
@@ -1189,6 +1596,14 @@ impl CodexJsonRpcClient {
             .finish(generation, turn_id);
     }
 
+    fn handle(&self) -> CodexJsonRpcClientHandle {
+        CodexJsonRpcClientHandle {
+            stdin: self.stdin.clone(),
+            state: self.state.clone(),
+            next_id: self.next_id.clone(),
+        }
+    }
+
     fn subscribe_closed(&self) -> broadcast::Receiver<String> {
         self.closed.subscribe()
     }
@@ -1213,39 +1628,42 @@ impl CodexJsonRpcClient {
             .unwrap_or(true)
     }
 
-    async fn request_until_cancelled(
+    async fn lifecycle_request_until_cancelled(
         &self,
         method: &str,
         params: Value,
         timeout_duration: Duration,
         cancel: TurnCancellation,
-        close_reason: &str,
-    ) -> anyhow::Result<Value> {
-        let request = self.request_started(method, params).await?;
+    ) -> anyhow::Result<CodexLifecycleResponse> {
+        let mut request = self.request_started(method, params).await?;
         let id = request.id;
         let method = request.method;
         let timeout_fut = sleep(timeout_duration);
         tokio::pin!(timeout_fut);
-        tokio::select! {
-            response = request.response => {
-                let response = match response {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => anyhow::bail!("codex app-server response channel closed"),
-                };
-                json_rpc_result(&method, response)
-            }
-            _ = &mut timeout_fut => {
-                self.cancel_pending(id).await;
-                anyhow::bail!(
-                    "codex app-server `{method}` timed out after {}s",
-                    timeout_duration.as_secs()
-                );
-            }
-            _ = cancel.cancelled() => {
-                self.cancel_pending(id).await;
-                self.close(close_reason).await;
-                anyhow::bail!("{close_reason}")
+        let mut cancelled = false;
+        loop {
+            tokio::select! {
+                response = &mut request.response => {
+                    let response = match response {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(err)) => return Err(err),
+                        Err(_) => anyhow::bail!("codex app-server response channel closed"),
+                    };
+                    return Ok(CodexLifecycleResponse {
+                        result: json_rpc_result(&method, response)?,
+                        cancelled,
+                    });
+                }
+                _ = &mut timeout_fut => {
+                    self.cancel_pending(id).await;
+                    anyhow::bail!(
+                        "codex app-server `{method}` timed out after {}s",
+                        timeout_duration.as_secs()
+                    );
+                }
+                _ = cancel.cancelled(), if !cancelled => {
+                    cancelled = true;
+                }
             }
         }
     }
@@ -1255,36 +1673,11 @@ impl CodexJsonRpcClient {
         method: &str,
         params: Value,
     ) -> anyhow::Result<PendingJsonRpcRequest> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut state = self.state.lock().await;
-            anyhow::ensure!(!state.closed, "codex app-server stdout is closed");
-            state.pending.insert(id, tx);
-        }
-        if let Err(err) = write_json(
-            &self.stdin,
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }),
-        )
-        .await
-        {
-            self.state.lock().await.pending.remove(&id);
-            return Err(err);
-        }
-        Ok(PendingJsonRpcRequest {
-            id,
-            method: method.to_string(),
-            response: rx,
-        })
+        start_json_rpc_request(&self.stdin, &self.state, &self.next_id, method, params).await
     }
 
     async fn cancel_pending(&self, id: u64) {
-        self.state.lock().await.pending.remove(&id);
+        cancel_pending_request(&self.state, id).await;
     }
 
     async fn close(&self, reason: &str) {
@@ -1324,6 +1717,45 @@ impl CodexJsonRpcClient {
         )
         .await
     }
+}
+
+async fn start_json_rpc_request(
+    stdin: &SharedStdin,
+    state: &SharedJsonRpcState,
+    next_id: &SharedJsonRpcNextId,
+    method: &str,
+    params: Value,
+) -> anyhow::Result<PendingJsonRpcRequest> {
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut state = state.lock().await;
+        anyhow::ensure!(!state.closed, "codex app-server stdout is closed");
+        state.pending.insert(id, tx);
+    }
+    if let Err(err) = write_json(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await
+    {
+        cancel_pending_request(state, id).await;
+        return Err(err);
+    }
+    Ok(PendingJsonRpcRequest {
+        id,
+        method: method.to_string(),
+        response: rx,
+    })
+}
+
+async fn cancel_pending_request(state: &SharedJsonRpcState, id: u64) {
+    state.lock().await.pending.remove(&id);
 }
 
 fn json_rpc_result(method: &str, response: Value) -> anyhow::Result<Value> {
@@ -1452,7 +1884,7 @@ async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexNotificationOutcome {
     Pending,
-    TurnCompleted,
+    TurnCompleted { interrupted: bool },
 }
 
 #[derive(Debug)]
@@ -1470,9 +1902,9 @@ fn collect_codex_notification(
         .and_then(Value::as_str)
         .unwrap_or("");
     if method == "turn/completed" {
-        validate_turn_completed(&notification)?;
+        let interrupted = validate_turn_completed(&notification)?;
         return Ok(CollectedCodexNotification {
-            outcome: CodexNotificationOutcome::TurnCompleted,
+            outcome: CodexNotificationOutcome::TurnCompleted { interrupted },
             updates: Vec::new(),
         });
     }
@@ -1582,14 +2014,17 @@ fn collect_codex_notification(
     })
 }
 
-fn validate_turn_completed(notification: &Value) -> anyhow::Result<()> {
+fn validate_turn_completed(notification: &Value) -> anyhow::Result<bool> {
     let turn = notification
         .get("params")
         .and_then(|params| params.get("turn"))
         .unwrap_or(&Value::Null);
     let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
     if status.is_empty() || status == "completed" {
-        return Ok(());
+        return Ok(false);
+    }
+    if matches!(status, "interrupted" | "cancelled" | "canceled") {
+        return Ok(true);
     }
     let error = turn
         .get("error")
@@ -1839,8 +2274,9 @@ mod tests {
 
     use crate::approval::ApprovalBroker;
     use crate::executor::{
-        ExecutorBackend, ExecutorChannelEventKind, ExecutorPrepareRequest, ExecutorPromptRequest,
-        ExecutorTurnRef, InterruptReason, test_support::CollectingExecutorEventSink,
+        ExecutorBackend, ExecutorChannelEventKind, ExecutorInterruptRequest,
+        ExecutorPrepareRequest, ExecutorPromptRequest, ExecutorTurnRef, InterruptReason,
+        test_support::CollectingExecutorEventSink,
     };
 
     use super::*;
@@ -2070,9 +2506,9 @@ for line in sys.stdin:
         send({{"jsonrpc": "2.0", "id": request_id, "result": {{"userAgent": "fake"}}}})
     elif method == "initialized":
         pass
+{behavior}
     elif method == "thread/start":
         send({{"jsonrpc": "2.0", "id": request_id, "result": {{"thread": {{"id": THREAD_ID}}}}}})
-{behavior}
 "#
             ),
         )
@@ -2166,20 +2602,50 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn codex_prompt_cancellation_closes_app_server_fallback() {
+    async fn codex_prompt_cancellation_sends_turn_interrupt_without_closing_app_server() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("cancellable_codex.py");
         let prompt_marker = tmp.path().join("turn_started");
+        let interrupt_marker = tmp.path().join("turn_interrupted");
         let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
             .expect("prompt marker path serializes");
+        let interrupt_marker_literal =
+            serde_json::to_string(&interrupt_marker.display().to_string())
+                .expect("interrupt marker path serializes");
         write_fake_codex_script(
             &script,
             &format!(
                 r#"    elif method == "turn/start":
+        turn_index = globals().get("turn_index", 0) + 1
+        globals()["turn_index"] = turn_index
+        active_turn_id = "turn-" + str(turn_index)
+        globals()["active_turn_id"] = active_turn_id
         with open({prompt_marker_literal}, "w") as f:
             f.write("started")
             f.flush()
-        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": active_turn_id}}}}}})
+        if turn_index > 1:
+            send({{
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {{"turnId": active_turn_id, "item": {{"type": "agentMessage", "text": "after interrupt"}}}},
+            }})
+            send({{
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {{"turn": {{"id": active_turn_id, "status": "completed"}}}},
+            }})
+    elif method == "turn/interrupt":
+        interrupted_turn_id = msg.get("params", {{}}).get("turnId")
+        with open({interrupt_marker_literal}, "w") as f:
+            f.write(json.dumps(msg))
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {{"turn": {{"id": interrupted_turn_id, "status": "interrupted"}}}},
+        }})
 "#
             ),
         );
@@ -2229,12 +2695,546 @@ for line in sys.stdin:
             prompt_task.await.unwrap(),
             ExecutorPromptOutcome::Cancelled
         ));
+        assert!(interrupt_marker.exists());
 
         let session = manager
             .existing_session("session-1", "codex")
             .await
             .unwrap();
-        assert!(!session.lock().await.client.is_alive());
+        assert!(session.lock().await.client.is_alive());
+
+        let mut events = CollectingExecutorEventSink::default();
+        let response = manager
+            .prompt(
+                ExecutorPromptRequest {
+                    turn: turn_ref("session-1", "codex", 2),
+                    prompt: "next".to_string(),
+                    user_id: None,
+                },
+                &mut events,
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.final_text, "after interrupt");
+    }
+
+    #[tokio::test]
+    async fn codex_interrupt_sends_turn_interrupt_while_prompt_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("interruptible_codex.py");
+        let prompt_marker = tmp.path().join("turn_started");
+        let interrupt_marker = tmp.path().join("turn_interrupted");
+        let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
+            .expect("prompt marker path serializes");
+        let interrupt_marker_literal =
+            serde_json::to_string(&interrupt_marker.display().to_string())
+                .expect("interrupt marker path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "turn/start":
+        with open({prompt_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+    elif method == "turn/interrupt":
+        with open({interrupt_marker_literal}, "w") as f:
+            f.write(json.dumps(msg))
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {{"turn": {{"id": "turn-1", "status": "interrupted"}}}},
+        }})
+"#
+            ),
+        );
+        let manager = Arc::new(CodexAppServerManager::new(executor_config(
+            &script,
+            tmp.path(),
+        )));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "codex", 1),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "codex", 1),
+                        prompt: "wait".to_string(),
+                        user_id: None,
+                    },
+                    &mut events,
+                    TurnCancellation::new(),
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if prompt_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(prompt_marker.exists());
+
+        manager
+            .interrupt(ExecutorInterruptRequest {
+                turn: turn_ref("session-1", "codex", 1),
+                reason: InterruptReason::UserStop,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(5), prompt_task)
+                .await
+                .expect("prompt task timed out")
+                .unwrap(),
+            ExecutorPromptOutcome::Cancelled
+        ));
+        assert!(interrupt_marker.exists());
+        let session = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        assert!(session.lock().await.client.is_alive());
+    }
+
+    #[tokio::test]
+    async fn codex_router_cancel_and_interrupt_send_one_turn_interrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("single_interrupt_codex.py");
+        let prompt_marker = tmp.path().join("turn_started");
+        let interrupt_count = tmp.path().join("interrupt_count");
+        let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
+            .expect("prompt marker path serializes");
+        let interrupt_count_literal = serde_json::to_string(&interrupt_count.display().to_string())
+            .expect("interrupt count path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "turn/start":
+        with open({prompt_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+    elif method == "turn/interrupt":
+        import os
+        count = 0
+        if os.path.exists({interrupt_count_literal}):
+            with open({interrupt_count_literal}) as f:
+                count = int(f.read() or "0")
+        with open({interrupt_count_literal}, "w") as f:
+            f.write(str(count + 1))
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {{"turn": {{"id": "turn-1", "status": "interrupted"}}}},
+        }})
+"#
+            ),
+        );
+        let manager = Arc::new(CodexAppServerManager::new(executor_config(
+            &script,
+            tmp.path(),
+        )));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "codex", 1),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let cancel = TurnCancellation::new();
+        let prompt_cancel = cancel.clone();
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "codex", 1),
+                        prompt: "wait".to_string(),
+                        user_id: None,
+                    },
+                    &mut events,
+                    prompt_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if prompt_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(prompt_marker.exists());
+
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        manager
+            .interrupt(ExecutorInterruptRequest {
+                turn: turn_ref("session-1", "codex", 1),
+                reason: InterruptReason::ReplacedByNewMessage,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(5), prompt_task)
+                .await
+                .expect("prompt task timed out")
+                .unwrap(),
+            ExecutorPromptOutcome::Cancelled
+        ));
+
+        let mut count = String::new();
+        for _ in 0..50 {
+            count = fs::read_to_string(&interrupt_count).unwrap_or_default();
+            if count == "1" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(count, "1");
+    }
+
+    #[tokio::test]
+    async fn codex_direct_interrupt_clears_pending_approval_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("interrupt_approval_codex.py");
+        let approval_response_marker = tmp.path().join("approval_response");
+        let approval_response_marker_literal =
+            serde_json::to_string(&approval_response_marker.display().to_string())
+                .expect("approval response marker path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "turn/start":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "id": 900,
+            "method": "item/commandExecution/requestApproval",
+            "params": {{"command": "danger", "cwd": "/tmp", "reason": "test"}},
+        }})
+    elif method == "turn/interrupt":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {{"turn": {{"id": "turn-1", "status": "interrupted"}}}},
+        }})
+    elif request_id == 900:
+        with open({approval_response_marker_literal}, "w") as f:
+            f.write(json.dumps(msg))
+            f.flush()
+"#
+            ),
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(CodexAppServerManager::with_approvals(
+            executor_config(&script, tmp.path()),
+            approvals.clone(),
+        ));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "codex", 1),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "codex", 1),
+                        prompt: "needs approval".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                    TurnCancellation::new(),
+                )
+                .await
+        });
+
+        let approval_prompt = timeout(Duration::from_secs(5), prompts.recv())
+            .await
+            .expect("approval prompt timed out")
+            .unwrap();
+        assert!(approvals.has_pending_for_session("session-1").await);
+
+        manager
+            .interrupt(ExecutorInterruptRequest {
+                turn: turn_ref("session-1", "codex", 1),
+                reason: InterruptReason::UserStop,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(5), prompt_task)
+                .await
+                .expect("prompt task timed out")
+                .unwrap(),
+            ExecutorPromptOutcome::Cancelled
+        ));
+        assert!(!approvals.has_pending_for_session("session-1").await);
+        let reply = approvals
+            .resolve_command(
+                "session-1",
+                &format!("/approve {}", approval_prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.text,
+            format!("Approval {} is not pending.", approval_prompt.id)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let approval_response = fs::read_to_string(&approval_response_marker).unwrap();
+        assert!(approval_response.contains(r#""decision": "decline""#));
+    }
+
+    #[tokio::test]
+    async fn codex_pre_turn_id_interrupt_declines_early_approval_before_interrupting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("early_approval_interrupt_codex.py");
+        let approval_response_marker = tmp.path().join("approval_response.json");
+        let interrupt_marker = tmp.path().join("turn_interrupted.json");
+        let approval_response_marker_literal =
+            serde_json::to_string(&approval_response_marker.display().to_string())
+                .expect("approval response marker path serializes");
+        let interrupt_marker_literal =
+            serde_json::to_string(&interrupt_marker.display().to_string())
+                .expect("interrupt marker path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "turn/start":
+        turn_request_id = request_id
+        send({{
+            "jsonrpc": "2.0",
+            "id": 900,
+            "method": "item/commandExecution/requestApproval",
+            "params": {{"command": "danger", "cwd": "/tmp", "reason": "test"}},
+        }})
+    elif request_id == 900:
+        with open({approval_response_marker_literal}, "w") as f:
+            f.write(json.dumps(msg))
+            f.flush()
+        if msg.get("result", {{}}).get("decision") == "decline":
+            send({{"jsonrpc": "2.0", "id": turn_request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+    elif method == "turn/interrupt":
+        with open({interrupt_marker_literal}, "w") as f:
+            f.write(json.dumps(msg))
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+        send({{
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {{"turn": {{"id": "turn-1", "status": "interrupted"}}}},
+        }})
+"#
+            ),
+        );
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let manager = Arc::new(CodexAppServerManager::with_approvals(
+            executor_config(&script, tmp.path()),
+            approvals.clone(),
+        ));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "codex", 1),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let cancel = TurnCancellation::new();
+        let prompt_cancel = cancel.clone();
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "codex", 1),
+                        prompt: "needs approval before ack".to_string(),
+                        user_id: Some("U1".to_string()),
+                    },
+                    &mut events,
+                    prompt_cancel,
+                )
+                .await
+        });
+
+        let approval_prompt = timeout(Duration::from_secs(5), prompts.recv())
+            .await
+            .expect("approval prompt timed out")
+            .unwrap();
+        assert!(approvals.has_pending_for_session("session-1").await);
+
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        manager
+            .interrupt(ExecutorInterruptRequest {
+                turn: turn_ref("session-1", "codex", 1),
+                reason: InterruptReason::ReplacedByNewMessage,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(5), prompt_task)
+                .await
+                .expect("prompt task timed out")
+                .unwrap(),
+            ExecutorPromptOutcome::Cancelled
+        ));
+        assert!(!approvals.has_pending_for_session("session-1").await);
+        let reply = approvals
+            .resolve_command(
+                "session-1",
+                &format!("/approve {}", approval_prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.text,
+            format!("Approval {} is not pending.", approval_prompt.id)
+        );
+
+        let approval_response = fs::read_to_string(&approval_response_marker).unwrap();
+        assert!(approval_response.contains(r#""decision": "decline""#));
+        assert!(interrupt_marker.exists());
+        let session = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        assert!(session.lock().await.client.is_alive());
+    }
+
+    #[tokio::test]
+    async fn codex_cancelled_prepare_after_publication_keeps_session_reusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("delayed_thread_start_codex.py");
+        let thread_start_marker = tmp.path().join("thread_start_seen");
+        let gate = tmp.path().join("release_thread_start");
+        let thread_start_marker_literal =
+            serde_json::to_string(&thread_start_marker.display().to_string())
+                .expect("marker path serializes");
+        let gate_literal =
+            serde_json::to_string(&gate.display().to_string()).expect("gate path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "thread/start":
+        thread_start_count = globals().get("thread_start_count", 0) + 1
+        globals()["thread_start_count"] = thread_start_count
+        if thread_start_count == 1:
+            with open({thread_start_marker_literal}, "w") as f:
+                f.write("seen")
+                f.flush()
+            while not __import__("os").path.exists({gate_literal}):
+                time.sleep(0.01)
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"thread": {{"id": THREAD_ID}}}}}})
+"#
+            ),
+        );
+        let manager = Arc::new(CodexAppServerManager::new(executor_config(
+            &script,
+            tmp.path(),
+        )));
+
+        let cancel = TurnCancellation::new();
+        let prepare_cancel = cancel.clone();
+        let prepare_manager = manager.clone();
+        let prepare_task = tokio::spawn(async move {
+            prepare_manager
+                .prepare(
+                    ExecutorPrepareRequest {
+                        turn: turn_ref("session-1", "codex", 1),
+                        cwd: None,
+                        previous_session_id: None,
+                    },
+                    prepare_cancel,
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if thread_start_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(thread_start_marker.exists());
+        let published = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+        fs::write(&gate, "go").unwrap();
+        let prepare_err = prepare_task.await.unwrap().unwrap_err();
+        assert!(prepare_err.to_string().contains("thread/start cancelled"));
+
+        let prepared = manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "codex", 2),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let reused = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&published, &reused));
+        assert_eq!(prepared.external_session_id.as_deref(), Some("thread-1"));
+        assert!(prepared.started_new_session);
+        assert!(reused.lock().await.client.is_alive());
     }
 
     #[tokio::test]
@@ -2970,6 +3970,7 @@ for line in sys.stdin:
         let mut events = CollectingExecutorEventSink::default();
         let mut final_text = String::new();
         let mut turn_completed = false;
+        let mut backend_interrupted = false;
 
         tx.send(json!({
             "method": "item/completed",
@@ -2983,11 +3984,13 @@ for line in sys.stdin:
                 &mut final_text,
                 &mut events,
                 &mut turn_completed,
+                &mut backend_interrupted,
             )
             .await
             .unwrap();
 
         assert!(!turn_completed);
+        assert!(!backend_interrupted);
         assert_eq!(events.updates.len(), 1);
     }
 
