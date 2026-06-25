@@ -5,7 +5,13 @@ pub mod registry;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::text::truncate_chars;
@@ -67,6 +73,7 @@ pub struct TurnCancellation {
 
 #[derive(Debug)]
 struct TurnCancellationInner {
+    cancelled: AtomicBool,
     reason: TokioMutex<Option<InterruptReason>>,
     changed: watch::Sender<Option<InterruptReason>>,
 }
@@ -76,6 +83,7 @@ impl TurnCancellation {
         let (changed, _) = watch::channel(None);
         Self {
             inner: Arc::new(TurnCancellationInner {
+                cancelled: AtomicBool::new(false),
                 reason: TokioMutex::new(None),
                 changed,
             }),
@@ -88,12 +96,17 @@ impl TurnCancellation {
             return false;
         }
         *guard = Some(reason);
+        self.inner.cancelled.store(true, Ordering::Release);
         let _ = self.inner.changed.send(Some(reason));
         true
     }
 
     pub async fn is_cancelled(&self) -> bool {
         self.inner.reason.lock().await.is_some()
+    }
+
+    pub fn is_cancelled_now(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
     }
 
     pub async fn cancelled(&self) -> InterruptReason {

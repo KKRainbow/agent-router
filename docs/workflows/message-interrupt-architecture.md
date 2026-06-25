@@ -433,6 +433,12 @@ Recommended contracts:
 - once a Backend Session is published in the adapter's shared session registry,
   a cancelled Turn cannot remove or close it merely because that Turn was
   cancelled.
+- Backend Session publication is compare-before-publish, never
+  last-writer-wins. If another prepare publishes first, the losing unpublished
+  process is closed and the winner remains the Manager-owned session.
+- Mismatched-session removal is compare-before-remove and cancellation-aware in
+  the same session-map critical section. A prepare cancelled while waiting to
+  remove a mismatched session cannot remove or close that session.
 - `prompt()` owns active backend work for one Turn.
 - `interrupt()` requests cancellation of active backend work for the specified
   Turn or Backend Session; it does not mean "destroy the shared Backend
@@ -955,6 +961,12 @@ prepare owns the Backend Session it touched.
   Backend Session. Lifecycle RPCs such as `initialize` and `thread/start` are
   driven to their response under the session lock before the cancelled prepare
   returns, so the shared session is not left in an unknown state.
+- Codex Backend Session publication is compare-before-publish; stale cancelled
+  prepares cannot remove newer published sessions, and publish losers close
+  their unpublished app-server process instead of overwriting the winner.
+- Codex mismatched-session removal re-checks cancellation while holding the
+  session map, so a cancellation that arrives after the first stale check still
+  prevents removal.
 - `started_new_session` is derived from actual `threadId` versus router
   `previous_session_id`, so a thread created by a cancelled prepare is still
   treated as a new session on the next successful prepare.
@@ -974,6 +986,8 @@ Codex coverage now includes:
   pending backend interrupt;
 - cancelled prepare after Backend Session publication keeps the same session
   reusable;
+- publication-lost and cancelled-mismatched-prepare races keep the newer
+  published Backend Session;
 - interrupted backend completion maps to `ExecutorPromptOutcome::Cancelled`.
 
 ### Phase 8: Delete Old Scattered State Rules `[implemented]`
@@ -992,6 +1006,12 @@ Codex coverage now includes:
   - kept adapter-local cache/reply ordering only where it protects platform
     cache state; it no longer uses router generation terminology and does not
     participate in router Turn lifecycle decisions.
+  - Codex app-server and Claude stream-json now publish Backend Sessions with
+    compare-before-publish semantics instead of last-writer-wins insertion.
+    Stale cancelled prepares cannot remove newer sessions, and publication
+    losers close only their own unpublished process. Their mismatched-session
+    removal helpers also check cancellation inside the session-map critical
+    section, so cancellation cannot race with removal.
   - cancellation paths now map to cancellation outcomes or cancelled prepare
     abandonment rather than ordinary backend failure. Process close remains
     isolated to unhealthy recovery paths.

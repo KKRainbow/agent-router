@@ -427,29 +427,105 @@ impl CodexAppServerManager {
         executor: &str,
         cfg: &ExecutorConfig,
         session_cwd: Option<&Path>,
+        cancel: &TurnCancellation,
     ) -> anyhow::Result<(SharedCodexSession, bool)> {
         let key = (session_key.to_string(), executor.to_string());
         let cwd = resolve_cwd(session_cwd.or(cfg.cwd.as_deref()))?;
-        let existing = self.sessions.lock().await.get(&key).cloned();
-        if let Some(existing) = existing {
-            let matches = existing.lock().await.matches(cfg, &cwd);
-            if matches {
-                return Ok((existing, false));
+        loop {
+            if cancel.is_cancelled().await {
+                anyhow::bail!("Codex app-server prepare cancelled");
             }
+            let existing = self.sessions.lock().await.get(&key).cloned();
+            if let Some(existing) = existing.as_ref() {
+                let matches = existing.lock().await.matches(cfg, &cwd);
+                if matches {
+                    return Ok((existing.clone(), false));
+                }
+                if cancel.is_cancelled().await {
+                    anyhow::bail!("Codex app-server prepare cancelled");
+                }
+                if !self
+                    .remove_session_if_same(
+                        &key,
+                        existing,
+                        "Codex app-server session no longer matches config",
+                        cancel,
+                    )
+                    .await
+                {
+                    continue;
+                }
+            }
+            let session = Arc::new(Mutex::new(
+                CodexAppServerSession::start(
+                    cfg.clone(),
+                    cwd.clone(),
+                    session_key.to_string(),
+                    executor.to_string(),
+                    self.approvals.clone(),
+                    self.limits,
+                )
+                .await?,
+            ));
+            if cancel.is_cancelled().await {
+                session
+                    .lock()
+                    .await
+                    .client
+                    .close("Codex app-server prepare cancelled before publication")
+                    .await;
+                anyhow::bail!("Codex app-server prepare cancelled");
+            }
+            if !self.publish_session_if_absent(&key, &session).await {
+                session
+                    .lock()
+                    .await
+                    .client
+                    .close("Codex app-server session publication lost race")
+                    .await;
+                continue;
+            }
+            return Ok((session, true));
         }
-        let session = Arc::new(Mutex::new(
-            CodexAppServerSession::start(
-                cfg.clone(),
-                cwd,
-                session_key.to_string(),
-                executor.to_string(),
-                self.approvals.clone(),
-                self.limits,
-            )
-            .await?,
-        ));
-        self.sessions.lock().await.insert(key, session.clone());
-        Ok((session, true))
+    }
+
+    async fn publish_session_if_absent(
+        &self,
+        key: &SessionKey,
+        session: &SharedCodexSession,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(key) {
+            return false;
+        }
+        sessions.insert(key.clone(), session.clone());
+        true
+    }
+
+    async fn remove_session_if_same(
+        &self,
+        key: &SessionKey,
+        session: &SharedCodexSession,
+        reason: &str,
+        cancel: &TurnCancellation,
+    ) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if !cancel.is_cancelled_now()
+                && sessions
+                    .get(key)
+                    .is_some_and(|existing| Arc::ptr_eq(existing, session))
+            {
+                sessions.remove(key);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            session.lock().await.client.close(reason).await;
+        }
+        removed
     }
 
     async fn existing_session(
@@ -512,6 +588,7 @@ impl ExecutorBackend for CodexAppServerManager {
                 &request.turn.executor,
                 cfg,
                 request.cwd.as_deref(),
+                &cancel,
             )
             .await?;
         if cancel.is_cancelled().await {
@@ -2402,18 +2479,19 @@ mod tests {
 
     fn executor_config(script: &Path, cwd: &Path) -> BTreeMap<String, ExecutorConfig> {
         let mut executors = BTreeMap::new();
-        executors.insert(
-            "codex".to_string(),
-            ExecutorConfig {
-                name: "codex".to_string(),
-                protocol: ExecutorProtocol::AppServer,
-                command: "python3".to_string(),
-                args: vec![script.display().to_string()],
-                cwd: Some(cwd.to_path_buf()),
-                env: BTreeMap::new(),
-            },
-        );
+        executors.insert("codex".to_string(), app_server_config(script, cwd));
         executors
+    }
+
+    fn app_server_config(script: &Path, cwd: &Path) -> ExecutorConfig {
+        ExecutorConfig {
+            name: "codex".to_string(),
+            protocol: ExecutorProtocol::AppServer,
+            command: "python3".to_string(),
+            args: vec![script.display().to_string()],
+            cwd: Some(cwd.to_path_buf()),
+            env: BTreeMap::new(),
+        }
     }
 
     fn make_executable(path: &Path) {
@@ -2625,6 +2703,144 @@ for line in sys.stdin:
         )
         .unwrap();
         make_executable(path);
+    }
+
+    #[tokio::test]
+    async fn codex_session_publication_lost_race_keeps_existing_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let winner_script = tmp.path().join("winner_codex.py");
+        let loser_script = tmp.path().join("loser_codex.py");
+        write_fake_codex_script(&winner_script, "");
+        write_fake_codex_script(&loser_script, "");
+        let manager = CodexAppServerManager::new(BTreeMap::new());
+        let key = ("session-1".to_string(), "codex".to_string());
+        let approvals = Arc::new(ApprovalBroker::default());
+        let winner = Arc::new(Mutex::new(
+            CodexAppServerSession::start(
+                app_server_config(&winner_script, tmp.path()),
+                tmp.path().to_path_buf(),
+                "session-1".to_string(),
+                "codex".to_string(),
+                approvals.clone(),
+                CodexRuntimeLimits::default(),
+            )
+            .await
+            .unwrap(),
+        ));
+        let loser = Arc::new(Mutex::new(
+            CodexAppServerSession::start(
+                app_server_config(&loser_script, tmp.path()),
+                tmp.path().to_path_buf(),
+                "session-1".to_string(),
+                "codex".to_string(),
+                approvals,
+                CodexRuntimeLimits::default(),
+            )
+            .await
+            .unwrap(),
+        ));
+
+        assert!(manager.publish_session_if_absent(&key, &winner).await);
+        assert!(!manager.publish_session_if_absent(&key, &loser).await);
+        loser
+            .lock()
+            .await
+            .client
+            .close("test publication loser")
+            .await;
+
+        let current = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &winner));
+        assert!(winner.lock().await.client.is_alive());
+        assert!(!loser.lock().await.client.is_alive());
+        winner.lock().await.client.close("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn codex_cancelled_removal_does_not_remove_matching_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("current_codex.py");
+        write_fake_codex_script(&script, "");
+        let manager = CodexAppServerManager::new(BTreeMap::new());
+        let key = ("session-1".to_string(), "codex".to_string());
+        let cancel = TurnCancellation::new();
+        let (session, _) = manager
+            .get_or_create_session(
+                "session-1",
+                "codex",
+                &app_server_config(&script, tmp.path()),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+
+        assert!(
+            !manager
+                .remove_session_if_same(&key, &session, "cancelled stale removal", &cancel)
+                .await
+        );
+
+        let current = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &session));
+        assert!(session.lock().await.client.is_alive());
+        session.lock().await.client.close("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn codex_cancelled_mismatched_prepare_does_not_remove_newer_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_script = tmp.path().join("old_codex.py");
+        let new_script = tmp.path().join("new_codex.py");
+        write_fake_codex_script(&old_script, "");
+        write_fake_codex_script(&new_script, "");
+        let manager = CodexAppServerManager::new(BTreeMap::new());
+        let new_cancel = TurnCancellation::new();
+        let (newer, _) = manager
+            .get_or_create_session(
+                "session-1",
+                "codex",
+                &app_server_config(&new_script, tmp.path()),
+                None,
+                &new_cancel,
+            )
+            .await
+            .unwrap();
+        let stale_cancel = TurnCancellation::new();
+        assert!(
+            stale_cancel
+                .cancel(InterruptReason::ReplacedByNewMessage)
+                .await
+        );
+
+        let err = manager
+            .get_or_create_session(
+                "session-1",
+                "codex",
+                &app_server_config(&old_script, tmp.path()),
+                None,
+                &stale_cancel,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Codex app-server prepare cancelled")
+        );
+        let current = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &newer));
+        newer.lock().await.client.close("test complete").await;
     }
 
     #[tokio::test]

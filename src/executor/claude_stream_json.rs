@@ -433,29 +433,87 @@ impl ClaudeStreamJsonManager {
         cfg: &ExecutorConfig,
         cwd: PathBuf,
         previous_session_id: Option<String>,
+        cancel: &TurnCancellation,
     ) -> anyhow::Result<SharedClaudeSession> {
         let key = (session_key.to_string(), executor.to_string());
-        let existing = self.sessions.lock().await.get(&key).cloned();
-        if let Some(existing) = existing {
-            let guard = existing.lock().await;
-            if guard.is_alive() && guard.matches(cfg, &cwd) {
-                drop(guard);
-                return Ok(existing);
+        loop {
+            if cancel.is_cancelled().await {
+                anyhow::bail!("Claude stream-json prepare cancelled");
             }
+            let existing = self.sessions.lock().await.get(&key).cloned();
+            if let Some(existing) = existing.as_ref() {
+                let guard = existing.lock().await;
+                let matches = guard.is_alive() && guard.matches(cfg, &cwd);
+                drop(guard);
+                if matches {
+                    return Ok(existing.clone());
+                }
+                if cancel.is_cancelled().await {
+                    anyhow::bail!("Claude stream-json prepare cancelled");
+                }
+                if !self.remove_session_if_same(&key, existing, cancel).await {
+                    continue;
+                }
+            }
+            let session = Arc::new(Mutex::new(
+                ClaudeSession::start(
+                    cfg.clone(),
+                    cwd.clone(),
+                    session_key.to_string(),
+                    executor.to_string(),
+                    self.approvals.clone(),
+                    previous_session_id.clone(),
+                )
+                .await?,
+            ));
+            if cancel.is_cancelled().await {
+                session.lock().await.close().await;
+                anyhow::bail!("Claude stream-json prepare cancelled");
+            }
+            if !self.publish_session_if_absent(&key, &session).await {
+                session.lock().await.close().await;
+                continue;
+            }
+            return Ok(session);
         }
-        let session = Arc::new(Mutex::new(
-            ClaudeSession::start(
-                cfg.clone(),
-                cwd,
-                session_key.to_string(),
-                executor.to_string(),
-                self.approvals.clone(),
-                previous_session_id,
-            )
-            .await?,
-        ));
-        self.sessions.lock().await.insert(key, session.clone());
-        Ok(session)
+    }
+
+    async fn publish_session_if_absent(
+        &self,
+        key: &SessionKey,
+        session: &SharedClaudeSession,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(key) {
+            return false;
+        }
+        sessions.insert(key.clone(), session.clone());
+        true
+    }
+
+    async fn remove_session_if_same(
+        &self,
+        key: &SessionKey,
+        session: &SharedClaudeSession,
+        cancel: &TurnCancellation,
+    ) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if !cancel.is_cancelled_now()
+                && sessions
+                    .get(key)
+                    .is_some_and(|existing| Arc::ptr_eq(existing, session))
+            {
+                sessions.remove(key);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            session.lock().await.close().await;
+        }
+        removed
     }
 
     async fn existing_session(
@@ -526,6 +584,7 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
                 cfg,
                 cwd,
                 previous_session_id.clone(),
+                &cancel,
             )
             .await?;
         if cancel.is_cancelled().await {
@@ -1176,7 +1235,33 @@ mod session_tests {
     use super::*;
     use crate::executor::{ExecutorTurnRef, InterruptReason};
     use std::collections::BTreeMap;
+    use std::path::Path;
     use std::time::Duration;
+
+    fn claude_executor_config(script: &Path, cwd: &Path) -> ExecutorConfig {
+        ExecutorConfig {
+            name: "claude".to_string(),
+            protocol: crate::config::ExecutorProtocol::ClaudeStreamJson,
+            command: "sh".to_string(),
+            args: vec![script.display().to_string()],
+            cwd: Some(cwd.to_path_buf()),
+            env: BTreeMap::new(),
+        }
+    }
+
+    fn write_fake_claude_script(path: &Path, session_id: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"printf '{{"type":"system","session_id":"{session_id}"}}\n'
+while IFS= read -r line; do
+  printf '{{"type":"result","result":"ok"}}\n'
+done
+"#
+            ),
+        )
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn session_tracks_external_id_from_system_event() {
@@ -1248,6 +1333,142 @@ mod session_tests {
             }
             other => panic!("expected Completed outcome, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn claude_session_publication_lost_race_keeps_existing_session() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let winner_script = temp_dir.path().join("winner_claude.sh");
+        let loser_script = temp_dir.path().join("loser_claude.sh");
+        write_fake_claude_script(&winner_script, "winner-session");
+        write_fake_claude_script(&loser_script, "loser-session");
+        let manager = ClaudeStreamJsonManager::new(BTreeMap::new());
+        let key = ("session-1".to_string(), "claude".to_string());
+        let approvals = Arc::new(crate::approval::ApprovalBroker::default());
+        let winner = Arc::new(Mutex::new(
+            ClaudeSession::start(
+                claude_executor_config(&winner_script, temp_dir.path()),
+                temp_dir.path().to_path_buf(),
+                "session-1".to_string(),
+                "claude".to_string(),
+                approvals.clone(),
+                None,
+            )
+            .await
+            .unwrap(),
+        ));
+        let loser = Arc::new(Mutex::new(
+            ClaudeSession::start(
+                claude_executor_config(&loser_script, temp_dir.path()),
+                temp_dir.path().to_path_buf(),
+                "session-1".to_string(),
+                "claude".to_string(),
+                approvals,
+                None,
+            )
+            .await
+            .unwrap(),
+        ));
+
+        assert!(manager.publish_session_if_absent(&key, &winner).await);
+        assert!(!manager.publish_session_if_absent(&key, &loser).await);
+        loser.lock().await.close().await;
+
+        let current = manager
+            .existing_session("session-1", "claude")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &winner));
+        assert!(winner.lock().await.is_alive());
+        assert!(!loser.lock().await.is_alive());
+        winner.lock().await.close().await;
+    }
+
+    #[tokio::test]
+    async fn claude_cancelled_removal_does_not_remove_matching_session() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let script = temp_dir.path().join("current_claude.sh");
+        write_fake_claude_script(&script, "current-session");
+        let manager = ClaudeStreamJsonManager::new(BTreeMap::new());
+        let key = ("session-1".to_string(), "claude".to_string());
+        let cancel = TurnCancellation::new();
+        let session = manager
+            .get_or_create_session(
+                "session-1",
+                "claude",
+                &claude_executor_config(&script, temp_dir.path()),
+                temp_dir.path().to_path_buf(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(cancel.cancel(InterruptReason::ReplacedByNewMessage).await);
+
+        assert!(
+            !manager
+                .remove_session_if_same(&key, &session, &cancel)
+                .await
+        );
+
+        let current = manager
+            .existing_session("session-1", "claude")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &session));
+        assert!(session.lock().await.is_alive());
+        session.lock().await.close().await;
+    }
+
+    #[tokio::test]
+    async fn claude_cancelled_mismatched_prepare_does_not_remove_newer_session() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let old_script = temp_dir.path().join("old_claude.sh");
+        let new_script = temp_dir.path().join("new_claude.sh");
+        write_fake_claude_script(&old_script, "old-session");
+        write_fake_claude_script(&new_script, "new-session");
+        let manager = ClaudeStreamJsonManager::new(BTreeMap::new());
+        let new_cancel = TurnCancellation::new();
+        let newer = manager
+            .get_or_create_session(
+                "session-1",
+                "claude",
+                &claude_executor_config(&new_script, temp_dir.path()),
+                temp_dir.path().to_path_buf(),
+                None,
+                &new_cancel,
+            )
+            .await
+            .unwrap();
+        let stale_cancel = TurnCancellation::new();
+        assert!(
+            stale_cancel
+                .cancel(InterruptReason::ReplacedByNewMessage)
+                .await
+        );
+
+        let err = manager
+            .get_or_create_session(
+                "session-1",
+                "claude",
+                &claude_executor_config(&old_script, temp_dir.path()),
+                temp_dir.path().to_path_buf(),
+                None,
+                &stale_cancel,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Claude stream-json prepare cancelled")
+        );
+        let current = manager
+            .existing_session("session-1", "claude")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &newer));
+        newer.lock().await.close().await;
     }
 
     #[tokio::test]
