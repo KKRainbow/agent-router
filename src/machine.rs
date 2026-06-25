@@ -1118,11 +1118,15 @@ mod tests {
         ]));
         let env = BTreeMap::new();
         let args = Vec::new();
+        let session_a = "slack:channel:C1:111.000";
+        let session_b = "slack:channel:C1:222.000";
+        let session_a_dir = session_workspace_dir_name(session_a);
+        let session_b_dir = session_workspace_dir_name(session_b);
 
         let first_a = registry
             .prepare_executor_command(MachinePrepareRequest {
                 machine_id: "machine-a",
-                session_key: "slack:channel:C1:111.000",
+                session_key: session_a,
                 router_workspace: None,
                 executor_cwd: None,
                 command: "agent",
@@ -1137,7 +1141,22 @@ mod tests {
         let second_a = registry
             .prepare_executor_command(MachinePrepareRequest {
                 machine_id: "machine-a",
-                session_key: "slack:channel:C1:111.000",
+                session_key: session_a,
+                router_workspace: None,
+                executor_cwd: None,
+                command: "agent",
+                args: &args,
+                env: &env,
+                cancel: None,
+            })
+            .await
+            .unwrap()
+            .workspace
+            .unwrap();
+        let other_session_a = registry
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: "machine-a",
+                session_key: session_b,
                 router_workspace: None,
                 executor_cwd: None,
                 command: "agent",
@@ -1152,7 +1171,7 @@ mod tests {
         let first_b = registry
             .prepare_executor_command(MachinePrepareRequest {
                 machine_id: "machine-b",
-                session_key: "slack:channel:C1:111.000",
+                session_key: session_a,
                 router_workspace: None,
                 executor_cwd: None,
                 command: "agent",
@@ -1166,10 +1185,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(first_a.cwd, second_a.cwd);
+        assert_ne!(first_a.cwd, other_session_a.cwd);
         assert_ne!(first_a.cwd, first_b.cwd);
         assert_eq!(first_a.machine_id, "machine-a");
+        assert_eq!(other_session_a.machine_id, "machine-a");
         assert_eq!(first_b.machine_id, "machine-b");
+        assert_eq!(
+            Path::new(&first_a.cwd)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(session_a_dir.as_str())
+        );
+        assert_eq!(
+            Path::new(&other_session_a.cwd)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(session_b_dir.as_str())
+        );
         assert!(Path::new(&first_a.cwd).starts_with(root_a.canonicalize().unwrap()));
+        assert!(Path::new(&other_session_a.cwd).starts_with(root_a.canonicalize().unwrap()));
         assert!(Path::new(&first_b.cwd).starts_with(root_b.canonicalize().unwrap()));
     }
 
