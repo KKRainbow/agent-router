@@ -482,13 +482,12 @@ impl PreparedContextSync {
         F: FnMut(ContextCommitCheckpoint) -> Fut,
         Fut: Future<Output = ()>,
     {
-        let cancel = turn.cancellation();
-        if cancel.is_cancelled().await || !turn.is_current().await {
+        if !turn.is_context_commit_allowed().await {
             return Ok(false);
         }
         let installed = self.plan.install()?;
         hook(ContextCommitCheckpoint::AfterInstall).await;
-        if cancel.is_cancelled().await || !turn.is_current().await {
+        if !turn.is_context_commit_allowed().await {
             drop(installed);
             return Ok(false);
         }
@@ -497,7 +496,7 @@ impl PreparedContextSync {
         self.state.context_artifacts = records;
         store.save(self.state).await;
         hook(ContextCommitCheckpoint::AfterStateSave).await;
-        if cancel.is_cancelled().await || !turn.is_current().await {
+        if !turn.is_context_commit_allowed().await {
             drop(installed);
             store.save(old_state).await;
             return Ok(false);
@@ -509,7 +508,7 @@ impl PreparedContextSync {
             context_records = self.record_count,
             unresolved_count = self.unresolved_count,
             cwd = %self.session_cwd.display(),
-            generation = turn.generation(),
+            generation = turn.log_generation(),
             "synced session context artifacts"
         );
         Ok(true)
@@ -872,7 +871,7 @@ where
                     None => {
                         tracing::debug!(
                             session_key = %session_key,
-                            generation = reservation.generation(),
+                            generation = reservation.log_generation(),
                             "discarded stale preempted router turn before prompt"
                         );
                         return Ok(());
@@ -889,7 +888,7 @@ where
                 let prepared = match self.prepare_context_sync_locked(context).await {
                     Ok(prepared) => prepared,
                     Err(err) => {
-                        let _ = turn.finish_if_current().await;
+                        let _ = turn.abandon_if_current().await;
                         return Err(err);
                     }
                 };
@@ -898,14 +897,14 @@ where
                         match prepared.commit_if_current(&turn, self.store.as_ref()).await {
                             Ok(committed) => committed,
                             Err(err) => {
-                                let _ = turn.finish_if_current().await;
+                                let _ = turn.abandon_if_current().await;
                                 return Err(err);
                             }
                         };
                     if !committed {
                         tracing::debug!(
                             session_key = %session_key,
-                            generation = turn.generation(),
+                            generation = turn.log_generation(),
                             "discarded stale reserved router turn before context commit"
                         );
                         return Ok(());
@@ -934,7 +933,7 @@ where
 
         debug_assert_eq!(turn.session_key(), session_key);
         debug_assert_eq!(turn.executor(), executor_name);
-        let generation = turn.generation();
+        let generation = turn.log_generation();
         let cancel = turn.cancellation();
         let executor_turn = turn.executor_turn_ref();
         tracing::info!(
@@ -964,7 +963,7 @@ where
             Ok(prepared) => prepared,
             Err(err) => {
                 if cancel.is_cancelled().await {
-                    let _ = turn.finish_if_current().await;
+                    let _ = turn.abandon_if_current().await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -1010,7 +1009,7 @@ where
             }
         };
         if cancel.is_cancelled().await {
-            let _ = turn.finish_if_current().await;
+            let _ = turn.abandon_if_current().await;
             tracing::info!(
                 session_key = %session_key,
                 executor = %executor_name,
@@ -1116,7 +1115,7 @@ where
                 output.send_final_reply(response.final_text).await
             }
             ExecutorPromptOutcome::Cancelled => {
-                let current = turn.finish_if_current().await;
+                let current = turn.abandon_if_current().await;
                 tracing::info!(
                     session_key = %session_key,
                     executor = %executor_name,
@@ -1403,7 +1402,7 @@ where
             .resolve_command(&input.session_key, &input.text, input.user_id.as_deref())
             .await
         {
-            let _ = reservation.discard_if_current().await;
+            let _ = reservation.abandon_if_current().await;
             return output.send_final_reply(reply.text).await;
         }
         match self
@@ -1412,7 +1411,7 @@ where
         {
             Ok(()) => Ok(()),
             Err(err) => {
-                let _ = reservation.discard_if_current().await;
+                let _ = reservation.abandon_if_current().await;
                 Err(err)
             }
         }
@@ -1466,7 +1465,7 @@ impl<'a> RouterExecutorEventSink<'a> {
 impl ExecutorEventSink for RouterExecutorEventSink<'_> {
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
         if let Some(event) = channel_event_from_executor_update(self.executor, &update)
-            && self.turn.is_current().await
+            && self.turn.is_output_allowed().await
         {
             self.output.send_channel_event(event);
         }
@@ -4809,7 +4808,7 @@ mod tests {
                 let stale_turn = stale_turn.clone();
                 async move {
                     if checkpoint == ContextCommitCheckpoint::AfterInstall {
-                        let _ = stale_turn.finish_if_current().await;
+                        let _ = stale_turn.abandon_if_current().await;
                     }
                 }
             })
@@ -4870,7 +4869,7 @@ mod tests {
                 let stale_turn = stale_turn.clone();
                 async move {
                     if checkpoint == ContextCommitCheckpoint::AfterStateSave {
-                        let _ = stale_turn.finish_if_current().await;
+                        let _ = stale_turn.abandon_if_current().await;
                     }
                 }
             })

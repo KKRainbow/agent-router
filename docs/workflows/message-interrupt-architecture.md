@@ -781,14 +781,15 @@ Already present:
 - `TurnRegistry`, `TurnReservation`, and `TurnGuard`;
 - active Turn storage and generation allocation outside `AgentRouter`;
 - replacement reservation, adoption, cancellation, stale finish, and `/stop`;
+- `TurnGuard` exposes typed router lifecycle operations for context commit
+  eligibility, output eligibility, abandoned Turns, and guarded commits instead
+  of exposing generic currentness checks to route code;
 - tests for replacement cancellation, stale reservation behavior, and command
   cancellation.
 
 Remaining work:
 
-- make `TurnGuard` the only router-state commit capability, not just the
-  currentness probe;
-- reduce raw generation exposure to logging and Executor correlation only;
+- keep raw generation exposure limited to logging and Executor correlation;
 - move repeated route-flow sequencing out of `src/router.rs` once the Turn
   Runner exists.
 
@@ -799,14 +800,15 @@ Already present:
 - success, cancellation, and stale paths use `TurnGuard` currentness checks;
 - successful Turn commits and failure-to-unhealthy binding commits now run
   through `TurnGuard::commit_if_current()`;
+- cancellation cleanup and context commit eligibility now run through typed
+  `TurnGuard` operations instead of ad hoc cancellation plus active-generation
+  checks;
 - old Turn events and final replies are gated against currentness;
 - route errors clear reserved placeholder Turns instead of leaving stale active
   records.
 
 Remaining work:
 
-- move cancellation cleanup and remaining context commit sequencing behind typed
-  `TurnGuard` operations;
 - separate the Turn Runner from command/intake code;
 - centralize stream event and final reply projection in one Turn-scoped output
   Module.
@@ -988,11 +990,13 @@ Codex coverage now includes:
   - removed `created_session` cancellation cleanup from Executor adapters; ACP,
     Codex app-server, and Claude stream-json no longer close an already
     published Backend Session from cancelled prepare cleanup.
+  - removed generic `TurnGuard::is_current()`, `finish_if_current()`, and raw
+    `generation()` calls from router code; router now uses typed TurnGuard
+    operations and explicit logging-only generation accessors.
 - Remaining:
 - Remove raw generation checks from Channel Adapters unless they are strictly
   local platform-cache sequence numbers.
 - Remove duplicated context-cache currentness code that the Turn Guard replaces.
-- Remove router helper methods that expose active generation directly.
 - Remove any fallback path where cancellation is handled as ordinary backend
   failure.
 
