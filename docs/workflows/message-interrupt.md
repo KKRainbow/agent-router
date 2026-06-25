@@ -256,6 +256,9 @@ Important constraints:
   a backend interrupt.
 - Prompt cancellation sends `turn/interrupt`; it does not close a healthy
   app-server process.
+- If `turn/interrupt` fails, times out, or returns a JSON-RPC error, the
+  adapter closes the app-server as unhealthy recovery before allowing another
+  turn to use that backend session.
 - Direct `interrupt()` cancels the local turn scope, so pending approval
   prompts are removed even before the backend emits `turn/completed`.
 - If Codex sends approval requests before `turn/start` returns a `turnId`,
@@ -272,7 +275,8 @@ Important constraints:
   create the thread during the current prepare call. This prevents a cancelled
   prepare from making the next prompt drop required context.
 - Process close remains reserved for unhealthy paths such as startup failure or
-  request timeout, not normal message interrupt.
+  request timeout, including a failed `turn/interrupt` request. It is not the
+  normal message interrupt path.
 
 ## Transcript and Context Cursor Rules
 

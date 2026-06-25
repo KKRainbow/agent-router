@@ -934,6 +934,9 @@ Backend Session it touched.
 - The active turn registry is an at-most-once gate for `turn/interrupt`, so the
   router's local cancellation token and backend `interrupt()` cannot send
   duplicate backend interrupts for the same Codex turn.
+- If `turn/interrupt` fails, times out, or returns a JSON-RPC error, Codex is
+  treated as unhealthy and the app-server process is closed before another turn
+  can reuse that backend session.
 - Direct backend `interrupt()` cancels the local turn scope, which clears
   pending approval prompts while the backend turn is being interrupted.
 - Cancellation still answers pre-`turnId` Codex approval requests with
@@ -951,7 +954,7 @@ Backend Session it touched.
   `previous_session_id`, so a thread created by a cancelled prepare is still
   treated as a new session on the next successful prepare.
 - Process close remains isolated to unhealthy recovery paths such as startup
-  failure and request timeout.
+  failure, request timeout, and failed `turn/interrupt`.
 
 Codex coverage now includes:
 
@@ -959,6 +962,7 @@ Codex coverage now includes:
 - prompt cancellation sends `turn/interrupt` and keeps the app-server reusable;
 - router cancellation plus backend interrupt sends only one `turn/interrupt`;
 - direct backend interrupt clears pending approval scope;
+- failed `turn/interrupt` closes the app-server as unhealthy recovery;
 - pre-`turnId` interrupt declines early approval requests before sending the
   pending backend interrupt;
 - cancelled prepare after Backend Session publication keeps the same session

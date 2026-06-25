@@ -234,7 +234,8 @@ enum CodexInterruptAction {
 
 impl CodexInterruptTarget {
     async fn issue(&self) -> anyhow::Result<()> {
-        self.client
+        let result = self
+            .client
             .request_until_timeout(
                 "turn/interrupt",
                 json!({
@@ -243,8 +244,14 @@ impl CodexInterruptTarget {
                 }),
                 CODEX_INTERRUPT_TIMEOUT,
             )
-            .await
-            .map(|_| ())
+            .await;
+        if let Err(err) = result {
+            self.client
+                .close("codex app-server turn/interrupt failed")
+                .await;
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn issue_in_background(self) -> anyhow::Result<()> {
@@ -1355,6 +1362,10 @@ struct CodexJsonRpcClientHandle {
     stdin: SharedStdin,
     state: SharedJsonRpcState,
     next_id: SharedJsonRpcNextId,
+    closed: broadcast::Sender<String>,
+    child: Arc<Mutex<Child>>,
+    session_key: String,
+    executor: String,
 }
 
 #[derive(Debug)]
@@ -1415,7 +1426,7 @@ impl CodexJsonRpcClientHandle {
         description: &'static str,
     ) -> anyhow::Result<()> {
         let request = self.request_started(method, params).await?;
-        let state = self.state.clone();
+        let client = self.clone();
         tokio::spawn(async move {
             let id = request.id;
             let method = request.method;
@@ -1432,6 +1443,9 @@ impl CodexJsonRpcClientHandle {
                                     description,
                                     "Codex background JSON-RPC request returned an error"
                                 );
+                                client
+                                    .close("codex app-server background request failed")
+                                    .await;
                             }
                         }
                         Ok(Err(err)) => {
@@ -1441,6 +1455,9 @@ impl CodexJsonRpcClientHandle {
                                 description,
                                 "Codex background JSON-RPC request failed"
                             );
+                            client
+                                .close("codex app-server background request failed")
+                                .await;
                         }
                         Err(_) => {
                             tracing::debug!(
@@ -1448,11 +1465,14 @@ impl CodexJsonRpcClientHandle {
                                 description,
                                 "Codex background JSON-RPC response channel closed"
                             );
+                            client
+                                .close("codex app-server background response channel closed")
+                                .await;
                         }
                     }
                 }
                 _ = &mut timeout_fut => {
-                    cancel_pending_request(&state, id).await;
+                    cancel_pending_request(&client.state, id).await;
                     tracing::warn!(
                         target: "agent_router::codex_app_server",
                         method,
@@ -1460,6 +1480,9 @@ impl CodexJsonRpcClientHandle {
                         description,
                         "Codex background JSON-RPC request timed out"
                     );
+                    client
+                        .close("codex app-server background request timed out")
+                        .await;
                 }
             }
         });
@@ -1472,6 +1495,18 @@ impl CodexJsonRpcClientHandle {
         params: Value,
     ) -> anyhow::Result<PendingJsonRpcRequest> {
         start_json_rpc_request(&self.stdin, &self.state, &self.next_id, method, params).await
+    }
+
+    async fn close(&self, reason: &str) {
+        close_codex_app_server(
+            &self.state,
+            &self.closed,
+            &self.child,
+            &self.executor,
+            &self.session_key,
+            reason,
+        )
+        .await;
     }
 }
 
@@ -1601,6 +1636,10 @@ impl CodexJsonRpcClient {
             stdin: self.stdin.clone(),
             state: self.state.clone(),
             next_id: self.next_id.clone(),
+            closed: self.closed.clone(),
+            child: self.child.clone(),
+            session_key: self.session_key.clone(),
+            executor: self.executor.clone(),
         }
     }
 
@@ -1681,29 +1720,15 @@ impl CodexJsonRpcClient {
     }
 
     async fn close(&self, reason: &str) {
-        fail_all_pending(&self.state, reason).await;
-        let _ = self.closed.send(reason.to_string());
-        let mut child = self.child.lock().await;
-        let pid = child.id();
-        tracing::warn!(
-            target: "agent_router::codex_app_server",
-            executor = %self.executor,
-            session_key = %self.session_key,
-            pid = ?pid,
+        close_codex_app_server(
+            &self.state,
+            &self.closed,
+            &self.child,
+            &self.executor,
+            &self.session_key,
             reason,
-            "closing Codex app-server process"
-        );
-        if let Err(err) = child.start_kill() {
-            tracing::warn!(
-                target: "agent_router::codex_app_server",
-                executor = %self.executor,
-                session_key = %self.session_key,
-                pid = ?pid,
-                reason,
-                error = %err,
-                "failed to signal Codex app-server process"
-            );
-        }
+        )
+        .await;
     }
 
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
@@ -1716,6 +1741,39 @@ impl CodexJsonRpcClient {
             }),
         )
         .await
+    }
+}
+
+async fn close_codex_app_server(
+    state: &SharedJsonRpcState,
+    closed: &broadcast::Sender<String>,
+    child: &Arc<Mutex<Child>>,
+    executor: &str,
+    session_key: &str,
+    reason: &str,
+) {
+    fail_all_pending(state, reason).await;
+    let _ = closed.send(reason.to_string());
+    let mut child = child.lock().await;
+    let pid = child.id();
+    tracing::warn!(
+        target: "agent_router::codex_app_server",
+        executor = %executor,
+        session_key = %session_key,
+        pid = ?pid,
+        reason,
+        "closing Codex app-server process"
+    );
+    if let Err(err) = child.start_kill() {
+        tracing::warn!(
+            target: "agent_router::codex_app_server",
+            executor = %executor,
+            session_key = %session_key,
+            pid = ?pid,
+            reason,
+            error = %err,
+            "failed to signal Codex app-server process"
+        );
     }
 }
 
@@ -3024,6 +3082,106 @@ for line in sys.stdin:
         tokio::time::sleep(Duration::from_millis(50)).await;
         let approval_response = fs::read_to_string(&approval_response_marker).unwrap();
         assert!(approval_response.contains(r#""decision": "decline""#));
+    }
+
+    #[tokio::test]
+    async fn codex_interrupt_error_closes_app_server_as_unhealthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("interrupt_error_codex.py");
+        let prompt_marker = tmp.path().join("turn_started");
+        let interrupt_marker = tmp.path().join("turn_interrupted");
+        let prompt_marker_literal = serde_json::to_string(&prompt_marker.display().to_string())
+            .expect("prompt marker path serializes");
+        let interrupt_marker_literal =
+            serde_json::to_string(&interrupt_marker.display().to_string())
+                .expect("interrupt marker path serializes");
+        write_fake_codex_script(
+            &script,
+            &format!(
+                r#"    elif method == "turn/start":
+        with open({prompt_marker_literal}, "w") as f:
+            f.write("started")
+            f.flush()
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{"turn": {{"id": "turn-1"}}}}}})
+    elif method == "turn/interrupt":
+        with open({interrupt_marker_literal}, "w") as f:
+            f.write(json.dumps(msg))
+            f.flush()
+        send({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {{"code": -32000, "message": "interrupt failed"}},
+        }})
+"#
+            ),
+        );
+        let manager = Arc::new(CodexAppServerManager::new(executor_config(
+            &script,
+            tmp.path(),
+        )));
+        manager
+            .prepare(
+                ExecutorPrepareRequest {
+                    turn: turn_ref("session-1", "codex", 1),
+                    cwd: None,
+                    previous_session_id: None,
+                },
+                TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        let prompt_manager = manager.clone();
+        let prompt_task = tokio::spawn(async move {
+            let mut events = CollectingExecutorEventSink::default();
+            prompt_manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn_ref("session-1", "codex", 1),
+                        prompt: "wait".to_string(),
+                        user_id: None,
+                    },
+                    &mut events,
+                    TurnCancellation::new(),
+                )
+                .await
+        });
+
+        for _ in 0..50 {
+            if prompt_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(prompt_marker.exists());
+
+        manager
+            .interrupt(ExecutorInterruptRequest {
+                turn: turn_ref("session-1", "codex", 1),
+                reason: InterruptReason::UserStop,
+            })
+            .await
+            .unwrap();
+
+        let err = timeout(Duration::from_secs(5), prompt_task)
+            .await
+            .expect("prompt task timed out")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("background request failed"));
+        assert!(interrupt_marker.exists());
+
+        let session = manager
+            .existing_session("session-1", "codex")
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if !session.lock().await.client.is_alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!session.lock().await.client.is_alive());
     }
 
     #[tokio::test]
