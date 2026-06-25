@@ -3458,6 +3458,423 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PrepareCancellationPoint {
+        BeforePublication,
+        AfterPublication,
+    }
+
+    struct PrepareCancellationExecutorBackend {
+        point: PrepareCancellationPoint,
+        prepare_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        prepare_cancelled: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        prepare_count: tokio::sync::Mutex<usize>,
+        published_sessions: tokio::sync::Mutex<Vec<String>>,
+        prompts: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl PrepareCancellationExecutorBackend {
+        fn new(
+            point: PrepareCancellationPoint,
+            prepare_started: tokio::sync::oneshot::Sender<()>,
+            prepare_cancelled: tokio::sync::oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                point,
+                prepare_started: tokio::sync::Mutex::new(Some(prepare_started)),
+                prepare_cancelled: tokio::sync::Mutex::new(Some(prepare_cancelled)),
+                prepare_count: tokio::sync::Mutex::new(0),
+                published_sessions: tokio::sync::Mutex::new(Vec::new()),
+                prompts: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn publish_session(&self, id: &str) {
+            let mut sessions = self.published_sessions.lock().await;
+            if !sessions.iter().any(|session| session == id) {
+                sessions.push(id.to_string());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for PrepareCancellationExecutorBackend {
+        fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+            (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "fake".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            cancel: TurnCancellation,
+        ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+            let prepare_index = {
+                let mut count = self.prepare_count.lock().await;
+                *count += 1;
+                *count
+            };
+
+            if prepare_index == 1 {
+                if self.point == PrepareCancellationPoint::AfterPublication {
+                    self.publish_session("shared-session").await;
+                }
+                if let Some(started) = self.prepare_started.lock().await.take() {
+                    let _ = started.send(());
+                }
+                let _ = cancel.cancelled().await;
+                if let Some(cancelled) = self.prepare_cancelled.lock().await.take() {
+                    let _ = cancelled.send(());
+                }
+                anyhow::bail!("prepare cancelled");
+            }
+
+            let external_session_id = match self.point {
+                PrepareCancellationPoint::BeforePublication => {
+                    let id = format!("published-session-{prepare_index}");
+                    self.publish_session(&id).await;
+                    id
+                }
+                PrepareCancellationPoint::AfterPublication => {
+                    self.publish_session("shared-session").await;
+                    "shared-session".to_string()
+                }
+            };
+
+            let started_new_session =
+                request.previous_session_id.as_deref() != Some(external_session_id.as_str());
+            Ok(crate::executor::PreparedExecutor {
+                external_session_id: Some(external_session_id),
+                started_new_session,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            _cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let prompt_index = {
+                let mut prompts = self.prompts.lock().await;
+                prompts.push(request.prompt);
+                prompts.len()
+            };
+            ExecutorPromptOutcome::Completed(crate::executor::ExecutorResponse {
+                final_text: format!("response {prompt_index}"),
+            })
+        }
+    }
+
+    async fn run_prepare_cancellation_test(
+        point: PrepareCancellationPoint,
+        expected_published_sessions: &[&str],
+        expected_external_session_id: &str,
+    ) {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(PrepareCancellationExecutorBackend::new(
+            point,
+            started_tx,
+            cancelled_tx,
+        ));
+        let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor.clone()));
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:C1:T1".to_string(),
+                        text: "first".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut second_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:C1:T1".to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                &mut second_output,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = first.await.unwrap();
+
+        assert!(first_output.events.is_empty());
+        assert_eq!(second_output.final_reply(), "response 1");
+        assert_eq!(
+            executor.published_sessions.lock().await.clone(),
+            expected_published_sessions
+                .iter()
+                .map(|session| (*session).to_string())
+                .collect::<Vec<_>>()
+        );
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("Current user message:\nsecond"));
+        drop(prompts);
+
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[0].content, "second");
+        let binding = saved.executor_bindings.get("kimi").unwrap();
+        assert_eq!(binding.health, ExecutorHealth::Healthy);
+        assert_eq!(
+            binding.external_session_id.as_deref(),
+            Some(expected_external_session_id)
+        );
+        assert!(!router.turns.has_current("slack:C1:T1").await);
+    }
+
+    #[tokio::test]
+    async fn prepare_cancelled_before_session_publication_does_not_mark_binding_unhealthy() {
+        run_prepare_cancellation_test(
+            PrepareCancellationPoint::BeforePublication,
+            &["published-session-2"],
+            "published-session-2",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prepare_cancelled_after_session_publication_keeps_published_session_reusable() {
+        run_prepare_cancellation_test(
+            PrepareCancellationPoint::AfterPublication,
+            &["shared-session"],
+            "shared-session",
+        )
+        .await;
+    }
+
+    struct PromptCancellationExecutorBackend {
+        emit_before_cancel: bool,
+        emit_after_cancel: bool,
+        ready_to_cancel: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        prompt_cancelled: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        prompts: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl PromptCancellationExecutorBackend {
+        fn new(
+            emit_before_cancel: bool,
+            emit_after_cancel: bool,
+            ready_to_cancel: tokio::sync::oneshot::Sender<()>,
+            prompt_cancelled: tokio::sync::oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                emit_before_cancel,
+                emit_after_cancel,
+                ready_to_cancel: tokio::sync::Mutex::new(Some(ready_to_cancel)),
+                prompt_cancelled: tokio::sync::Mutex::new(Some(prompt_cancelled)),
+                prompts: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for PromptCancellationExecutorBackend {
+        fn get(&self, name: &str) -> Option<crate::executor::ExecutorDescriptor> {
+            (name == "kimi").then(|| crate::executor::ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "fake".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<crate::executor::ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<crate::executor::PreparedExecutor> {
+            let previous_session_id = request.previous_session_id;
+            let external_session_id = previous_session_id
+                .clone()
+                .unwrap_or_else(|| "prompt-session".to_string());
+            let started_new_session =
+                previous_session_id.as_deref() != Some(external_session_id.as_str());
+            Ok(crate::executor::PreparedExecutor {
+                external_session_id: Some(external_session_id),
+                started_new_session,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            events: &mut dyn ExecutorEventSink,
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            self.prompts.lock().await.push(request.prompt);
+            if self.emit_before_cancel
+                && let Err(err) = events
+                    .send(
+                        ExecutorUpdate::new("progress", "Progress", "before cancel", "")
+                            .with_channel_event(ExecutorChannelEvent::agent_progress(
+                                "before cancel",
+                            )),
+                    )
+                    .await
+            {
+                return ExecutorPromptOutcome::Failed(err);
+            }
+            if let Some(ready) = self.ready_to_cancel.lock().await.take() {
+                let _ = ready.send(());
+            }
+            let _ = cancel.cancelled().await;
+            if self.emit_after_cancel
+                && let Err(err) = events
+                    .send(
+                        ExecutorUpdate::new("progress", "Progress", "after cancel", "")
+                            .with_channel_event(ExecutorChannelEvent::agent_progress(
+                                "after cancel",
+                            )),
+                    )
+                    .await
+            {
+                return ExecutorPromptOutcome::Failed(err);
+            }
+            if let Some(cancelled) = self.prompt_cancelled.lock().await.take() {
+                let _ = cancelled.send(());
+            }
+            ExecutorPromptOutcome::Cancelled
+        }
+    }
+
+    fn session_with_healthy_binding(session_key: &str) -> SessionState {
+        let mut state = SessionState::new(session_key, "kimi");
+        state.transcript.push(TranscriptMessage::user("prior"));
+        state.executor_bindings.insert(
+            "kimi".to_string(),
+            ExecutorBinding {
+                protocol: "fake".to_string(),
+                external_session_id: Some("existing-session".to_string()),
+                health: ExecutorHealth::Healthy,
+                ..ExecutorBinding::default()
+            },
+        );
+        state
+    }
+
+    async fn run_prompt_cancellation_test(
+        emit_before_cancel: bool,
+        emit_after_cancel: bool,
+        expected_turn_events: Vec<RouterOutputEvent>,
+    ) {
+        let session_key = "slack:C1:T1";
+        let store = Arc::new(InMemorySessionStore::default());
+        store.save(session_with_healthy_binding(session_key)).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(PromptCancellationExecutorBackend::new(
+            emit_before_cancel,
+            emit_after_cancel,
+            ready_tx,
+            cancelled_tx,
+        ));
+        let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor));
+
+        let turn_router = router.clone();
+        let turn = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            turn_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "cancel me".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut stop_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "/stop".to_string(),
+                    user_id: None,
+                },
+                &mut stop_output,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let turn_output = turn.await.unwrap();
+
+        assert_eq!(turn_output.events, expected_turn_events);
+        assert_eq!(stop_output.final_reply(), "Stopped the active turn.");
+        let saved = store.load_or_create(session_key, "kimi").await;
+        assert_eq!(saved.transcript.len(), 1);
+        assert_eq!(saved.transcript[0].content, "prior");
+        let binding = saved.executor_bindings.get("kimi").unwrap();
+        assert_eq!(binding.health, ExecutorHealth::Healthy);
+        assert_eq!(
+            binding.external_session_id.as_deref(),
+            Some("existing-session")
+        );
+        assert!(!router.turns.has_current(session_key).await);
+    }
+
+    #[tokio::test]
+    async fn prompt_cancelled_before_first_backend_event_does_not_commit_turn() {
+        run_prompt_cancellation_test(false, false, Vec::new()).await;
+    }
+
+    #[tokio::test]
+    async fn prompt_cancelled_after_backend_events_does_not_commit_turn() {
+        run_prompt_cancellation_test(
+            true,
+            true,
+            vec![RouterOutputEvent::Channel(RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "kimi".to_string(),
+                title: "Progress".to_string(),
+                text: "before cancel".to_string(),
+            })],
+        )
+        .await;
+    }
+
     struct InterruptibleExecutorBackend {
         prompts: tokio::sync::Mutex<Vec<String>>,
         interrupts: tokio::sync::Mutex<Vec<ExecutorInterruptRequest>>,

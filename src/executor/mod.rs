@@ -27,12 +27,16 @@ pub struct ExecutorTurnRef {
 pub struct ExecutorPrepareRequest {
     pub turn: ExecutorTurnRef,
     pub cwd: Option<PathBuf>,
+    /// Last committed Backend Session id from the Executor Binding.
     pub previous_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PreparedExecutor {
+    /// Backend Session id adopted by this Turn, if the protocol has one.
     pub external_session_id: Option<String>,
+    /// True when the adopted Backend Session is not the same identity as
+    /// `ExecutorPrepareRequest::previous_session_id`.
     pub started_new_session: bool,
 }
 
@@ -259,11 +263,30 @@ pub trait ExecutorEventSink: Send {
 pub trait ExecutorBackend: Send + Sync + 'static {
     fn get(&self, name: &str) -> Option<ExecutorDescriptor>;
     fn list(&self) -> Vec<ExecutorDescriptor>;
+
+    /// Prepare the backend for one router Turn.
+    ///
+    /// Implementations may create, initialize, or reuse a Backend Session. If
+    /// cancellation fires before a new Backend Session is published in shared
+    /// adapter state, the adapter may drop that local work and return an error.
+    /// Once a Backend Session has been published for reuse, cancellation of this
+    /// prepare call must not close or remove that published session; it is shared
+    /// adapter state and may already be visible to a replacement Turn.
+    ///
+    /// The router treats an error returned after `cancel` has fired as a
+    /// cancelled Turn, not as backend failure.
     async fn prepare(
         &self,
         request: ExecutorPrepareRequest,
         cancel: TurnCancellation,
     ) -> anyhow::Result<PreparedExecutor>;
+
+    /// Run one backend Turn.
+    ///
+    /// Prompt cancellation must use the backend protocol's interrupt or cancel
+    /// primitive when available, then return `ExecutorPromptOutcome::Cancelled`.
+    /// `Cancelled` is a Turn outcome and must not be reported as a generic
+    /// backend failure.
     async fn prompt(
         &self,
         request: ExecutorPromptRequest,
@@ -271,6 +294,11 @@ pub trait ExecutorBackend: Send + Sync + 'static {
         cancel: TurnCancellation,
     ) -> ExecutorPromptOutcome;
 
+    /// Request cancellation of active backend work for a router Turn.
+    ///
+    /// This is a protocol-level Turn interrupt. It does not mean "destroy the
+    /// Backend Session"; adapters should close or replace a Backend Session only
+    /// from their explicit unhealthy-session recovery path.
     async fn interrupt(&self, _request: ExecutorInterruptRequest) -> anyhow::Result<()> {
         Ok(())
     }

@@ -873,9 +873,9 @@ Required tests:
 - reserved context validation failure clears placeholder active Turns
   `[covered]`.
 
-### Phase 5: Refactor Executor Backend Turn Interface `[partial]`
+### Phase 5: Refactor Executor Backend Turn Interface `[implemented]`
 
-Already present:
+Implemented:
 
 - `ExecutorTurnRef` carries `session_key`, `executor`, and `generation`;
 - prepare, prompt, and interrupt request types carry `ExecutorTurnRef`;
@@ -883,23 +883,20 @@ Already present:
 - `ExecutorRegistry`, ACP, and Codex app-server route through
   `request.turn.executor`;
 - router tests verify prepare and prompt share one Turn identity, and interrupt
-  carries the interrupted Turn identity.
-
-Remaining work:
-
-- Document prepare cancellation and Backend Session ownership contracts in
-  `src/executor/mod.rs`.
-- Map cancelled prepare to a router cancellation outcome rather than generic
-  unhealthy state.
-- Add fake Executor tests that model:
+  carries the interrupted Turn identity;
+- `src/executor/mod.rs` documents prepare cancellation, Backend Session
+  ownership, prompt cancellation, and interrupt contracts;
+- router maps cancelled prepare to a cancellation outcome instead of marking the
+  Executor Binding unhealthy;
+- fake Executor tests model:
   - prepare cancelled before Backend Session publication;
   - prepare cancelled after Backend Session publication;
   - prompt cancelled before first backend event;
   - prompt cancelled after backend events.
 
-Phase 5 is the required bridge before ACP and Codex can be made robust. Without
-it, adapter code will keep guessing whether a cancelled prepare owns the
-Backend Session it touched.
+Phase 5 is the required bridge before ACP can finish its Backend Session
+Manager refactor. Adapter code no longer needs to guess whether a cancelled
+prepare owns the Backend Session it touched.
 
 ### Phase 6: Refactor ACP Backend Session Lifecycle `[partial]`
 
