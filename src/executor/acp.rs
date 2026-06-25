@@ -1386,6 +1386,9 @@ where
         tokio::select! {
             _ = changed => {}
             _ = &mut timeout => {
+                if active_cancel_barrier_id(state).await.is_none() {
+                    return Ok(());
+                }
                 if let Some(on_timeout) = on_timeout.take() {
                     on_timeout().await;
                 }
@@ -1882,7 +1885,10 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         fs,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -1976,6 +1982,46 @@ mod tests {
         if let Ok(response) = rx.await {
             assert!(response.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_barrier_timeout_rechecks_cleared_barrier_before_recovery() {
+        let state = Arc::new(Mutex::new(JsonRpcState::default()));
+        let barrier = Arc::new(AcpCancelBarrier::default());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<anyhow::Result<Value>>();
+        state.lock().await.pending.insert(7, tx);
+
+        assert!(begin_cancel_barrier_if_pending(&state, &barrier, 7).await);
+        assert_eq!(active_cancel_barrier_id(&state).await, Some(7));
+
+        let timeout_hook_called = Arc::new(AtomicBool::new(false));
+        let mut wait_task = tokio::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            let timeout_hook_called = timeout_hook_called.clone();
+            async move {
+                wait_for_cancel_barrier(&state, &barrier, || {
+                    let timeout_hook_called = timeout_hook_called.clone();
+                    async move {
+                        timeout_hook_called.store(true, Ordering::SeqCst);
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::select! {
+            result = &mut wait_task => {
+                panic!("barrier wait finished before the test cleared it: {result:?}");
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+
+        state.lock().await.cancel_barrier_response_id = None;
+
+        let result = wait_task.await.unwrap();
+        assert!(result.is_ok());
+        assert!(!timeout_hook_called.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -933,7 +933,9 @@ prepare owns the Backend Session it touched.
     session map, so a cancelled stale prepare cannot remove or close a matching
     published session;
   - ACP cancel barriers time out through unhealthy recovery if the cancelled
-    prompt response never arrives;
+    prompt response never arrives, and the timeout path re-checks the barrier
+    state before recovery so a just-settled cancelled response is not
+    misclassified as unhealthy;
   - adapter-boundary tests cover cancelled prepare during `initialize`, after
     `session/new`, cancelled lifecycle permission requests, stale mismatched
     prepare after newer publication, and stale unhealthy-session removal after a
@@ -1020,7 +1022,9 @@ Codex coverage now includes:
     removal helpers also check cancellation inside the session-map critical
     section, so cancellation cannot race with removal.
   - ACP cancel barriers time out through unhealthy recovery if a cancelled
-    prompt response never settles, so later prompts are not wedged forever.
+    prompt response never settles, so later prompts are not wedged forever. The
+    timeout path re-checks barrier state before closing the process, which
+    avoids misclassifying a response that settled at the timeout boundary.
   - cancellation paths now map to cancellation outcomes or cancelled prepare
     abandonment rather than ordinary backend failure. Process close remains
     isolated to unhealthy recovery paths.
