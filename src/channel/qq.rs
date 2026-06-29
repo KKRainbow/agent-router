@@ -673,7 +673,7 @@ impl QqReplyCheckpoints {
             self.started_at.is_some_and(|started| {
                 now.duration_since(started) >= QQ_REPLY_CHECKPOINT_MIN_INTERVAL
             }) || self.text.len() >= QQ_REPLY_CHECKPOINT_MIN_GROWTH
-        } || growth >= QQ_REPLY_CHECKPOINT_MIN_GROWTH;
+        };
         if !should_send {
             return None;
         }
@@ -735,6 +735,10 @@ impl RouterOutputSink for QqRouterOutputSink {
         }
     }
 
+    async fn discard_reply_stream(&mut self) {
+        self.abort_reply_checkpoints().await;
+    }
+
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
         self.flush_reply_checkpoints().await;
         if let Some(summary) = render_compact_channel_events(&self.pending_events)
@@ -758,6 +762,14 @@ impl QqRouterOutputSink {
             if let Err(err) = poster.handle.await {
                 tracing::warn!(error = %err, "QQ reply checkpoint worker failed");
             }
+        }
+    }
+
+    async fn abort_reply_checkpoints(&mut self) {
+        if let Some(poster) = self.checkpoint_poster.take() {
+            drop(poster.checkpoints);
+            poster.handle.abort();
+            let _ = poster.handle.await;
         }
     }
 }
@@ -1048,6 +1060,22 @@ mod tests {
 
         assert!(checkpoint.starts_with("Still generating reply:\n"));
         assert!(checkpoint.ends_with("..."));
+    }
+
+    #[test]
+    fn qq_reply_checkpoint_throttles_after_first_preview() {
+        let mut checkpoints = QqReplyCheckpoints::default();
+
+        assert!(
+            checkpoints
+                .push_chunk("a".repeat(QQ_REPLY_CHECKPOINT_MIN_GROWTH))
+                .is_some()
+        );
+        assert!(
+            checkpoints
+                .push_chunk("b".repeat(QQ_REPLY_CHECKPOINT_MIN_GROWTH))
+                .is_none()
+        );
     }
 
     #[derive(Debug, Default)]

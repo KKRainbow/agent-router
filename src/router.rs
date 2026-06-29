@@ -367,6 +367,7 @@ pub enum RouterChannelEventKind {
 pub trait RouterOutputSink: Send {
     fn send_channel_event(&mut self, event: RouterChannelEvent);
     fn send_reply_chunk(&mut self, _chunk: String) {}
+    async fn discard_reply_stream(&mut self) {}
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()>;
 }
 
@@ -1290,6 +1291,7 @@ where
                     .is_some()
                 };
                 if !committed {
+                    output.discard_reply_stream().await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -1309,6 +1311,7 @@ where
             }
             ExecutorPromptOutcome::Cancelled => {
                 let current = turn.abandon_if_current().await;
+                output.discard_reply_stream().await;
                 tracing::info!(
                     session_key = %session_key,
                     executor = %executor_name,
@@ -1349,6 +1352,7 @@ where
                     .is_some()
                 };
                 if !committed_failure {
+                    output.discard_reply_stream().await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -1365,6 +1369,7 @@ where
                     generation,
                     "router turn failed"
                 );
+                output.discard_reply_stream().await;
                 Err(err)
             }
         }

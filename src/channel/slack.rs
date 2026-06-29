@@ -605,6 +605,106 @@ impl SlackSocketModeChannel {
         Ok(())
     }
 
+    async fn update_markdown_message(
+        &self,
+        target: &SlackReplyTarget,
+        ts: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let Some(body) = slack_markdown_update_body(target, ts, text) else {
+            return self.update_message(target, ts, text).await;
+        };
+        match self.update_message_body(body).await {
+            Ok(()) => Ok(()),
+            Err(err) if slack_error_is_invalid_blocks(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Slack markdown block was rejected; retrying final update as plain text"
+                );
+                self.update_message(target, ts, text).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn update_message_body(&self, body: Value) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            error: Option<String>,
+        }
+
+        let channel = body
+            .get("channel")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let ts = body.get("ts").and_then(Value::as_str).unwrap_or_default();
+        let text_len = body
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or_default();
+        tracing::info!(channel, ts, text_len, "updating Slack message");
+        let resp = self
+            .http
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&body)
+            .send()
+            .await?
+            .json::<Response>()
+            .await?;
+        if !resp.ok {
+            return Err(SlackApiError::new(
+                "chat.update",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        tracing::info!(channel, ts, text_len, "updated Slack message");
+        Ok(())
+    }
+
+    async fn delete_message(&self, target: &SlackReplyTarget, ts: &str) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            error: Option<String>,
+        }
+
+        tracing::info!(
+            channel = %target.channel,
+            ts,
+            "deleting Slack message"
+        );
+        let body = json!({
+            "channel": target.channel,
+            "ts": ts,
+        });
+        let resp = self
+            .http
+            .post("https://slack.com/api/chat.delete")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&body)
+            .send()
+            .await?
+            .json::<Response>()
+            .await?;
+        if !resp.ok {
+            return Err(SlackApiError::new(
+                "chat.delete",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        tracing::info!(
+            channel = %target.channel,
+            ts,
+            "deleted Slack message"
+        );
+        Ok(())
+    }
+
     fn validate_tokens(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.cfg.bot_token.is_empty(),
@@ -1523,6 +1623,9 @@ enum SlackReplyDraftUpdate {
         text: String,
         done: oneshot::Sender<anyhow::Result<()>>,
     },
+    Discard {
+        done: oneshot::Sender<()>,
+    },
 }
 
 impl SlackVerboseActivity {
@@ -1647,6 +1750,25 @@ impl SlackReplyDraft {
         await_slack_activity_worker(updater.handle, "reply_draft").await;
         result
     }
+
+    async fn discard(&mut self) {
+        self.text.clear();
+        let Some(updater) = self.updater.take() else {
+            return;
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        if updater
+            .updates
+            .send(SlackReplyDraftUpdate::Discard { done: done_tx })
+            .is_err()
+        {
+            await_slack_activity_worker(updater.handle, "reply_draft").await;
+            return;
+        }
+        drop(updater.updates);
+        let _ = done_rx.await;
+        await_slack_activity_worker(updater.handle, "reply_draft").await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -1668,6 +1790,10 @@ impl RouterOutputSink for SlackRouterOutputSink {
     fn send_reply_chunk(&mut self, chunk: String) {
         self.reply_draft
             .send_chunk(self.channel.clone(), self.target.clone(), chunk);
+    }
+
+    async fn discard_reply_stream(&mut self) {
+        self.reply_draft.discard().await;
     }
 
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
@@ -1702,6 +1828,24 @@ fn slack_markdown_message_body(target: &SlackReplyTarget, text: &str) -> Option<
         }
     ]);
     Some(body)
+}
+
+fn slack_markdown_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -> Option<Value> {
+    if text.trim().is_empty() || text.chars().count() > SLACK_MARKDOWN_BLOCK_CHAR_LIMIT {
+        return None;
+    }
+
+    Some(json!({
+        "channel": target.channel,
+        "ts": ts,
+        "text": text,
+        "blocks": [
+            {
+                "type": "markdown",
+                "text": text,
+            }
+        ],
+    }))
 }
 
 fn spawn_slack_verbose_activity_poster(
@@ -1774,10 +1918,19 @@ fn spawn_slack_reply_draft_updater(
                 }
                 SlackReplyDraftUpdate::Final { text, done } => {
                     let result =
-                        upsert_slack_reply_draft(&channel, &target, &mut message_ts, &text)
+                        finalize_slack_reply_draft(&channel, &target, &mut message_ts, &text)
                             .await
                             .map(|_| ());
                     let _ = done.send(result);
+                    break;
+                }
+                SlackReplyDraftUpdate::Discard { done } => {
+                    if let Some(ts) = message_ts.as_deref()
+                        && let Err(err) = channel.delete_message(&target, ts).await
+                    {
+                        tracing::warn!(error = %err, "failed to delete Slack reply draft");
+                    }
+                    let _ = done.send(());
                     break;
                 }
             }
@@ -1805,6 +1958,25 @@ async fn upsert_slack_reply_draft(
             Ok(())
         }
         None => anyhow::bail!("Slack reply draft message response omitted ts"),
+    }
+}
+
+async fn finalize_slack_reply_draft(
+    channel: &SlackSocketModeChannel,
+    target: &SlackReplyTarget,
+    message_ts: &mut Option<String>,
+    text: &str,
+) -> anyhow::Result<()> {
+    if let Some(ts) = message_ts.as_deref() {
+        channel.update_markdown_message(target, ts, text).await?;
+        return Ok(());
+    }
+    match channel.post_markdown_message_with_ts(target, text).await? {
+        Some(ts) => {
+            *message_ts = Some(ts);
+            Ok(())
+        }
+        None => anyhow::bail!("Slack final reply message response omitted ts"),
     }
 }
 
@@ -1950,7 +2122,8 @@ fn slack_error_is_access_denied(err: &anyhow::Error) -> bool {
 
 fn slack_error_is_invalid_blocks(err: &anyhow::Error) -> bool {
     err.downcast_ref::<SlackApiError>().is_some_and(|err| {
-        err.method == "chat.postMessage" && matches!(err.code.as_str(), "invalid_blocks")
+        matches!(err.method, "chat.postMessage" | "chat.update")
+            && matches!(err.code.as_str(), "invalid_blocks")
     })
 }
 
