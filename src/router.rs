@@ -176,6 +176,12 @@ fn render_compact_channel_events_inner(
         }
     }
 
+    let has_activity_detail =
+        latest_reasoning.is_some() || tool_total > 0 || !attention.is_empty();
+    if !has_activity_detail {
+        return None;
+    }
+
     if suppress_single_successful_tool
         && latest_progress.is_none()
         && latest_reasoning.is_none()
@@ -3883,7 +3889,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_channel_events_include_latest_progress() {
+    fn compact_channel_events_suppress_progress_only() {
         let events = vec![
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
@@ -3901,8 +3907,9 @@ mod tests {
 
         assert_eq!(
             render_compact_channel_events(&events).as_deref(),
-            Some("[codex] Activity\nProgress: Now I will add the focused test.")
+            None
         );
+        assert_eq!(render_live_compact_channel_events(&events).as_deref(), None);
     }
 
     #[test]
