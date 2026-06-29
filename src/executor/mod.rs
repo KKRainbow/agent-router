@@ -379,6 +379,10 @@ pub trait ExecutorBackend: Send + Sync + 'static {
     async fn interrupt(&self, _request: ExecutorInterruptRequest) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn discard_session(&self, _turn: ExecutorTurnRef, _reason: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn summarize_json_rpc_error(error: &Value) -> String {

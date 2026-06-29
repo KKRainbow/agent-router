@@ -21,6 +21,7 @@ pub(crate) struct TurnRegistry {
 struct ActiveTurn {
     generation: u64,
     executor: Option<String>,
+    executor_session_key: Option<String>,
     cancel: TurnCancellation,
 }
 
@@ -53,6 +54,7 @@ pub struct TurnReservation {
 pub(crate) struct TurnGuard {
     registry: Arc<TurnRegistry>,
     session_key: String,
+    executor_session_key: String,
     generation: u64,
     executor: String,
     cancel: TurnCancellation,
@@ -63,6 +65,7 @@ pub(crate) struct InterruptedTurn {
     pub(crate) session_key: String,
     pub(crate) generation: u64,
     pub(crate) executor: Option<String>,
+    pub(crate) executor_session_key: Option<String>,
     pub(crate) reason: InterruptReason,
     cancel: TurnCancellation,
 }
@@ -85,6 +88,7 @@ impl TurnRegistry {
                 ActiveTurn {
                     generation,
                     executor: Some(executor.clone()),
+                    executor_session_key: Some(session_key.to_string()),
                     cancel: cancel.clone(),
                 },
             )
@@ -96,6 +100,7 @@ impl TurnRegistry {
             guard: TurnGuard {
                 registry: self.clone(),
                 session_key: session_key.to_string(),
+                executor_session_key: session_key.to_string(),
                 generation,
                 executor,
                 cancel,
@@ -114,6 +119,7 @@ impl TurnRegistry {
                 ActiveTurn {
                     generation,
                     executor: None,
+                    executor_session_key: None,
                     cancel: cancel.clone(),
                 },
             )
@@ -180,15 +186,26 @@ impl TurnReservation {
     }
 
     pub(in crate::router) async fn adopt(&self, executor: String) -> Option<TurnGuard> {
+        self.adopt_with_session_key(executor, self.session_key.clone())
+            .await
+    }
+
+    pub(in crate::router) async fn adopt_with_session_key(
+        &self,
+        executor: String,
+        executor_session_key: String,
+    ) -> Option<TurnGuard> {
         let mut active = self.registry.active.lock().await;
         let turn = active.get_mut(&self.session_key)?;
         if turn.generation != self.generation {
             return None;
         }
         turn.executor = Some(executor.clone());
+        turn.executor_session_key = Some(executor_session_key.clone());
         Some(TurnGuard {
             registry: self.registry.clone(),
             session_key: self.session_key.clone(),
+            executor_session_key,
             generation: self.generation,
             executor,
             cancel: turn.cancel.clone(),
@@ -215,7 +232,7 @@ impl TurnGuard {
 
     pub(crate) fn executor_turn_ref(&self) -> ExecutorTurnRef {
         ExecutorTurnRef {
-            session_key: self.session_key.clone(),
+            session_key: self.executor_session_key.clone(),
             executor: self.executor.clone(),
             generation: self.generation,
         }
@@ -263,10 +280,16 @@ impl TurnGuard {
 
 impl InterruptedTurn {
     pub(crate) fn executor_turn_ref(&self) -> Option<ExecutorTurnRef> {
-        self.executor.as_ref().map(|executor| ExecutorTurnRef {
-            session_key: self.session_key.clone(),
-            executor: executor.clone(),
-            generation: self.generation,
+        self.executor.as_ref().map(|executor| {
+            let session_key = self
+                .executor_session_key
+                .clone()
+                .unwrap_or_else(|| self.session_key.clone());
+            ExecutorTurnRef {
+                session_key,
+                executor: executor.clone(),
+                generation: self.generation,
+            }
         })
     }
 }
@@ -280,6 +303,7 @@ fn interrupted_turn(
         session_key: session_key.to_string(),
         generation: turn.generation,
         executor: turn.executor,
+        executor_session_key: turn.executor_session_key,
         reason,
         cancel: turn.cancel,
     }

@@ -42,19 +42,40 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load(config_path.as_deref())?;
 
     let store = Arc::new(InMemorySessionStore::default());
+    let mut approval_policy = SessionApprovalPolicy::new(
+        config.router.default_executor.clone(),
+        config.approval.default_mode,
+        store.clone(),
+    );
+    if let Some(orchestrator) = &config.router.orchestrator
+        && orchestrator.enabled
+    {
+        approval_policy =
+            approval_policy.with_denied_approval_executor(orchestrator.executor.clone());
+    }
     let approvals = Arc::new(ApprovalBroker::with_policy(
         Duration::from_secs(120),
-        Arc::new(SessionApprovalPolicy::new(
-            config.router.default_executor.clone(),
-            config.approval.default_mode,
-            store.clone(),
-        )),
+        Arc::new(approval_policy),
     ));
     let executor = Arc::new(ExecutorRegistry::with_machines(
         config.executors.clone(),
         MachineRegistry::new(config.machines.clone()),
         approvals.clone(),
     ));
+    let orchestrator =
+        config
+            .router
+            .orchestrator
+            .as_ref()
+            .map(|cfg| agent_router::router::OrchestratorSettings {
+                enabled: cfg.enabled,
+                executor: cfg.executor.clone(),
+                policy_file: cfg.policy_file.clone(),
+                max_policy_bytes: cfg.max_policy_bytes,
+                max_transcript_messages: cfg.max_transcript_messages,
+                decision_timeout: Duration::from_millis(cfg.decision_timeout_ms),
+                emit_handoff_notice: cfg.emit_handoff_notice,
+            });
     let router: Arc<dyn RouterService> = Arc::new(
         AgentRouter::with_approval_mode(
             config.router.default_executor.clone(),
@@ -63,7 +84,8 @@ async fn main() -> anyhow::Result<()> {
             executor,
             approvals.clone(),
         )
-        .with_workspace_root(config.workspace.root.clone()),
+        .with_workspace_root(config.workspace.root.clone())
+        .with_orchestrator(orchestrator),
     );
 
     let mut channels: JoinSet<(&'static str, anyhow::Result<()>)> = JoinSet::new();

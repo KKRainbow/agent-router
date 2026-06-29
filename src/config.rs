@@ -28,6 +28,18 @@ pub struct ApprovalConfig {
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     pub default_executor: String,
+    pub orchestrator: Option<OrchestratorConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorConfig {
+    pub enabled: bool,
+    pub executor: String,
+    pub policy_file: PathBuf,
+    pub max_policy_bytes: usize,
+    pub max_transcript_messages: usize,
+    pub decision_timeout_ms: u64,
+    pub emit_handoff_notice: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +127,18 @@ struct FileApprovalConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileRouterConfig {
     default_executor: Option<String>,
+    orchestrator: Option<FileOrchestratorConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileOrchestratorConfig {
+    enabled: Option<bool>,
+    executor: Option<String>,
+    policy_file: Option<PathBuf>,
+    max_policy_bytes: Option<usize>,
+    max_transcript_messages: Option<usize>,
+    decision_timeout_ms: Option<u64>,
+    emit_handoff_notice: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -210,16 +234,13 @@ impl AppConfig {
     }
 
     fn from_file_config(file_cfg: FileConfig, env_cfg: EnvConfig) -> anyhow::Result<Self> {
+        let router_file = file_cfg.router.unwrap_or_default();
         let default_executor = env_cfg
             .default_executor
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                file_cfg
-                    .router
-                    .as_ref()
-                    .and_then(|router| router.default_executor.clone())
-            })
+            .or(router_file.default_executor.clone())
             .unwrap_or_else(|| "kimi".to_string());
+        let orchestrator = parse_orchestrator_config(router_file.orchestrator)?;
 
         let approval_file = file_cfg.approval.unwrap_or_default();
         let default_approval_mode = env_cfg
@@ -356,6 +377,19 @@ impl AppConfig {
             executors.contains_key(&default_executor),
             "default executor `{default_executor}` is not configured"
         );
+        if let Some(orchestrator) = &orchestrator
+            && orchestrator.enabled
+        {
+            anyhow::ensure!(
+                executors.contains_key(&orchestrator.executor),
+                "router.orchestrator.executor `{}` is not configured",
+                orchestrator.executor
+            );
+            anyhow::ensure!(
+                orchestrator.executor != default_executor,
+                "router.orchestrator.executor must not be the default executor"
+            );
+        }
         for cfg in executors.values() {
             anyhow::ensure!(
                 machines.contains_key(&cfg.machine),
@@ -366,7 +400,10 @@ impl AppConfig {
         }
 
         Ok(Self {
-            router: RouterConfig { default_executor },
+            router: RouterConfig {
+                default_executor,
+                orchestrator,
+            },
             approval,
             workspace,
             slack,
@@ -504,6 +541,39 @@ fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Resul
         cwd: raw.cwd,
         env: raw.env.unwrap_or_default(),
     })
+}
+
+fn parse_orchestrator_config(
+    raw: Option<FileOrchestratorConfig>,
+) -> anyhow::Result<Option<OrchestratorConfig>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let enabled = raw.enabled.unwrap_or(false);
+    let executor = raw.executor.filter(|value| !value.trim().is_empty());
+    let policy_file = raw.policy_file.filter(|path| !path.as_os_str().is_empty());
+    if !enabled && executor.is_none() && policy_file.is_none() {
+        return Ok(None);
+    }
+    let executor = if enabled {
+        executor.ok_or_else(|| anyhow::anyhow!("router.orchestrator.executor is required"))?
+    } else {
+        executor.unwrap_or_default()
+    };
+    let policy_file = if enabled {
+        policy_file.ok_or_else(|| anyhow::anyhow!("router.orchestrator.policy_file is required"))?
+    } else {
+        policy_file.unwrap_or_default()
+    };
+    Ok(Some(OrchestratorConfig {
+        enabled,
+        executor,
+        policy_file,
+        max_policy_bytes: raw.max_policy_bytes.unwrap_or(65_536),
+        max_transcript_messages: raw.max_transcript_messages.unwrap_or(12),
+        decision_timeout_ms: raw.decision_timeout_ms.unwrap_or(15_000),
+        emit_handoff_notice: raw.emit_handoff_notice.unwrap_or(false),
+    }))
 }
 
 fn parse_machine_configs(
@@ -746,6 +816,66 @@ executors:
         );
         assert_eq!(cfg.executors["local-kimi"].machine, LOCAL_MACHINE_ID);
         assert_eq!(cfg.executors["remote-codex"].machine, "zbs-dev");
+    }
+
+    #[test]
+    fn parses_orchestrator_config() {
+        let raw = r#"
+router:
+  default_executor: kimi
+  orchestrator:
+    enabled: true
+    executor: route-planner
+    policy_file: config/agent-routing.md
+    max_policy_bytes: 1234
+    max_transcript_messages: 5
+    decision_timeout_ms: 2500
+    emit_handoff_notice: true
+executors:
+  kimi:
+    protocol: acp
+    command: kimi
+  route-planner:
+    protocol: acp
+    command: kimi
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let orchestrator = cfg.router.orchestrator.unwrap();
+
+        assert!(orchestrator.enabled);
+        assert_eq!(orchestrator.executor, "route-planner");
+        assert_eq!(
+            orchestrator.policy_file,
+            PathBuf::from("config/agent-routing.md")
+        );
+        assert_eq!(orchestrator.max_policy_bytes, 1234);
+        assert_eq!(orchestrator.max_transcript_messages, 5);
+        assert_eq!(orchestrator.decision_timeout_ms, 2500);
+        assert!(orchestrator.emit_handoff_notice);
+    }
+
+    #[test]
+    fn enabled_orchestrator_requires_configured_non_default_executor() {
+        let raw = r#"
+router:
+  default_executor: kimi
+  orchestrator:
+    enabled: true
+    executor: kimi
+    policy_file: config/agent-routing.md
+executors:
+  kimi:
+    protocol: acp
+    command: kimi
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("router.orchestrator.executor must not be the default executor")
+        );
     }
 
     #[test]

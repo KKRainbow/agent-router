@@ -1,5 +1,15 @@
 router:
   default_executor: kimi
+  # Optional initial routing executor. It decides only the first real executor
+  # for an auto-pending session; it never handles user tasks directly.
+  # orchestrator:
+  #   enabled: true
+  #   executor: route-planner
+  #   policy_file: config/agent-routing.md
+  #   max_policy_bytes: 65536
+  #   max_transcript_messages: 12
+  #   decision_timeout_ms: 15000
+  #   emit_handoff_notice: false
 
 approval:
   # normal: ask for approval prompts.
@@ -37,6 +47,11 @@ executors:
     protocol: app_server
     machine: local
     command: codex
+  # route-planner:
+  #   protocol: acp
+  #   machine: local
+  #   command: kimi
+  #   args: ["acp", "--profile", "route-planner"]
   # Remote ACP over SSH. SSH details live on the Machine, not in command args.
   # codex-zbs:
   #   protocol: acp

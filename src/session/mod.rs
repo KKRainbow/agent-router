@@ -105,7 +105,8 @@ pub struct ExecutorBinding {
 pub struct SessionState {
     pub session_key: String,
     pub default_executor: String,
-    pub active_executor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_executor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode_override: Option<ApprovalMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,7 +124,7 @@ impl SessionState {
         let default_executor = default_executor.into();
         Self {
             session_key: session_key.into(),
-            active_executor: default_executor.clone(),
+            active_executor: Some(default_executor.clone()),
             default_executor,
             approval_mode_override: None,
             cwd: None,

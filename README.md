@@ -46,6 +46,7 @@ User commands:
 ```text
 /agent status
 /agent <agent-name>
+/agent auto
 ```
 
 For example:
@@ -148,6 +149,12 @@ qq:
 Each chat session has one active agent. New sessions start with
 `router.default_executor`. Users can switch the active agent with
 `/agent <agent-name>`.
+
+Optional initial routing can be enabled with `router.orchestrator`. When enabled,
+new sessions start as auto-pending; the configured routing executor returns a
+strict JSON decision, and Agent Router sets the real active executor before
+delivering the original user message. Use `/agent auto` to clear the current
+selection and rerun initial routing on the next normal message.
 
 ## Non-Goals
 

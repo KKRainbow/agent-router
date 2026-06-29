@@ -21,7 +21,7 @@ use crate::config::{ExecutorConfig, ExecutorProtocol};
 use crate::executor::{
     ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
     ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest,
-    ExecutorResponse, ExecutorUpdate, PreparedExecutor, TurnCancellation,
+    ExecutorResponse, ExecutorTurnRef, ExecutorUpdate, PreparedExecutor, TurnCancellation,
 };
 use crate::machine::{
     MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand,
@@ -610,6 +610,16 @@ impl ClaudeStreamJsonManager {
                 )
             })
     }
+
+    async fn discard_session(&self, session_key: &str, executor: &str) -> bool {
+        let key = (session_key.to_string(), executor.to_string());
+        let session = self.sessions.lock().await.remove(&key);
+        let Some(session) = session else {
+            return false;
+        };
+        session.lock().await.close().await;
+        true
+    }
 }
 
 #[async_trait]
@@ -771,6 +781,22 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
             .cloned();
         if let Some(session) = session {
             session.lock().await.close().await;
+        }
+        Ok(())
+    }
+
+    async fn discard_session(&self, turn: ExecutorTurnRef, reason: &str) -> anyhow::Result<()> {
+        if self
+            .discard_session(&turn.session_key, &turn.executor)
+            .await
+        {
+            tracing::debug!(
+                target: "agent_router::claude",
+                session_key = %turn.session_key,
+                executor = %turn.executor,
+                reason,
+                "discarded Claude stream-json session"
+            );
         }
         Ok(())
     }

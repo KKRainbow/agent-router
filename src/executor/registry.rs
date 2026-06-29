@@ -9,7 +9,7 @@ use crate::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorInterruptRequest,
         ExecutorPrepareRequest, ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorSlashCommand,
         ExecutorSlashCommandOutcome, ExecutorSlashCommandRequest, ExecutorSlashCommandSupport,
-        PreparedExecutor, TurnCancellation, acp::AcpExecutorManager,
+        ExecutorTurnRef, PreparedExecutor, TurnCancellation, acp::AcpExecutorManager,
         claude_stream_json::ClaudeStreamJsonManager, codex_app_server::CodexAppServerManager,
     },
     machine::MachineRegistry,
@@ -130,6 +130,12 @@ impl ExecutorBackend for ExecutorRegistry {
     async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
         self.backend_for(&request.turn.executor)?
             .interrupt(request)
+            .await
+    }
+
+    async fn discard_session(&self, turn: ExecutorTurnRef, reason: &str) -> anyhow::Result<()> {
+        self.backend_for(&turn.executor)?
+            .discard_session(turn, reason)
             .await
     }
 }

@@ -26,7 +26,7 @@ use crate::{
     executor::{
         ExecutorBackend, ExecutorChannelEvent, ExecutorChannelEventKind, ExecutorDescriptor,
         ExecutorEventSink, ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
-        ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
+        ExecutorPromptRequest, ExecutorResponse, ExecutorTurnRef, ExecutorUpdate, PreparedExecutor,
         TurnCancellation, summarize_json_rpc_error,
     },
     machine::{MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand},
@@ -285,6 +285,18 @@ impl AcpBackendSessionManager {
                 )
             })
     }
+
+    async fn discard_session(&self, session_key: &str, executor: &str, reason: &str) -> bool {
+        let key = (session_key.to_string(), executor.to_string());
+        let session = self.sessions.lock().await.remove(&key);
+        let Some(session) = session else {
+            return false;
+        };
+        let mut session = session.lock().await;
+        session.client.close(reason).await;
+        session.session_id = None;
+        true
+    }
 }
 
 #[async_trait]
@@ -457,6 +469,23 @@ impl ExecutorBackend for AcpExecutorManager {
             );
             active_prompt.notify_cancel().await?;
             return Ok(());
+        }
+        Ok(())
+    }
+
+    async fn discard_session(&self, turn: ExecutorTurnRef, reason: &str) -> anyhow::Result<()> {
+        if self
+            .session_manager
+            .discard_session(&turn.session_key, &turn.executor, reason)
+            .await
+        {
+            tracing::debug!(
+                target: "agent_router::acp",
+                session_key = %turn.session_key,
+                executor = %turn.executor,
+                reason,
+                "discarded ACP executor session"
+            );
         }
         Ok(())
     }
