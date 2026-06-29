@@ -20,6 +20,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SLACK_REPLY_DRAFT_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
 const SLACK_REPLY_DRAFT_UPDATE_GROWTH: usize = 500;
+const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 use crate::{
     approval::{SharedApprovalBroker, is_approval_command},
@@ -1848,6 +1849,10 @@ fn slack_markdown_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -
     }))
 }
 
+fn slack_reply_draft_text(text: &str) -> String {
+    format!("{text}\n\n{SLACK_REPLY_DRAFT_MARKER}")
+}
+
 fn spawn_slack_verbose_activity_poster(
     channel: SlackSocketModeChannel,
     target: SlackReplyTarget,
@@ -1910,6 +1915,7 @@ fn spawn_slack_reply_draft_updater(
             }
             match update {
                 SlackReplyDraftUpdate::Preview(text) => {
+                    let text = slack_reply_draft_text(&text);
                     if let Err(err) =
                         upsert_slack_reply_draft(&channel, &target, &mut message_ts, &text).await
                     {
@@ -1968,7 +1974,19 @@ async fn finalize_slack_reply_draft(
     text: &str,
 ) -> anyhow::Result<()> {
     if let Some(ts) = message_ts.as_deref() {
-        channel.update_markdown_message(target, ts, text).await?;
+        if let Err(err) = channel.update_markdown_message(target, ts, text).await {
+            tracing::warn!(
+                error = %err,
+                "failed to update Slack reply draft as final reply; posting final reply instead"
+            );
+            match channel.post_markdown_message_with_ts(target, text).await? {
+                Some(new_ts) => {
+                    *message_ts = Some(new_ts);
+                    return Ok(());
+                }
+                None => anyhow::bail!("Slack fallback final reply response omitted ts"),
+            }
+        }
         return Ok(());
     }
     match channel.post_markdown_message_with_ts(target, text).await? {
@@ -2711,6 +2729,7 @@ fn is_router_noise_message(text: &str) -> bool {
         || trimmed.starts_with("Auto-approved in YOLO mode:")
         || trimmed.starts_with("Approved ")
         || trimmed.starts_with("Denied ")
+        || trimmed.ends_with(SLACK_REPLY_DRAFT_MARKER)
     {
         return true;
     }
@@ -4484,13 +4503,41 @@ mod tests {
                 text: "[codex] Progress report for the release".to_string(),
                 files: Vec::new(),
             },
+            SlackThreadMessage {
+                ts: "115.000".to_string(),
+                user: Some("BOT".to_string()),
+                author_name: None,
+                bot_id: Some("B_SELF".to_string()),
+                text: slack_reply_draft_text("partial answer"),
+                files: Vec::new(),
+            },
+            SlackThreadMessage {
+                ts: "116.000".to_string(),
+                user: Some("U_OTHER_BOT".to_string()),
+                author_name: None,
+                bot_id: Some("B_OTHER".to_string()),
+                text: slack_reply_draft_text("other bot draft-looking message"),
+                files: Vec::new(),
+            },
         ];
 
         let filtered = filter_context_messages(messages, "BOT");
 
-        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered.len(), 3);
         assert_eq!(filtered[0].text, "root from another bot");
         assert_eq!(filtered[1].text, "[codex] Progress report for the release");
+        assert_eq!(
+            filtered[2].text,
+            slack_reply_draft_text("other bot draft-looking message")
+        );
+    }
+
+    #[test]
+    fn slack_reply_draft_text_marks_preview_messages() {
+        assert_eq!(
+            slack_reply_draft_text("partial"),
+            format!("partial\n\n{SLACK_REPLY_DRAFT_MARKER}")
+        );
     }
 
     #[test]
