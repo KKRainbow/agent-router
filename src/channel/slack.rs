@@ -20,6 +20,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SLACK_REPLY_DRAFT_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
 const SLACK_REPLY_DRAFT_UPDATE_GROWTH: usize = 500;
+const SLACK_REPLY_DRAFT_INITIAL_MIN_LEN: usize = 40;
 const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 use crate::{
@@ -35,6 +36,7 @@ use crate::{
         ContextFileContent, ContextFileInput, ContextSyncIssueInput, ContextSyncRequest,
         sanitize_path_segment,
     },
+    text::append_reply_message_break,
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -1684,6 +1686,10 @@ impl SlackCompactActivity {
 }
 
 impl SlackReplyDraft {
+    fn break_message(&mut self) {
+        append_reply_message_break(&mut self.text);
+    }
+
     fn send_chunk(
         &mut self,
         channel: SlackSocketModeChannel,
@@ -1698,12 +1704,7 @@ impl SlackReplyDraft {
             self.updater = Some(spawn_slack_reply_draft_updater(channel, target));
         }
         let now = Instant::now();
-        let should_update = self
-            .last_update_at
-            .is_none_or(|last| now.duration_since(last) >= SLACK_REPLY_DRAFT_UPDATE_INTERVAL)
-            || self.text.len().saturating_sub(self.last_update_len)
-                >= SLACK_REPLY_DRAFT_UPDATE_GROWTH;
-        if !should_update {
+        if !self.should_send_preview(now) {
             return;
         }
         if let Some(updater) = &self.updater {
@@ -1718,6 +1719,15 @@ impl SlackReplyDraft {
                 tracing::warn!("Slack reply draft updater stopped before receiving preview");
             }
         }
+    }
+
+    fn should_send_preview(&self, now: Instant) -> bool {
+        if let Some(last) = self.last_update_at {
+            return now.duration_since(last) >= SLACK_REPLY_DRAFT_UPDATE_INTERVAL
+                || self.text.len().saturating_sub(self.last_update_len)
+                    >= SLACK_REPLY_DRAFT_UPDATE_GROWTH;
+        }
+        self.text.len() >= SLACK_REPLY_DRAFT_INITIAL_MIN_LEN
     }
 
     async fn finalize(
@@ -1791,6 +1801,10 @@ impl RouterOutputSink for SlackRouterOutputSink {
     fn send_reply_chunk(&mut self, chunk: String) {
         self.reply_draft
             .send_chunk(self.channel.clone(), self.target.clone(), chunk);
+    }
+
+    fn send_reply_break(&mut self) {
+        self.reply_draft.break_message();
     }
 
     async fn discard_reply_stream(&mut self) {
@@ -4538,6 +4552,34 @@ mod tests {
             slack_reply_draft_text("partial"),
             format!("partial\n\n{SLACK_REPLY_DRAFT_MARKER}")
         );
+    }
+
+    #[test]
+    fn slack_reply_draft_delays_tiny_initial_preview() {
+        let now = Instant::now();
+        let mut draft = SlackReplyDraft {
+            text: "我".to_string(),
+            ..SlackReplyDraft::default()
+        };
+
+        assert!(!draft.should_send_preview(now));
+
+        draft.text = "a".repeat(SLACK_REPLY_DRAFT_INITIAL_MIN_LEN);
+
+        assert!(draft.should_send_preview(now));
+    }
+
+    #[test]
+    fn slack_reply_draft_breaks_between_messages() {
+        let mut draft = SlackReplyDraft {
+            text: "first".to_string(),
+            ..SlackReplyDraft::default()
+        };
+
+        draft.break_message();
+        draft.text.push_str("second");
+
+        assert_eq!(draft.text, "first\n\nsecond");
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::{
         TurnCancellation, summarize_json_rpc_error,
     },
     machine::{MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand},
+    text::append_reply_message_break,
 };
 
 type SessionKey = (String, String);
@@ -1132,7 +1133,7 @@ impl CodexAppServerSession {
         let mut cancellation_requested = false;
         let mut backend_interrupted = false;
         let result: anyhow::Result<ExecutorResponse> = async {
-            let mut final_text = String::new();
+            let mut final_text = CodexReplyText::default();
             let mut turn_start_acknowledged = false;
             let mut turn_completed = false;
             let turn_start_timeout = sleep(self.limits.rpc_timeout);
@@ -1309,7 +1310,9 @@ impl CodexAppServerSession {
             }
             self.client
                 .finish_turn_streams(turn_generation, active_turn_id.as_deref());
-            Ok(ExecutorResponse { final_text })
+            Ok(ExecutorResponse {
+                final_text: final_text.into_text(),
+            })
         }
         .await;
 
@@ -1359,7 +1362,7 @@ impl CodexAppServerSession {
     async fn drain_ready_notifications(
         &mut self,
         notifications: &mut mpsc::UnboundedReceiver<Value>,
-        final_text: &mut String,
+        final_text: &mut CodexReplyText,
         events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
         backend_interrupted: &mut bool,
@@ -1388,7 +1391,7 @@ impl CodexAppServerSession {
     async fn handle_notification(
         &mut self,
         notification: Value,
-        final_text: &mut String,
+        final_text: &mut CodexReplyText,
         events: &mut dyn ExecutorEventSink,
         turn_completed: &mut bool,
         backend_interrupted: &mut bool,
@@ -2175,9 +2178,50 @@ struct CollectedCodexNotification {
     updates: Vec<ExecutorUpdate>,
 }
 
+#[derive(Debug, Default)]
+struct CodexReplyText {
+    text: String,
+    last_message_id: Option<String>,
+    started: bool,
+}
+
+impl CodexReplyText {
+    #[cfg(test)]
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn into_text(self) -> String {
+        self.text
+    }
+
+    fn push_update(&mut self, update: &ExecutorUpdate) {
+        if self.should_break_before(update) {
+            append_reply_message_break(&mut self.text);
+        }
+        self.text.push_str(&update.text);
+        self.observe(update);
+    }
+
+    fn should_break_before(&self, update: &ExecutorUpdate) -> bool {
+        self.started
+            && matches!(
+                (&self.last_message_id, &update.reply_message_id),
+                (Some(last), Some(next)) if last != next
+            )
+    }
+
+    fn observe(&mut self, update: &ExecutorUpdate) {
+        self.started = true;
+        if let Some(id) = &update.reply_message_id {
+            self.last_message_id = Some(id.clone());
+        }
+    }
+}
+
 fn collect_codex_notification(
     notification: Value,
-    final_text: &mut String,
+    final_text: &mut CodexReplyText,
 ) -> anyhow::Result<CollectedCodexNotification> {
     let method = notification
         .get("method")
@@ -2215,16 +2259,22 @@ fn collect_codex_notification(
                 .unwrap_or("")
                 .to_string();
             let phase = item.get("phase").and_then(Value::as_str).unwrap_or("");
+            let reply_message_id = reply_message_id_field(item);
             let mut update = ExecutorUpdate::new(
                 "agent_message_chunk",
                 String::new(),
                 text.clone(),
                 String::new(),
             );
+            if phase != "commentary"
+                && let Some(id) = reply_message_id
+            {
+                update = update.with_reply_message_id(id);
+            }
             if phase == "commentary" {
                 update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text));
             } else {
-                *final_text = text;
+                final_text.push_update(&update);
             }
             updates.push(update);
         }
@@ -2538,6 +2588,18 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn reply_message_id_field(value: &Value) -> Option<String> {
+    ["id", "itemId", "item_id", "messageId", "message_id"]
+        .into_iter()
+        .find_map(|field| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
@@ -2623,7 +2685,7 @@ mod tests {
 
     #[test]
     fn codex_reasoning_channel_event_requires_summary() {
-        let mut final_text = String::new();
+        let mut final_text = CodexReplyText::default();
 
         let collected = collect_codex_notification(
             json!({
@@ -2658,7 +2720,7 @@ mod tests {
 
     #[test]
     fn codex_commentary_agent_message_emits_progress_event() {
-        let mut final_text = String::new();
+        let mut final_text = CodexReplyText::default();
 
         let collected = collect_codex_notification(
             json!({
@@ -2675,7 +2737,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(final_text.is_empty());
+        assert!(final_text.as_str().is_empty());
         assert_eq!(collected.updates.len(), 1);
         assert_eq!(collected.updates[0].kind, "agent_message_chunk");
         assert_eq!(
@@ -2689,13 +2751,14 @@ mod tests {
 
     #[test]
     fn codex_final_agent_message_does_not_emit_progress_event() {
-        let mut final_text = String::new();
+        let mut final_text = CodexReplyText::default();
 
         let collected = collect_codex_notification(
             json!({
                 "method": "item/completed",
                 "params": {
                     "item": {
+                        "id": "msg-1",
                         "type": "agentMessage",
                         "phase": "final_answer",
                         "text": "done"
@@ -2706,14 +2769,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(final_text, "done");
+        assert_eq!(final_text.as_str(), "done");
         assert_eq!(collected.updates.len(), 1);
+        assert_eq!(
+            collected.updates[0].reply_message_id.as_deref(),
+            Some("msg-1")
+        );
         assert!(collected.updates[0].channel_event.is_none());
     }
 
     #[test]
     fn codex_legacy_agent_message_remains_final_reply_only() {
-        let mut final_text = String::new();
+        let mut final_text = CodexReplyText::default();
 
         let collected = collect_codex_notification(
             json!({
@@ -2724,14 +2791,39 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(final_text, "legacy reply");
+        assert_eq!(final_text.as_str(), "legacy reply");
         assert_eq!(collected.updates.len(), 1);
         assert!(collected.updates[0].channel_event.is_none());
     }
 
     #[test]
+    fn codex_distinct_final_agent_messages_separate_final_text() {
+        let mut final_text = CodexReplyText::default();
+
+        for (id, text) in [("msg-1", "first"), ("msg-2", "second")] {
+            collect_codex_notification(
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "id": id,
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": text
+                        }
+                    }
+                }),
+                &mut final_text,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(final_text.as_str(), "first\n\nsecond");
+    }
+
+    #[test]
     fn codex_command_channel_event_includes_command_without_aggregated_output() {
-        let mut final_text = String::new();
+        let mut final_text = CodexReplyText::default();
 
         let collected = collect_codex_notification(
             json!({
@@ -4643,7 +4735,7 @@ for line in sys.stdin:
         let mut session = session.lock().await;
         let (tx, mut notifications) = mpsc::unbounded_channel();
         let mut events = CollectingExecutorEventSink::default();
-        let mut final_text = String::new();
+        let mut final_text = CodexReplyText::default();
         let mut turn_completed = false;
         let mut backend_interrupted = false;
 

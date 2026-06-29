@@ -30,6 +30,7 @@ use crate::{
         TurnCancellation, summarize_json_rpc_error,
     },
     machine::{MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand},
+    text::append_reply_message_break,
 };
 
 type SharedJsonRpcState = Arc<Mutex<JsonRpcState>>;
@@ -695,7 +696,7 @@ impl AcpSession {
         let response_fut = request.response;
         tokio::pin!(response_fut);
 
-        let mut text_parts = Vec::new();
+        let mut text_parts = ReplyTextParts::default();
         let result = loop {
             tokio::select! {
                 result = &mut response_fut => {
@@ -826,7 +827,7 @@ impl AcpSession {
         let final_text = if text_parts.is_empty() {
             extract_text_result(&result)
         } else {
-            text_parts.join("")
+            text_parts.join()
         };
         clear_active_acp_prompt(
             &active_prompt_turn.active_prompts,
@@ -882,12 +883,55 @@ impl AcpSession {
 async fn collect_update(
     update: ExecutorUpdate,
     events: &mut dyn ExecutorEventSink,
-    text_parts: &mut Vec<String>,
+    text_parts: &mut ReplyTextParts,
 ) -> anyhow::Result<()> {
     if update.kind == "agent_message_chunk" {
-        text_parts.push(update.text.clone());
+        text_parts.push_update(&update);
     }
     events.send(update).await
+}
+
+#[derive(Debug, Default)]
+struct ReplyTextParts {
+    parts: Vec<String>,
+    last_message_id: Option<String>,
+    started: bool,
+}
+
+impl ReplyTextParts {
+    fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    fn join(&self) -> String {
+        self.parts.join("")
+    }
+
+    fn push_update(&mut self, update: &ExecutorUpdate) {
+        if self.should_break_before(update) {
+            let mut text = self.join();
+            append_reply_message_break(&mut text);
+            self.parts.clear();
+            self.parts.push(text);
+        }
+        self.parts.push(update.text.clone());
+        self.observe(update);
+    }
+
+    fn should_break_before(&self, update: &ExecutorUpdate) -> bool {
+        self.started
+            && matches!(
+                (&self.last_message_id, &update.reply_message_id),
+                (Some(last), Some(next)) if last != next
+            )
+    }
+
+    fn observe(&mut self, update: &ExecutorUpdate) {
+        self.started = true;
+        if let Some(id) = &update.reply_message_id {
+            self.last_message_id = Some(id.clone());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1707,11 +1751,12 @@ fn project_acp_update_with_state(
     tool_calls: &mut HashMap<String, AcpToolCallState>,
 ) -> Option<ExecutorUpdate> {
     let params = message.get("params")?;
-    let update = params
+    let raw_update = params
         .get("update")
         .or_else(|| params.get("sessionUpdate"))
         .unwrap_or(params);
-    let update = acp_logical_update(update);
+    let update = acp_logical_update(raw_update);
+    let reply_message_id = acp_reply_message_id(raw_update, update);
     let tool_call_id = tool_call_id(update);
     let kind = update
         .get("sessionUpdate")
@@ -1793,8 +1838,12 @@ fn project_acp_update_with_state(
         None
     };
     let is_agent_progress = normalized_kind == "agent_progress";
+    let is_final_agent_message = !is_agent_progress && normalized_kind == "agent_message_chunk";
     let mut update =
         ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
+    if is_final_agent_message && let Some(id) = reply_message_id {
+        update = update.with_reply_message_id(id);
+    }
     if is_agent_progress && !text.trim().is_empty() {
         update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text.clone()));
     } else if let Some(summary) = plan_summary {
@@ -1816,6 +1865,26 @@ fn acp_logical_update(update: &Value) -> &Value {
         return payload;
     }
     update
+}
+
+fn acp_reply_message_id(raw_update: &Value, update: &Value) -> Option<String> {
+    raw_update
+        .get("payload")
+        .and_then(reply_message_id_field)
+        .or_else(|| reply_message_id_field(update))
+        .or_else(|| reply_message_id_field(raw_update))
+}
+
+fn reply_message_id_field(value: &Value) -> Option<String> {
+    ["messageId", "message_id", "itemId", "item_id", "id"]
+        .into_iter()
+        .find_map(|field| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn is_acp_agent_message_kind(kind: &str, update: &Value) -> bool {
@@ -2591,7 +2660,7 @@ mod tests {
     #[tokio::test]
     async fn acp_commentary_agent_message_does_not_enter_final_text() {
         let mut events = CollectingExecutorEventSink::default();
-        let mut text_parts = Vec::new();
+        let mut text_parts = ReplyTextParts::default();
         collect_update(
             project_acp_update(&json!({
                 "method": "session/update",
@@ -2627,7 +2696,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(text_parts, ["done"]);
+        assert_eq!(text_parts.parts, ["done"]);
         assert_eq!(events.updates.len(), 2);
         assert!(events.updates[0].channel_event.is_some());
     }
@@ -2635,7 +2704,7 @@ mod tests {
     #[tokio::test]
     async fn acp_unphased_chunks_remain_final_text_only() {
         let mut events = CollectingExecutorEventSink::default();
-        let mut text_parts = Vec::new();
+        let mut text_parts = ReplyTextParts::default();
 
         for chunk in ["I", " am", " checking"] {
             collect_update(
@@ -2656,7 +2725,7 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(text_parts, ["I", " am", " checking"]);
+        assert_eq!(text_parts.parts, ["I", " am", " checking"]);
         assert_eq!(events.updates.len(), 3);
         assert!(
             events
@@ -2667,9 +2736,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_distinct_reply_message_ids_separate_final_text() {
+        let mut events = CollectingExecutorEventSink::default();
+        let mut text_parts = ReplyTextParts::default();
+
+        for (id, text) in [("msg-1", "first"), ("msg-2", "second")] {
+            collect_update(
+                project_acp_update(&json!({
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "id": id,
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": text}
+                        }
+                    }
+                }))
+                .unwrap(),
+                &mut events,
+                &mut text_parts,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(text_parts.join(), "first\n\nsecond");
+        assert_eq!(events.updates[0].reply_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(events.updates[1].reply_message_id.as_deref(), Some("msg-2"));
+    }
+
+    #[tokio::test]
+    async fn acp_payload_message_id_beats_wrapper_event_id() {
+        let mut events = CollectingExecutorEventSink::default();
+        let mut text_parts = ReplyTextParts::default();
+
+        for (event_id, text) in [("event-1", "first"), ("event-2", " chunk")] {
+            collect_update(
+                project_acp_update(&json!({
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "id": event_id,
+                            "type": "response_item",
+                            "payload": {
+                                "messageId": "msg-1",
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": text}]
+                            }
+                        }
+                    }
+                }))
+                .unwrap(),
+                &mut events,
+                &mut text_parts,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(text_parts.join(), "first chunk");
+        assert_eq!(events.updates[0].reply_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(events.updates[1].reply_message_id.as_deref(), Some("msg-1"));
+    }
+
+    #[tokio::test]
     async fn acp_codex_event_commentary_does_not_enter_final_text() {
         let mut events = CollectingExecutorEventSink::default();
-        let mut text_parts = Vec::new();
+        let mut text_parts = ReplyTextParts::default();
         collect_update(
             project_acp_update(&json!({
                 "method": "session/update",
@@ -2711,7 +2845,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(text_parts, ["done"]);
+        assert_eq!(text_parts.parts, ["done"]);
         assert_eq!(events.updates.len(), 2);
         assert!(events.updates[0].channel_event.is_some());
         assert!(events.updates[1].channel_event.is_none());

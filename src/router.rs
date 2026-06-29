@@ -105,6 +105,7 @@ fn render_unknown_router_slash_command(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterOutputEvent {
     Channel(RouterChannelEvent),
+    ReplyBreak,
     ReplyChunk(String),
     FinalReply(String),
 }
@@ -366,6 +367,7 @@ pub enum RouterChannelEventKind {
 #[async_trait]
 pub trait RouterOutputSink: Send {
     fn send_channel_event(&mut self, event: RouterChannelEvent);
+    fn send_reply_break(&mut self) {}
     fn send_reply_chunk(&mut self, _chunk: String) {}
     async fn discard_reply_stream(&mut self) {}
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()>;
@@ -1658,6 +1660,13 @@ struct RouterExecutorEventSink<'a> {
     executor: &'a str,
     output: &'a mut dyn RouterOutputSink,
     updates: Vec<ExecutorUpdate>,
+    reply_stream: RouterReplyStreamState,
+}
+
+#[derive(Default)]
+struct RouterReplyStreamState {
+    started: bool,
+    last_message_id: Option<String>,
 }
 
 impl<'a> RouterExecutorEventSink<'a> {
@@ -1667,6 +1676,7 @@ impl<'a> RouterExecutorEventSink<'a> {
             executor,
             output,
             updates: Vec::new(),
+            reply_stream: RouterReplyStreamState::default(),
         }
     }
 
@@ -1680,7 +1690,11 @@ impl ExecutorEventSink for RouterExecutorEventSink<'_> {
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
         if self.turn.is_output_allowed().await {
             if let Some(chunk) = reply_chunk_from_executor_update(&update) {
+                if self.reply_stream.should_break_before(&update) {
+                    self.output.send_reply_break();
+                }
                 self.output.send_reply_chunk(chunk);
+                self.reply_stream.observe(&update);
             }
             if let Some(event) = channel_event_from_executor_update(self.executor, &update) {
                 self.output.send_channel_event(event);
@@ -1688,6 +1702,23 @@ impl ExecutorEventSink for RouterExecutorEventSink<'_> {
         }
         self.updates.push(update);
         Ok(())
+    }
+}
+
+impl RouterReplyStreamState {
+    fn should_break_before(&self, update: &ExecutorUpdate) -> bool {
+        self.started
+            && matches!(
+                (&self.last_message_id, &update.reply_message_id),
+                (Some(last), Some(next)) if last != next
+            )
+    }
+
+    fn observe(&mut self, update: &ExecutorUpdate) {
+        self.started = true;
+        if let Some(id) = &update.reply_message_id {
+            self.last_message_id = Some(id.clone());
+        }
     }
 }
 
@@ -2070,6 +2101,10 @@ mod tests {
             self.events.push(RouterOutputEvent::Channel(event));
         }
 
+        fn send_reply_break(&mut self) {
+            self.events.push(RouterOutputEvent::ReplyBreak);
+        }
+
         fn send_reply_chunk(&mut self, chunk: String) {
             self.events.push(RouterOutputEvent::ReplyChunk(chunk));
         }
@@ -2084,7 +2119,9 @@ mod tests {
         fn final_reply(&self) -> &str {
             match self.events.last().expect("router emitted no events") {
                 RouterOutputEvent::FinalReply(text) => text,
-                RouterOutputEvent::Channel(_) | RouterOutputEvent::ReplyChunk(_) => {
+                RouterOutputEvent::Channel(_)
+                | RouterOutputEvent::ReplyBreak
+                | RouterOutputEvent::ReplyChunk(_) => {
                     panic!("last router event was not final reply")
                 }
             }
@@ -3895,6 +3932,44 @@ mod tests {
             Some("hello")
         );
         assert_eq!(channel_event_from_executor_update("codex", &update), None);
+    }
+
+    #[tokio::test]
+    async fn reply_stream_breaks_between_distinct_message_ids() {
+        let turns = TurnRegistry::new();
+        let begun = turns.begin("slack:C1:T1", "codex".to_string()).await;
+        let mut output = CollectingRouterOutputSink::default();
+        let mut sink = RouterExecutorEventSink::new(begun.guard, "codex", &mut output);
+
+        sink.send(
+            ExecutorUpdate::new("agent_message_chunk", "", "first", "")
+                .with_reply_message_id("msg-1"),
+        )
+        .await
+        .unwrap();
+        sink.send(
+            ExecutorUpdate::new("agent_message_chunk", "", " more", "")
+                .with_reply_message_id("msg-1"),
+        )
+        .await
+        .unwrap();
+        sink.send(
+            ExecutorUpdate::new("agent_message_chunk", "", "second", "")
+                .with_reply_message_id("msg-2"),
+        )
+        .await
+        .unwrap();
+
+        drop(sink);
+        assert_eq!(
+            output.events,
+            vec![
+                RouterOutputEvent::ReplyChunk("first".to_string()),
+                RouterOutputEvent::ReplyChunk(" more".to_string()),
+                RouterOutputEvent::ReplyBreak,
+                RouterOutputEvent::ReplyChunk("second".to_string()),
+            ]
+        );
     }
 
     #[test]

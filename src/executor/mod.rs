@@ -179,6 +179,7 @@ pub struct ExecutorUpdate {
     pub status: String,
     pub transcript_summary: Option<String>,
     pub channel_event: Option<ExecutorChannelEvent>,
+    pub reply_message_id: Option<String>,
 }
 
 impl ExecutorUpdate {
@@ -195,6 +196,7 @@ impl ExecutorUpdate {
             status: status.into(),
             transcript_summary: None,
             channel_event: None,
+            reply_message_id: None,
         }
     }
 
@@ -205,6 +207,11 @@ impl ExecutorUpdate {
 
     pub fn with_channel_event(mut self, channel_event: ExecutorChannelEvent) -> Self {
         self.channel_event = Some(channel_event);
+        self
+    }
+
+    pub fn with_reply_message_id(mut self, id: impl Into<String>) -> Self {
+        self.reply_message_id = Some(id.into());
         self
     }
 }

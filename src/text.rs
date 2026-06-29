@@ -25,6 +25,17 @@ pub(crate) fn truncate_bytes_on_char_boundary(mut text: String, max_bytes: usize
     text
 }
 
+pub(crate) fn append_reply_message_break(text: &mut String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let trimmed_len = text.trim_end().len();
+    text.truncate(trimmed_len);
+    if !text.ends_with("\n\n") {
+        text.push_str("\n\n");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,5 +52,14 @@ mod tests {
         let truncated = truncate_bytes_on_char_boundary(text, 1200);
 
         assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn append_reply_message_break_normalizes_to_one_blank_line() {
+        let mut text = "first\n\n".to_string();
+
+        append_reply_message_break(&mut text);
+
+        assert_eq!(text, "first\n\n");
     }
 }

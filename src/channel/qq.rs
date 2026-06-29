@@ -24,7 +24,7 @@ use crate::{
         RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
         TurnReservation, is_slash_command_input, render_compact_channel_events,
     },
-    text::truncate_chars,
+    text::{append_reply_message_break, truncate_chars},
 };
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
@@ -681,6 +681,10 @@ impl QqReplyCheckpoints {
         self.last_checkpoint_len = self.text.len();
         Some(render_qq_reply_checkpoint(&self.text))
     }
+
+    fn break_message(&mut self) {
+        append_reply_message_break(&mut self.text);
+    }
 }
 
 fn render_qq_reply_checkpoint(text: &str) -> String {
@@ -730,6 +734,10 @@ impl RouterOutputSink for QqRouterOutputSink {
         {
             tracing::warn!("QQ reply checkpoint poster stopped before receiving checkpoint");
         }
+    }
+
+    fn send_reply_break(&mut self) {
+        self.reply_checkpoints.break_message();
     }
 
     async fn discard_reply_stream(&mut self) {
@@ -1073,6 +1081,17 @@ mod tests {
                 .push_chunk("b".repeat(QQ_REPLY_CHECKPOINT_MIN_GROWTH))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn qq_reply_checkpoint_breaks_between_messages() {
+        let mut checkpoints = QqReplyCheckpoints::default();
+
+        checkpoints.push_chunk("first".to_string());
+        checkpoints.break_message();
+        checkpoints.push_chunk("second".to_string());
+
+        assert_eq!(checkpoints.text, "first\n\nsecond");
     }
 
     #[test]
