@@ -430,6 +430,7 @@ pub mod test_support {
         pub executor: String,
         pub generation: u64,
         pub prompt: String,
+        pub user_id: Option<String>,
     }
 
     #[derive(Debug, Default)]
@@ -501,6 +502,7 @@ pub mod test_support {
                 executor: request.turn.executor,
                 generation: request.turn.generation,
                 prompt: request.prompt,
+                user_id: request.user_id,
             });
             if let Err(err) = events
                 .send(

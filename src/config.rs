@@ -7,7 +7,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::machine::{LOCAL_MACHINE_ID, MachineConfig, MachineKind, local_machine_config};
-use crate::session::ApprovalMode;
+use crate::{router::OrchestratorMode, session::ApprovalMode};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -34,6 +34,7 @@ pub struct RouterConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorConfig {
     pub enabled: bool,
+    pub mode: OrchestratorMode,
     pub executor: String,
     pub policy_file: PathBuf,
     pub max_policy_bytes: usize,
@@ -133,6 +134,7 @@ struct FileRouterConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileOrchestratorConfig {
     enabled: Option<bool>,
+    mode: Option<String>,
     executor: Option<String>,
     policy_file: Option<PathBuf>,
     max_policy_bytes: Option<usize>,
@@ -565,8 +567,14 @@ fn parse_orchestrator_config(
     } else {
         policy_file.unwrap_or_default()
     };
+    let mode = raw
+        .mode
+        .map(|value| parse_orchestrator_mode(&value))
+        .transpose()?
+        .unwrap_or(OrchestratorMode::Initial);
     Ok(Some(OrchestratorConfig {
         enabled,
+        mode,
         executor,
         policy_file,
         max_policy_bytes: raw.max_policy_bytes.unwrap_or(65_536),
@@ -574,6 +582,14 @@ fn parse_orchestrator_config(
         decision_timeout_ms: raw.decision_timeout_ms.unwrap_or(15_000),
         emit_handoff_notice: raw.emit_handoff_notice.unwrap_or(false),
     }))
+}
+
+fn parse_orchestrator_mode(value: &str) -> anyhow::Result<OrchestratorMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "initial" => Ok(OrchestratorMode::Initial),
+        "per_turn" | "per-turn" => Ok(OrchestratorMode::PerTurn),
+        other => anyhow::bail!("router.orchestrator.mode `{other}` is not supported"),
+    }
 }
 
 fn parse_machine_configs(
@@ -825,6 +841,7 @@ router:
   default_executor: kimi
   orchestrator:
     enabled: true
+    mode: per_turn
     executor: route-planner
     policy_file: config/agent-routing.md
     max_policy_bytes: 1234
@@ -844,6 +861,7 @@ executors:
         let orchestrator = cfg.router.orchestrator.unwrap();
 
         assert!(orchestrator.enabled);
+        assert_eq!(orchestrator.mode, OrchestratorMode::PerTurn);
         assert_eq!(orchestrator.executor, "route-planner");
         assert_eq!(
             orchestrator.policy_file,
@@ -853,6 +871,57 @@ executors:
         assert_eq!(orchestrator.max_transcript_messages, 5);
         assert_eq!(orchestrator.decision_timeout_ms, 2500);
         assert!(orchestrator.emit_handoff_notice);
+    }
+
+    #[test]
+    fn orchestrator_mode_defaults_to_initial() {
+        let raw = r#"
+router:
+  default_executor: kimi
+  orchestrator:
+    enabled: true
+    executor: route-planner
+    policy_file: config/agent-routing.md
+executors:
+  kimi:
+    protocol: acp
+    command: kimi
+  route-planner:
+    protocol: acp
+    command: kimi
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let orchestrator = cfg.router.orchestrator.unwrap();
+
+        assert_eq!(orchestrator.mode, OrchestratorMode::Initial);
+    }
+
+    #[test]
+    fn invalid_orchestrator_mode_is_rejected() {
+        let raw = r#"
+router:
+  default_executor: kimi
+  orchestrator:
+    enabled: true
+    mode: always
+    executor: route-planner
+    policy_file: config/agent-routing.md
+executors:
+  kimi:
+    protocol: acp
+    command: kimi
+  route-planner:
+    protocol: acp
+    command: kimi
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("router.orchestrator.mode `always` is not supported")
+        );
     }
 
     #[test]

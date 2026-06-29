@@ -15,7 +15,7 @@ Agent Router 仍然是真正的控制平面，负责校验 decision、设置 `ac
 创建或恢复目标 executor binding、投递原始用户消息、维护 transcript 和处理失败
 回滚。
 
-第一版只做初始路由：
+默认 `mode: initial` 只做初始路由：
 
 - 新 session 的 `active_executor` 可以暂时为空，表示还没有真实承接者。
 - 只有当 `active_executor` 为空时才调用 orchestrator。
@@ -25,6 +25,12 @@ Agent Router 仍然是真正的控制平面，负责校验 decision、设置 `ac
 - 一旦 `active_executor` 被设置，后续消息直接进入该 executor。
 - `/agent auto` 可以显式清空 `active_executor`，让下一条普通消息重新自动选择。
 - 不做任务完成自动回收，不做 target-to-target 自动路由。
+
+可选 `mode: per_turn` 会在每条普通用户消息前调用 orchestrator。此模式下
+`stay` 表示保持当前 active executor；如果当前仍是 auto-pending，则选择
+`default_executor`。`handoff` 可以切换到任意已配置的任务 executor，包括 default。
+Router 仍然负责校验目标 executor，并在 stale/cancel/failure 路径恢复本轮路由前的
+active executor。
 
 ## 背景
 
@@ -474,21 +480,30 @@ reply。
 单元测试：
 
 - orchestrator disabled 时行为和现在一致。
-- `active_executor = None` 时才会调用 orchestrator。
-- `active_executor = Some(default_executor)` 时不会调用 orchestrator。
-- `active_executor = Some(non_default)` 时不会调用 orchestrator。
+- `mode: initial` 下，`active_executor = None` 时才会调用 orchestrator。
+- `mode: initial` 下，`active_executor = Some(default_executor)` 时不会调用
+  orchestrator。
+- `mode: initial` 下，`active_executor = Some(non_default)` 时不会调用
+  orchestrator。
+- `mode: per_turn` 下，每条普通用户消息都会调用 orchestrator。
 - `/agent` 命令不会调用 orchestrator。
-- `stay` decision 会设置 `active_executor = default_executor`，并只把原始用户消息
-  投递给 default executor 一次。
+- `mode: initial` 下，`stay` decision 会设置 `active_executor = default_executor`，
+  并只把原始用户消息投递给 default executor 一次。
+- `mode: per_turn` 下，`stay` decision 会保持当前 active executor；如果仍是
+  auto-pending，则选择 default executor。
 - 合法 `handoff` decision 更新 `active_executor` 并投递给 target 一次。
 - target 为 default 时归一化为 `stay`。
 - target 为 orchestrator executor 时拒绝。
 - target 未配置时按 `stay`。
 - malformed JSON 按 `stay`。
-- orchestrator failure/timeout 按 `stay`，并设置 `active_executor = default_executor`。
+- `mode: initial` 下，orchestrator failure/timeout 按 `stay`，并设置
+  `active_executor = default_executor`。
+- `mode: per_turn` 下，orchestrator failure/timeout 按 `stay`，保持当前 active
+  executor。
 - orchestrator prompt/response 不进入 canonical transcript。
 - orchestrator session id 不写入 task executor binding。
-- target prepare failure 回滚 `active_executor`。
+- target prepare failure 回滚 `active_executor`；如果本轮 handoff 前仍是 auto-pending，
+  则回退到 `default_executor`。
 - target prompt failure 保留 seen-context cursor。
 - `/agent auto` 清空 `active_executor`。
 - `/agent done` 设置 `active_executor = default_executor`，不清空 active executor。

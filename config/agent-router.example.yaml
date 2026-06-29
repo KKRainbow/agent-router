@@ -1,9 +1,11 @@
 router:
   default_executor: kimi
-  # Optional initial routing executor. It decides only the first real executor
-  # for an auto-pending session; it never handles user tasks directly.
+  # Optional routing executor. In initial mode it decides the first real executor
+  # for an auto-pending session; in per_turn mode it decides each normal turn.
+  # It never handles user tasks directly.
   # orchestrator:
   #   enabled: true
+  #   mode: initial
   #   executor: route-planner
   #   policy_file: config/agent-routing.md
   #   max_policy_bytes: 65536

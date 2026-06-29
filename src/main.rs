@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(|cfg| agent_router::router::OrchestratorSettings {
                 enabled: cfg.enabled,
+                mode: cfg.mode,
                 executor: cfg.executor.clone(),
                 policy_file: cfg.policy_file.clone(),
                 max_policy_bytes: cfg.max_policy_bytes,

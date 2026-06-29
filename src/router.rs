@@ -554,12 +554,28 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSettings {
     pub enabled: bool,
+    pub mode: OrchestratorMode,
     pub executor: String,
     pub policy_file: PathBuf,
     pub max_policy_bytes: usize,
     pub max_transcript_messages: usize,
     pub decision_timeout: Duration,
     pub emit_handoff_notice: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorMode {
+    Initial,
+    PerTurn,
+}
+
+impl OrchestratorMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::PerTurn => "per_turn",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +601,8 @@ enum InitialRouteSource {
 struct InitialRouteSelection {
     executor: String,
     source: InitialRouteSource,
+    failure_active_executor: Option<String>,
+    active_executor_revision: u64,
 }
 
 struct OrchestratorPreflight {
@@ -598,6 +616,7 @@ struct PendingOrchestratorDecision {
     orchestrator: OrchestratorSettings,
     decision: RouteDecision,
     generation: u64,
+    active_executor_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -807,7 +826,7 @@ where
         }
         let mut state = SessionState::new(session_key, &self.default_executor);
         if self.orchestrator_enabled() {
-            state.active_executor = None;
+            state.set_active_executor(None);
         }
         self.store.save(state.clone()).await;
         state
@@ -844,6 +863,61 @@ where
                 "executor interrupt request failed"
             );
         }
+    }
+
+    async fn restore_active_executor_after_failed_route(
+        &self,
+        session_key: &str,
+        route_source: InitialRouteSource,
+        route_active_executor_revision: u64,
+        failure_active_executor: &Option<String>,
+        turn_generation: u64,
+        cancel: &TurnCancellation,
+    ) {
+        if route_source != InitialRouteSource::OrchestratorHandoff {
+            return;
+        }
+        let lock = self.session_lock(session_key).await;
+        let _guard = lock.lock().await;
+        if self
+            .route_rollback_was_superseded(session_key, turn_generation, cancel)
+            .await
+        {
+            tracing::debug!(
+                session_key,
+                route_active_executor_revision,
+                turn_generation,
+                "skipped route failure rollback because a newer turn superseded it"
+            );
+            return;
+        }
+        let Some(mut state) = self.store.load(session_key).await else {
+            return;
+        };
+        if state.active_executor_revision != route_active_executor_revision {
+            tracing::debug!(
+                session_key,
+                route_active_executor_revision,
+                current_active_executor_revision = state.active_executor_revision,
+                "skipped route failure rollback because active executor changed"
+            );
+            return;
+        }
+        state.set_active_executor(failure_active_executor.clone());
+        self.store.save(state).await;
+    }
+
+    async fn route_rollback_was_superseded(
+        &self,
+        session_key: &str,
+        turn_generation: u64,
+        cancel: &TurnCancellation,
+    ) -> bool {
+        if route_was_superseded_by_new_message(cancel).await {
+            return true;
+        }
+        self.turns.has_active(session_key).await
+            && !self.turns.is_current(session_key, turn_generation).await
     }
 
     async fn handle_input(
@@ -991,7 +1065,7 @@ where
 
         let target = args;
         if target == "done" {
-            state.active_executor = Some(state.default_executor.clone());
+            state.set_active_executor(Some(state.default_executor.clone()));
             self.store.save(state.clone()).await;
             return output
                 .send_final_reply(format!(
@@ -1001,7 +1075,7 @@ where
                 .await;
         }
         if target == "auto" {
-            state.active_executor = None;
+            state.set_active_executor(None);
             self.store.save(state).await;
             return output
                 .send_final_reply("Active executor: [auto pending]".to_string())
@@ -1020,7 +1094,7 @@ where
                 ))
                 .await;
         }
-        state.active_executor = Some(target.to_string());
+        state.set_active_executor(Some(target.to_string()));
         self.store.save(state).await;
         output
             .send_final_reply(format!("Active executor: {target}"))
@@ -1119,7 +1193,7 @@ where
                 Some(executor_name) => executor_name,
                 None => {
                     let executor_name = state.default_executor.clone();
-                    state.active_executor = Some(executor_name.clone());
+                    state.set_active_executor(Some(executor_name.clone()));
                     self.store.save(state).await;
                     executor_name
                 }
@@ -1196,6 +1270,8 @@ where
             return Ok(Some(InitialRouteSelection {
                 executor,
                 source: InitialRouteSource::Existing,
+                failure_active_executor: None,
+                active_executor_revision: state.active_executor_revision,
             }));
         }
 
@@ -1205,10 +1281,12 @@ where
             .filter(|orchestrator| orchestrator.enabled)
         else {
             let executor = state.default_executor.clone();
-            state.active_executor = Some(executor.clone());
+            state.set_active_executor(Some(executor.clone()));
             return Ok(Some(InitialRouteSelection {
                 executor,
                 source: InitialRouteSource::Defaulted,
+                failure_active_executor: None,
+                active_executor_revision: state.active_executor_revision,
             }));
         };
 
@@ -1241,7 +1319,7 @@ where
         else {
             return Ok(None);
         };
-        if state.active_executor.is_some() {
+        if !orchestrator_should_route(&orchestrator, &state) {
             return Ok(None);
         }
         let mut replaced = None;
@@ -1253,11 +1331,10 @@ where
         let reservation = reserved_turn
             .as_ref()
             .expect("orchestrator preflight must have a turn reservation");
-        let routing_session_key = format!(
-            "{}::__agent_router_orchestrator__:{}:{}",
-            input.session_key,
-            orchestrator.executor,
-            reservation.log_generation()
+        let routing_session_key = orchestrator_routing_session_key(
+            &input.session_key,
+            &orchestrator.executor,
+            reservation.log_generation(),
         );
         let Some(turn) = reservation
             .adopt_with_session_key(orchestrator.executor.clone(), routing_session_key)
@@ -1285,6 +1362,10 @@ where
         orchestrator: &OrchestratorSettings,
         decision: RouteDecision,
     ) -> InitialRouteSelection {
+        let failure_active_executor = state
+            .active_executor
+            .clone()
+            .or_else(|| Some(state.default_executor.clone()));
         match self.normalize_route_decision(decision, orchestrator, state) {
             RouteDecision::Stay { reason } => {
                 if let Some(reason) = reason.as_deref().filter(|reason| !reason.trim().is_empty()) {
@@ -1292,14 +1373,19 @@ where
                         session_key,
                         orchestrator = %orchestrator.executor,
                         reason,
-                        "orchestrator selected default executor"
+                        "orchestrator selected stay"
                     );
                 }
-                let executor = state.default_executor.clone();
-                state.active_executor = Some(executor.clone());
+                let executor = state
+                    .active_executor
+                    .clone()
+                    .unwrap_or_else(|| state.default_executor.clone());
+                state.set_active_executor(Some(executor.clone()));
                 InitialRouteSelection {
                     executor,
                     source: InitialRouteSource::OrchestratorStay,
+                    failure_active_executor: None,
+                    active_executor_revision: state.active_executor_revision,
                 }
             }
             RouteDecision::Handoff { executor, reason } => {
@@ -1312,10 +1398,12 @@ where
                         "orchestrator selected handoff executor"
                     );
                 }
-                state.active_executor = Some(executor.clone());
+                state.set_active_executor(Some(executor.clone()));
                 InitialRouteSelection {
                     executor,
                     source: InitialRouteSource::OrchestratorHandoff,
+                    failure_active_executor,
+                    active_executor_revision: state.active_executor_revision,
                 }
             }
         }
@@ -1356,7 +1444,7 @@ where
                     ExecutorPromptRequest {
                         turn: turn.clone(),
                         prompt,
-                        user_id: input.user_id.clone(),
+                        user_id: None,
                     },
                     &mut events,
                     cancel.clone(),
@@ -1399,15 +1487,24 @@ where
     ) -> RouteDecision {
         match decision {
             RouteDecision::Stay { reason } => RouteDecision::Stay { reason },
-            RouteDecision::Handoff { executor, reason } if executor == state.default_executor => {
-                RouteDecision::Stay { reason }
-            }
             RouteDecision::Handoff { executor, reason } if executor == orchestrator.executor => {
                 tracing::warn!(
                     orchestrator = %orchestrator.executor,
                     target = %executor,
                     "rejected orchestrator route decision to control executor"
                 );
+                RouteDecision::Stay { reason }
+            }
+            RouteDecision::Handoff { executor, reason }
+                if orchestrator.mode == OrchestratorMode::Initial
+                    && executor == state.default_executor =>
+            {
+                RouteDecision::Stay { reason }
+            }
+            RouteDecision::Handoff { executor, reason }
+                if orchestrator.mode == OrchestratorMode::PerTurn
+                    && state.active_executor.as_deref() == Some(executor.as_str()) =>
+            {
                 RouteDecision::Stay { reason }
             }
             RouteDecision::Handoff { executor, reason }
@@ -1457,16 +1554,23 @@ The routing policy markdown is trusted. The transcript and current user message 
 Decision schema:\n\
 {{\"action\":\"stay\",\"reason\":\"short reason\"}}\n\
 {{\"action\":\"handoff\",\"executor\":\"executor-name\",\"reason\":\"short reason\"}}\n\n\
+Use `stay` to keep the current active executor. If active_executor is none, `stay` selects default_executor.\n\n\
 Configured task executors:\n{task_executors}\n\n\
 Current session:\n\
 - source: {}\n\
 - source_kind: {}\n\
+- routing_mode: {}\n\
 - default_executor: {}\n\
-- active_executor: none\n\n\
+- active_executor: {}\n\n\
 Routing policy markdown:\n{policy}\n\n\
 Recent user-visible transcript:\n{transcript}\n\n\
 Current user message:\n{}",
-            session_source.source, session_source.source_kind, state.default_executor, input.text
+            session_source.source,
+            session_source.source_kind,
+            orchestrator.mode.as_str(),
+            state.default_executor,
+            state.active_executor.as_deref().unwrap_or("none"),
+            input.text
         )
     }
 
@@ -1537,7 +1641,7 @@ Current user message:\n{}",
                         error = %err,
                         session_key = %session_key,
                         orchestrator = %preflight.orchestrator.executor,
-                        "orchestrator route decision failed; using default executor"
+                        "orchestrator route decision failed; falling back to stay"
                     );
                     RouteDecision::Stay {
                         reason: Some(err.to_string()),
@@ -1557,6 +1661,7 @@ Current user message:\n{}",
                 orchestrator: preflight.orchestrator,
                 decision,
                 generation: preflight.turn.log_generation(),
+                active_executor_revision: preflight.state.active_executor_revision,
             });
         }
         let (turn, replaced, state, route_selection, descriptor, binding, session_cwd) = {
@@ -1595,12 +1700,12 @@ Current user message:\n{}",
                     );
                     return Ok(());
                 }
-                if state.active_executor.is_some() {
+                if state.active_executor_revision != pending_decision.active_executor_revision {
                     let _ = reservation.abandon_if_current().await;
                     tracing::debug!(
                         session_key = %session_key,
                         orchestrator = %pending_decision.orchestrator.executor,
-                        "discarded orchestrator decision because active executor was already selected"
+                        "discarded orchestrator decision because active executor revision changed"
                     );
                     return Ok(());
                 }
@@ -1650,6 +1755,16 @@ Current user message:\n{}",
                 let prepared = match self.prepare_context_sync_locked(context).await {
                     Ok(prepared) => prepared,
                     Err(err) => {
+                        let superseded =
+                            route_was_superseded_by_new_message(&turn.cancellation()).await;
+                        restore_active_executor_after_route_failure(
+                            &mut state,
+                            route_selection.source,
+                            route_selection.active_executor_revision,
+                            &route_selection.failure_active_executor,
+                            superseded,
+                        );
+                        self.store.save(state).await;
                         let _ = turn.abandon_if_current().await;
                         return Err(err);
                     }
@@ -1659,11 +1774,29 @@ Current user message:\n{}",
                         match prepared.commit_if_current(&turn, self.store.as_ref()).await {
                             Ok(committed) => committed,
                             Err(err) => {
+                                let superseded =
+                                    route_was_superseded_by_new_message(&turn.cancellation()).await;
+                                restore_active_executor_after_route_failure(
+                                    &mut state,
+                                    route_selection.source,
+                                    route_selection.active_executor_revision,
+                                    &route_selection.failure_active_executor,
+                                    superseded,
+                                );
+                                self.store.save(state).await;
                                 let _ = turn.abandon_if_current().await;
                                 return Err(err);
                             }
                         };
                     if !committed {
+                        restore_active_executor_after_route_failure(
+                            &mut state,
+                            route_selection.source,
+                            route_selection.active_executor_revision,
+                            &route_selection.failure_active_executor,
+                            route_was_superseded_by_new_message(&turn.cancellation()).await,
+                        );
+                        self.store.save(state).await;
                         tracing::debug!(
                             session_key = %session_key,
                             generation = turn.log_generation(),
@@ -1692,6 +1825,8 @@ Current user message:\n{}",
 
         let executor_name = route_selection.executor.clone();
         let route_source = route_selection.source;
+        let failure_active_executor = route_selection.failure_active_executor.clone();
+        let route_active_executor_revision = route_selection.active_executor_revision;
         #[cfg(test)]
         if route_source == InitialRouteSource::OrchestratorHandoff
             && let Some(hook) = &self.before_handoff_notice_hook
@@ -1750,6 +1885,15 @@ Current user message:\n{}",
             Err(err) => {
                 if cancel.is_cancelled().await {
                     let _ = turn.abandon_if_current().await;
+                    self.restore_active_executor_after_failed_route(
+                        &session_key,
+                        route_source,
+                        route_active_executor_revision,
+                        &failure_active_executor,
+                        generation,
+                        &cancel,
+                    )
+                    .await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -1770,9 +1914,13 @@ Current user message:\n{}",
                             .store
                             .load_or_create(&session_key, &self.default_executor)
                             .await;
-                        if route_source == InitialRouteSource::OrchestratorHandoff {
-                            latest.active_executor = Some(latest.default_executor.clone());
-                        }
+                        restore_active_executor_after_route_failure(
+                            &mut latest,
+                            route_source,
+                            route_active_executor_revision,
+                            &failure_active_executor,
+                            false,
+                        );
                         let latest_binding = latest.binding_for(&executor_name);
                         latest.executor_bindings.insert(
                             executor_name.clone(),
@@ -1792,6 +1940,15 @@ Current user message:\n{}",
                     .is_some()
                 };
                 if !committed_failure {
+                    self.restore_active_executor_after_failed_route(
+                        &session_key,
+                        route_source,
+                        route_active_executor_revision,
+                        &failure_active_executor,
+                        generation,
+                        &cancel,
+                    )
+                    .await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -1806,6 +1963,15 @@ Current user message:\n{}",
         };
         if cancel.is_cancelled().await {
             let _ = turn.abandon_if_current().await;
+            self.restore_active_executor_after_failed_route(
+                &session_key,
+                route_source,
+                route_active_executor_revision,
+                &failure_active_executor,
+                generation,
+                &cancel,
+            )
+            .await;
             tracing::info!(
                 session_key = %session_key,
                 executor = %executor_name,
@@ -1909,6 +2075,15 @@ Current user message:\n{}",
                 };
                 if !committed {
                     output.discard_reply_stream().await;
+                    self.restore_active_executor_after_failed_route(
+                        &session_key,
+                        route_source,
+                        route_active_executor_revision,
+                        &failure_active_executor,
+                        generation,
+                        &cancel,
+                    )
+                    .await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -1929,6 +2104,15 @@ Current user message:\n{}",
             ExecutorPromptOutcome::Cancelled => {
                 let current = turn.abandon_if_current().await;
                 output.discard_reply_stream().await;
+                self.restore_active_executor_after_failed_route(
+                    &session_key,
+                    route_source,
+                    route_active_executor_revision,
+                    &failure_active_executor,
+                    generation,
+                    &cancel,
+                )
+                .await;
                 tracing::info!(
                     session_key = %session_key,
                     executor = %executor_name,
@@ -1947,9 +2131,13 @@ Current user message:\n{}",
                             .store
                             .load_or_create(&session_key, &self.default_executor)
                             .await;
-                        if route_source == InitialRouteSource::OrchestratorHandoff {
-                            latest.active_executor = Some(latest.default_executor.clone());
-                        }
+                        restore_active_executor_after_route_failure(
+                            &mut latest,
+                            route_source,
+                            route_active_executor_revision,
+                            &failure_active_executor,
+                            false,
+                        );
                         let latest_binding = latest.binding_for(&executor_name);
                         if let Some(machine_workspace) = prepared_machine_workspace.clone() {
                             latest
@@ -1973,6 +2161,15 @@ Current user message:\n{}",
                 };
                 if !committed_failure {
                     output.discard_reply_stream().await;
+                    self.restore_active_executor_after_failed_route(
+                        &session_key,
+                        route_source,
+                        route_active_executor_revision,
+                        &failure_active_executor,
+                        generation,
+                        &cancel,
+                    )
+                    .await;
                     tracing::debug!(
                         session_key = %session_key,
                         executor = %executor_name,
@@ -2114,6 +2311,30 @@ fn parse_route_decision(text: &str) -> anyhow::Result<RouteDecision> {
         }
         other => anyhow::bail!("unsupported route decision action `{other}`"),
     }
+}
+
+fn orchestrator_should_route(orchestrator: &OrchestratorSettings, state: &SessionState) -> bool {
+    orchestrator.enabled
+        && (state.active_executor.is_none() || orchestrator.mode == OrchestratorMode::PerTurn)
+}
+
+fn orchestrator_routing_session_key(
+    session_key: &str,
+    orchestrator_executor: &str,
+    generation: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session_key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(orchestrator_executor.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(generation.to_le_bytes());
+    let digest = hasher.finalize();
+    let hash = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("__agent_router_orchestrator__:{hash}:{generation}")
 }
 
 fn session_source_metadata(session_key: &str) -> SessionSourceMetadata {
@@ -2536,6 +2757,25 @@ fn binding_with_executor_cwd(mut binding: ExecutorBinding, cwd: Option<&str>) ->
     binding
 }
 
+fn restore_active_executor_after_route_failure(
+    state: &mut SessionState,
+    route_source: InitialRouteSource,
+    route_active_executor_revision: u64,
+    failure_active_executor: &Option<String>,
+    superseded_by_new_message: bool,
+) {
+    if route_source == InitialRouteSource::OrchestratorHandoff
+        && !superseded_by_new_message
+        && state.active_executor_revision == route_active_executor_revision
+    {
+        state.set_active_executor(failure_active_executor.clone());
+    }
+}
+
+async fn route_was_superseded_by_new_message(cancel: &TurnCancellation) -> bool {
+    cancel.is_cancelled().await && cancel.cancelled().await == InterruptReason::ReplacedByNewMessage
+}
+
 fn binding_with_executor_cwd_or_clear(
     mut binding: ExecutorBinding,
     cwd: Option<&str>,
@@ -2896,6 +3136,7 @@ mod tests {
                     executor: executor.clone(),
                     generation: request.turn.generation,
                     prompt: request.prompt,
+                    user_id: request.user_id,
                 });
             let _ = events
                 .send(ExecutorUpdate::new("progress", "Progress", "working", ""))
@@ -2982,6 +3223,7 @@ mod tests {
                     executor: executor.clone(),
                     generation: request.turn.generation,
                     prompt: request.prompt,
+                    user_id: request.user_id,
                 });
             if executor == "route-planner" {
                 if let Some(started) = self.started.lock().await.take() {
@@ -3010,6 +3252,479 @@ mod tests {
             _reason: &str,
         ) -> anyhow::Result<()> {
             self.discarded.lock().await.push(turn);
+            Ok(())
+        }
+    }
+
+    struct ReleasableOrchestratorBackend {
+        decision_text: String,
+        started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        prompts: Arc<Mutex<Vec<crate::executor::test_support::ExecutorRequest>>>,
+    }
+
+    impl ReleasableOrchestratorBackend {
+        fn new(
+            decision_text: impl Into<String>,
+            started: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        ) -> Self {
+            Self {
+                decision_text: decision_text.into(),
+                started: tokio::sync::Mutex::new(Some(started)),
+                release: tokio::sync::Mutex::new(Some(release)),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for ReleasableOrchestratorBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            matches!(name, "kimi" | "codex" | "route-planner").then(|| ExecutorDescriptor {
+                name: name.to_string(),
+                protocol: "test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            ["codex", "kimi", "route-planner"]
+                .into_iter()
+                .filter_map(|name| self.get(name))
+                .collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            Ok(PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
+                started_new_session: true,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            _cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let executor = request.turn.executor.clone();
+            self.prompts
+                .lock()
+                .await
+                .push(crate::executor::test_support::ExecutorRequest {
+                    session_key: request.turn.session_key,
+                    executor: executor.clone(),
+                    generation: request.turn.generation,
+                    prompt: request.prompt,
+                    user_id: request.user_id,
+                });
+            if executor == "route-planner" {
+                if let Some(started) = self.started.lock().await.take() {
+                    let _ = started.send(());
+                }
+                if let Some(release) = self.release.lock().await.take() {
+                    let _ = release.await;
+                }
+                return ExecutorPromptOutcome::Completed(ExecutorResponse {
+                    final_text: self.decision_text.clone(),
+                });
+            }
+            ExecutorPromptOutcome::Completed(ExecutorResponse {
+                final_text: format!("{executor} response"),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HandoffFailurePhase {
+        Prepare,
+        Prompt,
+    }
+
+    #[derive(Debug)]
+    struct PerTurnHandoffFailureBackend {
+        phase: HandoffFailurePhase,
+        prompts: Arc<Mutex<Vec<crate::executor::test_support::ExecutorRequest>>>,
+    }
+
+    impl PerTurnHandoffFailureBackend {
+        fn new(phase: HandoffFailurePhase) -> Self {
+            Self {
+                phase,
+                prompts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for PerTurnHandoffFailureBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            matches!(name, "kimi" | "codex" | "route-planner").then(|| ExecutorDescriptor {
+                name: name.to_string(),
+                protocol: "test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            ["codex", "kimi", "route-planner"]
+                .into_iter()
+                .filter_map(|name| self.get(name))
+                .collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            if self.phase == HandoffFailurePhase::Prepare && request.turn.executor == "kimi" {
+                anyhow::bail!("prepare failed");
+            }
+            Ok(PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
+                started_new_session: true,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            _cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let executor = request.turn.executor.clone();
+            self.prompts
+                .lock()
+                .await
+                .push(crate::executor::test_support::ExecutorRequest {
+                    session_key: request.turn.session_key,
+                    executor: executor.clone(),
+                    generation: request.turn.generation,
+                    prompt: request.prompt,
+                    user_id: request.user_id,
+                });
+            if executor == "route-planner" {
+                return ExecutorPromptOutcome::Completed(ExecutorResponse {
+                    final_text: r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#
+                        .to_string(),
+                });
+            }
+            if self.phase == HandoffFailurePhase::Prompt && executor == "kimi" {
+                return ExecutorPromptOutcome::Failed(anyhow::anyhow!("prompt failed"));
+            }
+            ExecutorPromptOutcome::Completed(ExecutorResponse {
+                final_text: format!("{executor} response"),
+            })
+        }
+    }
+
+    struct ReleasablePromptFailureBackend {
+        started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl ReleasablePromptFailureBackend {
+        fn new(
+            started: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        ) -> Self {
+            Self {
+                started: tokio::sync::Mutex::new(Some(started)),
+                release: tokio::sync::Mutex::new(Some(release)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for ReleasablePromptFailureBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            matches!(name, "kimi" | "codex" | "route-planner").then(|| ExecutorDescriptor {
+                name: name.to_string(),
+                protocol: "test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            ["codex", "kimi", "route-planner"]
+                .into_iter()
+                .filter_map(|name| self.get(name))
+                .collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            Ok(PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
+                started_new_session: true,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            _cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            if request.turn.executor == "route-planner" {
+                return ExecutorPromptOutcome::Completed(ExecutorResponse {
+                    final_text: r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#
+                        .to_string(),
+                });
+            }
+            if let Some(started) = self.started.lock().await.take() {
+                let _ = started.send(());
+            }
+            if let Some(release) = self.release.lock().await.take() {
+                let _ = release.await;
+            }
+            ExecutorPromptOutcome::Failed(anyhow::anyhow!("prompt failed"))
+        }
+    }
+
+    struct PerTurnStaleRollbackBackend {
+        decisions: tokio::sync::Mutex<Vec<String>>,
+        prompts: Arc<Mutex<Vec<crate::executor::test_support::ExecutorRequest>>>,
+        first_task_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        first_task_cancelled: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl PerTurnStaleRollbackBackend {
+        fn new(
+            first_task_started: tokio::sync::oneshot::Sender<()>,
+            first_task_cancelled: tokio::sync::oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                decisions: tokio::sync::Mutex::new(vec![
+                    r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#.to_string(),
+                    r#"{"action":"stay","reason":"same executor"}"#.to_string(),
+                ]),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                first_task_started: tokio::sync::Mutex::new(Some(first_task_started)),
+                first_task_cancelled: tokio::sync::Mutex::new(Some(first_task_cancelled)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for PerTurnStaleRollbackBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            matches!(name, "kimi" | "codex" | "route-planner").then(|| ExecutorDescriptor {
+                name: name.to_string(),
+                protocol: "test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            ["codex", "kimi", "route-planner"]
+                .into_iter()
+                .filter_map(|name| self.get(name))
+                .collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            Ok(PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
+                started_new_session: true,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let executor = request.turn.executor.clone();
+            self.prompts
+                .lock()
+                .await
+                .push(crate::executor::test_support::ExecutorRequest {
+                    session_key: request.turn.session_key,
+                    executor: executor.clone(),
+                    generation: request.turn.generation,
+                    prompt: request.prompt,
+                    user_id: request.user_id,
+                });
+            if executor == "route-planner" {
+                let decision = self.decisions.lock().await.remove(0);
+                return ExecutorPromptOutcome::Completed(ExecutorResponse {
+                    final_text: decision,
+                });
+            }
+            let task_prompt_count = self
+                .prompts
+                .lock()
+                .await
+                .iter()
+                .filter(|request| request.executor == "kimi")
+                .count();
+            if task_prompt_count == 1 {
+                if let Some(started) = self.first_task_started.lock().await.take() {
+                    let _ = started.send(());
+                }
+                let _ = cancel.cancelled().await;
+                if let Some(cancelled) = self.first_task_cancelled.lock().await.take() {
+                    let _ = cancelled.send(());
+                }
+                return ExecutorPromptOutcome::Cancelled;
+            }
+            ExecutorPromptOutcome::Completed(ExecutorResponse {
+                final_text: "fresh response".to_string(),
+            })
+        }
+
+        async fn interrupt(&self, _request: ExecutorInterruptRequest) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PerTurnSupersededRollbackBackend {
+        decisions: tokio::sync::Mutex<Vec<String>>,
+        prompts: Arc<Mutex<Vec<crate::executor::test_support::ExecutorRequest>>>,
+        first_task_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        first_task_cancelled: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        second_route_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        second_route_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl PerTurnSupersededRollbackBackend {
+        fn new(
+            first_task_started: tokio::sync::oneshot::Sender<()>,
+            first_task_cancelled: tokio::sync::oneshot::Sender<()>,
+            second_route_started: tokio::sync::oneshot::Sender<()>,
+            second_route_release: tokio::sync::oneshot::Receiver<()>,
+        ) -> Self {
+            Self {
+                decisions: tokio::sync::Mutex::new(vec![
+                    r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#.to_string(),
+                    r#"{"action":"stay","reason":"same executor"}"#.to_string(),
+                ]),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                first_task_started: tokio::sync::Mutex::new(Some(first_task_started)),
+                first_task_cancelled: tokio::sync::Mutex::new(Some(first_task_cancelled)),
+                second_route_started: tokio::sync::Mutex::new(Some(second_route_started)),
+                second_route_release: tokio::sync::Mutex::new(Some(second_route_release)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for PerTurnSupersededRollbackBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            matches!(name, "kimi" | "codex" | "route-planner").then(|| ExecutorDescriptor {
+                name: name.to_string(),
+                protocol: "test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            ["codex", "kimi", "route-planner"]
+                .into_iter()
+                .filter_map(|name| self.get(name))
+                .collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            Ok(PreparedExecutor {
+                external_session_id: Some(format!("{}-session", request.turn.executor)),
+                started_new_session: true,
+                machine_id: None,
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            let executor = request.turn.executor.clone();
+            let (route_prompt_count, task_prompt_count) = {
+                let mut prompts = self.prompts.lock().await;
+                prompts.push(crate::executor::test_support::ExecutorRequest {
+                    session_key: request.turn.session_key,
+                    executor: executor.clone(),
+                    generation: request.turn.generation,
+                    prompt: request.prompt,
+                    user_id: request.user_id,
+                });
+                let route_prompt_count = prompts
+                    .iter()
+                    .filter(|request| request.executor == "route-planner")
+                    .count();
+                let task_prompt_count = prompts
+                    .iter()
+                    .filter(|request| request.executor == "kimi")
+                    .count();
+                (route_prompt_count, task_prompt_count)
+            };
+
+            if executor == "route-planner" {
+                let decision = self.decisions.lock().await.remove(0);
+                if route_prompt_count == 2 {
+                    if let Some(started) = self.second_route_started.lock().await.take() {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = self.second_route_release.lock().await.take() {
+                        let _ = release.await;
+                    }
+                }
+                return ExecutorPromptOutcome::Completed(ExecutorResponse {
+                    final_text: decision,
+                });
+            }
+
+            if task_prompt_count == 1 {
+                if let Some(started) = self.first_task_started.lock().await.take() {
+                    let _ = started.send(());
+                }
+                let _ = cancel.cancelled().await;
+                if let Some(cancelled) = self.first_task_cancelled.lock().await.take() {
+                    let _ = cancelled.send(());
+                }
+                return ExecutorPromptOutcome::Cancelled;
+            }
+
+            ExecutorPromptOutcome::Completed(ExecutorResponse {
+                final_text: "fresh response".to_string(),
+            })
+        }
+
+        async fn interrupt(&self, _request: ExecutorInterruptRequest) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -3086,6 +3801,7 @@ mod tests {
     fn test_orchestrator_settings(policy_file: PathBuf) -> OrchestratorSettings {
         OrchestratorSettings {
             enabled: true,
+            mode: OrchestratorMode::Initial,
             executor: "route-planner".to_string(),
             policy_file,
             max_policy_bytes: 65_536,
@@ -3247,16 +3963,35 @@ mod tests {
         assert!(
             prompts[0]
                 .session_key
-                .contains("__agent_router_orchestrator__")
+                .starts_with("__agent_router_orchestrator__:")
         );
+        assert!(!prompts[0].session_key.contains("slack"));
+        assert!(!prompts[0].session_key.contains("D1"));
+        assert!(!prompts[0].session_key.contains("111.000"));
+        assert_eq!(prompts[0].user_id, None);
         assert!(prompts[0].prompt.contains("- source: slack"));
         assert!(prompts[0].prompt.contains("- source_kind: dm"));
+        assert!(prompts[0].prompt.contains("- routing_mode: initial"));
+        assert!(prompts[0].prompt.contains("- active_executor: none"));
         assert!(!prompts[0].prompt.contains("slack:dm:D1:111.000"));
         assert!(prompts[0].prompt.contains("Routing policy markdown:"));
         assert!(prompts[0].prompt.contains("please edit this repo"));
         assert_eq!(prompts[1].executor, "codex");
         assert_eq!(prompts[1].session_key, "slack:dm:D1:111.000");
+        assert_eq!(prompts[1].user_id.as_deref(), Some("U1"));
         drop(prompts);
+        let prepared = executor.prepared.lock().await;
+        assert_eq!(prepared[0].turn.executor, "route-planner");
+        assert!(
+            prepared[0]
+                .turn
+                .session_key
+                .starts_with("__agent_router_orchestrator__:")
+        );
+        assert!(!prepared[0].turn.session_key.contains("slack"));
+        assert!(!prepared[0].turn.session_key.contains("D1"));
+        assert!(!prepared[0].turn.session_key.contains("111.000"));
+        drop(prepared);
 
         let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
@@ -3303,6 +4038,651 @@ mod tests {
             .count();
         assert_eq!(route_prompts, 1);
         assert_eq!(codex_prompts, 2);
+    }
+
+    #[tokio::test]
+    async fn per_turn_orchestrator_runs_before_each_normal_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"codex","reason":"code work"}"#,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router =
+            AgentRouter::new("kimi", store, executor.clone()).with_orchestrator(Some(settings));
+
+        for text in ["first task", "second task"] {
+            let mut output = CollectingRouterOutputSink::default();
+            router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:dm:D1:111.000".to_string(),
+                        text: text.to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+        }
+
+        let prompts = executor.prompts.lock().await;
+        let route_prompts = prompts
+            .iter()
+            .filter(|request| request.executor == "route-planner")
+            .collect::<Vec<_>>();
+        let codex_prompts = prompts
+            .iter()
+            .filter(|request| request.executor == "codex")
+            .count();
+        assert_eq!(route_prompts.len(), 2);
+        assert_eq!(codex_prompts, 2);
+        assert!(route_prompts[0].prompt.contains("- routing_mode: per_turn"));
+        assert!(route_prompts[0].prompt.contains("- active_executor: none"));
+        assert!(route_prompts[1].prompt.contains("- active_executor: codex"));
+    }
+
+    #[tokio::test]
+    async fn per_turn_stay_keeps_current_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let mut state = SessionState::new("slack:dm:D1:111.000", "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        store.save(state).await;
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"stay","reason":"same task"}"#,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_orchestrator(Some(settings));
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "continue".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "codex response");
+        assert_eq!(
+            store
+                .load("slack:dm:D1:111.000")
+                .await
+                .unwrap()
+                .active_executor
+                .as_deref(),
+            Some("codex")
+        );
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts[0].executor, "route-planner");
+        assert!(prompts[0].prompt.contains("- active_executor: codex"));
+        assert_eq!(prompts[1].executor, "codex");
+    }
+
+    #[tokio::test]
+    async fn per_turn_handoff_to_default_switches_from_current_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let mut state = SessionState::new("slack:dm:D1:111.000", "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        store.save(state).await;
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"kimi","reason":"conversation"}"#,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_orchestrator(Some(settings));
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "switch back".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "kimi response");
+        assert_eq!(
+            store
+                .load("slack:dm:D1:111.000")
+                .await
+                .unwrap()
+                .active_executor
+                .as_deref(),
+            Some("kimi")
+        );
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts[0].executor, "route-planner");
+        assert_eq!(prompts[1].executor, "kimi");
+    }
+
+    #[tokio::test]
+    async fn per_turn_handoff_failure_restores_previous_active_executor() {
+        for phase in [HandoffFailurePhase::Prepare, HandoffFailurePhase::Prompt] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(InMemorySessionStore::default());
+            let session_key = format!("slack:dm:D1:{phase:?}");
+            let mut state = SessionState::new(&session_key, "kimi");
+            state.set_active_executor(Some("codex".to_string()));
+            let initial_revision = state.active_executor_revision;
+            store.save(state).await;
+            let executor = Arc::new(PerTurnHandoffFailureBackend::new(phase));
+            let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+            settings.mode = OrchestratorMode::PerTurn;
+            let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+                .with_orchestrator(Some(settings));
+
+            let mut output = CollectingRouterOutputSink::default();
+            let err = router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.clone(),
+                        text: "switch".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap_err();
+
+            match phase {
+                HandoffFailurePhase::Prepare => assert_eq!(err.to_string(), "prepare failed"),
+                HandoffFailurePhase::Prompt => assert_eq!(err.to_string(), "prompt failed"),
+            }
+            let saved = store.load(&session_key).await.unwrap();
+            assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+            assert!(saved.active_executor_revision > initial_revision);
+            assert!(saved.transcript.is_empty());
+            assert_eq!(
+                saved
+                    .executor_bindings
+                    .get("kimi")
+                    .map(|binding| binding.health.clone()),
+                Some(ExecutorHealth::Unhealthy)
+            );
+            let prompts = executor.prompts.lock().await;
+            assert_eq!(prompts[0].executor, "route-planner");
+            if phase == HandoffFailurePhase::Prompt {
+                assert_eq!(prompts[1].executor, "kimi");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_failure_from_auto_pending_falls_back_to_default_executor() {
+        for mode in [OrchestratorMode::Initial, OrchestratorMode::PerTurn] {
+            for phase in [HandoffFailurePhase::Prepare, HandoffFailurePhase::Prompt] {
+                let tmp = tempfile::tempdir().unwrap();
+                let store = Arc::new(InMemorySessionStore::default());
+                let session_key = format!("slack:dm:D1:auto-pending-{mode:?}-{phase:?}");
+                let executor = Arc::new(PerTurnHandoffFailureBackend::new(phase));
+                let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+                settings.mode = mode;
+                let router = AgentRouter::new("kimi", store.clone(), executor)
+                    .with_orchestrator(Some(settings));
+
+                let mut output = CollectingRouterOutputSink::default();
+                let err = router
+                    .handle(
+                        RouterInput {
+                            session_key: session_key.clone(),
+                            text: "switch from pending".to_string(),
+                            user_id: None,
+                        },
+                        &mut output,
+                    )
+                    .await
+                    .unwrap_err();
+
+                match phase {
+                    HandoffFailurePhase::Prepare => assert_eq!(err.to_string(), "prepare failed"),
+                    HandoffFailurePhase::Prompt => assert_eq!(err.to_string(), "prompt failed"),
+                }
+                let saved = store.load(&session_key).await.unwrap();
+                assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
+                assert!(saved.transcript.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn per_turn_handoff_failure_does_not_overwrite_newer_manual_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let session_key = "slack:dm:D1:manual-during-failure";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        store.save(state).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(ReleasablePromptFailureBackend::new(started_tx, release_rx));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = Arc::new(
+            AgentRouter::new("kimi", store.clone(), executor).with_orchestrator(Some(settings)),
+        );
+
+        let route_router = router.clone();
+        let route = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            route_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "switch then fail".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut manual = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "/agent kimi".to_string(),
+                    user_id: None,
+                },
+                &mut manual,
+            )
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), route)
+                .await
+                .unwrap()
+                .unwrap(),
+            "prompt failed"
+        );
+        let saved = store.load(session_key).await.unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
+        assert!(saved.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn per_turn_handoff_context_sync_failure_restores_previous_active_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let session_key = "slack:dm:D1:context-failure";
+        let cwd = workspace_root.join(session_workspace_dir_name(session_key));
+        std::fs::create_dir_all(cwd.join("slack/current-thread.md")).unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        let initial_revision = state.active_executor_revision;
+        store.save(state).await;
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_orchestrator(Some(settings))
+            .with_workspace_root(Some(workspace_root));
+        let reservation = router
+            .reserve_turn(session_key, TurnBeginMode::ReplaceActive)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut output = CollectingRouterOutputSink::default();
+
+        let err = router
+            .handle_reserved(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "switch with context".to_string(),
+                    user_id: None,
+                },
+                reservation,
+                Some(ContextSyncRequest {
+                    session_key: session_key.to_string(),
+                    source: "slack".to_string(),
+                    base_path: PathBuf::from("slack"),
+                    artifacts: vec![ContextArtifactInput {
+                        id: "thread".to_string(),
+                        kind: "slack_current_thread".to_string(),
+                        title: "Thread".to_string(),
+                        source_locator: None,
+                        files: vec![ContextFileInput {
+                            relative_path: PathBuf::from("slack/current-thread.md"),
+                            content: ContextFileContent::Text("thread context".to_string()),
+                        }],
+                        metadata: Default::default(),
+                    }],
+                    remove_artifacts: Vec::new(),
+                    unresolved: Vec::new(),
+                }),
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("context path is not a file"));
+        assert!(!router.turns.has_current(session_key).await);
+        let saved = store.load(session_key).await.unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+        assert!(saved.active_executor_revision > initial_revision);
+        assert!(saved.transcript.is_empty());
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].executor, "route-planner");
+    }
+
+    #[tokio::test]
+    async fn per_turn_stale_handoff_does_not_rollback_newer_stay_on_same_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let session_key = "slack:dm:D1:stale-same-executor";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        store.save(state).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(PerTurnStaleRollbackBackend::new(started_tx, cancelled_tx));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = Arc::new(
+            AgentRouter::new("kimi", store.clone(), executor).with_orchestrator(Some(settings)),
+        );
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "old switch".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut second = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "newer stay".to_string(),
+                    user_id: None,
+                },
+                &mut second,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(first_output.events.is_empty());
+        assert_eq!(second.final_reply(), "fresh response");
+        let saved = store.load(session_key).await.unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[0].content, "newer stay");
+    }
+
+    #[tokio::test]
+    async fn per_turn_superseded_handoff_cancel_does_not_drop_newer_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let session_key = "slack:dm:D1:superseded-rollback";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        store.save(state).await;
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (first_cancelled_tx, first_cancelled_rx) = tokio::sync::oneshot::channel();
+        let (second_route_started_tx, second_route_started_rx) = tokio::sync::oneshot::channel();
+        let (second_route_release_tx, second_route_release_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(PerTurnSupersededRollbackBackend::new(
+            first_started_tx,
+            first_cancelled_tx,
+            second_route_started_tx,
+            second_route_release_rx,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = Arc::new(
+            AgentRouter::new("kimi", store.clone(), executor).with_orchestrator(Some(settings)),
+        );
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            first_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "old switch".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), first_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let second_router = router.clone();
+        let second = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            second_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "newer stay".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), second_route_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_output = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first_output.events.is_empty());
+
+        second_route_release_tx.send(()).unwrap();
+        let second_output = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(second_output.final_reply(), "fresh response");
+        let saved = store.load(session_key).await.unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(saved.transcript[0].content, "newer stay");
+    }
+
+    #[tokio::test]
+    async fn per_turn_cancelled_handoff_restores_previous_active_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let session_key = "slack:dm:D1:cancelled-handoff";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        let initial_revision = state.active_executor_revision;
+        store.save(state).await;
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let turns = TurnRegistry::new();
+        let hook_turns = turns.clone();
+        let hook_session_key = session_key.to_string();
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_orchestrator(Some(settings))
+            .with_before_handoff_notice_hook(Arc::new(move || {
+                let turns = hook_turns.clone();
+                let session_key = hook_session_key.clone();
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move { turns.stop(&session_key).await });
+                })
+                .join()
+                .unwrap();
+            }));
+        let router = AgentRouter { turns, ..router };
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "cancel after handoff".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert!(output.events.is_empty());
+        let saved = store.load(session_key).await.unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+        assert!(saved.active_executor_revision > initial_revision);
+        assert!(saved.transcript.is_empty());
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].executor, "route-planner");
+    }
+
+    #[tokio::test]
+    async fn per_turn_stale_decision_after_active_executor_aba_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let session_key = "slack:dm:D1:111.000";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        let initial_revision = state.active_executor_revision;
+        store.save(state).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(ReleasableOrchestratorBackend::new(
+            r#"{"action":"handoff","executor":"kimi","reason":"old route"}"#,
+            started_tx,
+            release_rx,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = Arc::new(
+            AgentRouter::new("kimi", store.clone(), executor).with_orchestrator(Some(settings)),
+        );
+
+        let route_router = router.clone();
+        let route = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            route_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "old task".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut to_default = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "/agent kimi".to_string(),
+                    user_id: None,
+                },
+                &mut to_default,
+            )
+            .await
+            .unwrap();
+        let mut back_to_codex = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "/agent codex".to_string(),
+                    user_id: None,
+                },
+                &mut back_to_codex,
+            )
+            .await
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        let route_output = tokio::time::timeout(Duration::from_secs(1), route)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(route_output.events.is_empty());
+        let saved = store.load(session_key).await.unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+        assert!(saved.active_executor_revision > initial_revision);
+        assert!(saved.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -3400,6 +4780,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(route_prompt_keys.len(), 2);
         assert_ne!(route_prompt_keys[0], route_prompt_keys[1]);
+        for key in &route_prompt_keys {
+            assert!(key.starts_with("__agent_router_orchestrator__:"));
+            assert!(!key.contains("slack"));
+            assert!(!key.contains("D1"));
+            assert!(!key.contains("111.000"));
+        }
         drop(prompts);
         let discarded = executor.discarded.lock().await;
         let discarded_keys = discarded
@@ -3562,8 +4948,11 @@ mod tests {
             interrupts[0]
                 .turn
                 .session_key
-                .contains("__agent_router_orchestrator__")
+                .starts_with("__agent_router_orchestrator__:")
         );
+        assert!(!interrupts[0].turn.session_key.contains("slack"));
+        assert!(!interrupts[0].turn.session_key.contains("D1"));
+        assert!(!interrupts[0].turn.session_key.contains("111.000"));
         drop(interrupts);
         let prompts = executor.prompts.lock().await;
         assert_eq!(prompts.len(), 1);

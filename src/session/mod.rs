@@ -107,6 +107,8 @@ pub struct SessionState {
     pub default_executor: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_executor: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub active_executor_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode_override: Option<ApprovalMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +127,7 @@ impl SessionState {
         Self {
             session_key: session_key.into(),
             active_executor: Some(default_executor.clone()),
+            active_executor_revision: 0,
             default_executor,
             approval_mode_override: None,
             cwd: None,
@@ -141,6 +144,15 @@ impl SessionState {
             .cloned()
             .unwrap_or_default()
     }
+
+    pub fn set_active_executor(&mut self, executor: Option<String>) {
+        self.active_executor = executor;
+        self.active_executor_revision = self.active_executor_revision.saturating_add(1);
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 fn now_ms() -> u64 {

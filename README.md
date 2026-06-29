@@ -150,14 +150,13 @@ Each chat session has one active agent. New sessions start with
 `router.default_executor`. Users can switch the active agent with
 `/agent <agent-name>`.
 
-Optional initial routing can be enabled with `router.orchestrator`. When enabled,
-new sessions start as auto-pending; the configured routing executor returns a
-strict JSON decision, and Agent Router sets the real active executor before
-delivering the original user message. Use `/agent auto` to clear the current
-selection and rerun initial routing on the next normal message. The routing
-prompt includes low-sensitivity session source metadata (`source` and
-`source_kind`), such as Slack DM or QQ group, without exposing the full channel
-session key.
+Optional routing can be enabled with `router.orchestrator`. The default
+`mode: initial` starts new sessions as auto-pending, asks the routing executor
+for one strict JSON decision, and then keeps the selected real executor until
+the user switches it or runs `/agent auto`. `mode: per_turn` asks the routing
+executor before every normal user message. The routing prompt includes
+low-sensitivity session source metadata (`source` and `source_kind`), such as
+Slack DM or QQ group, without exposing the full channel session key.
 
 ## Non-Goals
 
