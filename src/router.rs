@@ -145,7 +145,8 @@ fn render_compact_channel_events_inner(
     suppress_single_successful_tool: bool,
 ) -> Option<String> {
     let first = events.first()?;
-    let mut latest_progress = None;
+    let mut progress_items = Vec::new();
+    let mut last_progress_text: Option<String> = None;
     let mut latest_reasoning = None;
     let mut tool_total = 0usize;
     let mut command_counts: Vec<(String, usize)> = Vec::new();
@@ -155,7 +156,11 @@ fn render_compact_channel_events_inner(
     for event in events {
         match event.kind {
             RouterChannelEventKind::AgentProgress => {
-                latest_progress = Some(truncate_chars(one_line(&event.text).as_str(), 240));
+                push_compact_progress(
+                    &mut progress_items,
+                    &mut last_progress_text,
+                    one_line(&event.text),
+                );
             }
             RouterChannelEventKind::ReasoningSummary => {
                 latest_reasoning = Some(truncate_chars(one_line(&event.text).as_str(), 240));
@@ -184,7 +189,7 @@ fn render_compact_channel_events_inner(
     }
 
     if suppress_single_successful_tool
-        && latest_progress.is_none()
+        && progress_items.is_empty()
         && latest_reasoning.is_none()
         && attention.is_empty()
         && tool_total <= 1
@@ -210,12 +215,42 @@ fn render_compact_channel_events_inner(
             lines.push(format!("- {remaining} more"));
         }
     }
-    if let Some(progress) = latest_progress
-        && !progress.is_empty()
-    {
-        lines.push(format!("Progress: {progress}"));
+    if !progress_items.is_empty() {
+        lines.push("Progress:".to_string());
+        let omitted = progress_items.len().saturating_sub(6);
+        if omitted > 0 {
+            lines.push(format!("- {omitted} earlier"));
+        }
+        for progress in progress_items.iter().skip(omitted) {
+            lines.push(format!("- {progress}"));
+        }
     }
     Some(lines.join("\n"))
+}
+
+fn push_compact_progress(
+    progress_items: &mut Vec<String>,
+    last_progress_text: &mut Option<String>,
+    text: String,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let item = if let Some(previous) = last_progress_text.as_deref() {
+        if text == previous {
+            String::new()
+        } else if let Some(delta) = text.strip_prefix(previous) {
+            delta.trim_start().to_string()
+        } else {
+            text.clone()
+        }
+    } else {
+        text.clone()
+    };
+    *last_progress_text = Some(text);
+    if !item.is_empty() {
+        progress_items.push(truncate_chars(&item, 240));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4079,7 +4114,44 @@ mod tests {
         assert_eq!(
             render_compact_channel_events(&events).as_deref(),
             Some(
-                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `cargo test -q`\n- `sleep 3` x3\nTools:\n- read_file\nProgress: I will inspect the failing test first."
+                "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `cargo test -q`\n- `sleep 3` x3\nTools:\n- read_file\nProgress:\n- I will inspect the failing test first."
+            )
+        );
+    }
+
+    #[test]
+    fn compact_channel_events_render_progress_events_as_list() {
+        let events = vec![
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "codex".to_string(),
+                title: "Progress".to_string(),
+                text: "First step.".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "codex".to_string(),
+                title: "Progress".to_string(),
+                text: "Second step.".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "codex".to_string(),
+                title: "Progress".to_string(),
+                text: "Second step. Third step.".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "Bash".to_string(),
+                text: "$ echo ok\nexit: 0\nstatus: completed".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            render_live_compact_channel_events(&events).as_deref(),
+            Some(
+                "[codex] Activity\nCommands:\n- `echo ok`\nProgress:\n- First step.\n- Second step.\n- Third step."
             )
         );
     }
