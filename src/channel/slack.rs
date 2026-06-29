@@ -21,6 +21,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const SLACK_REPLY_DRAFT_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
 const SLACK_REPLY_DRAFT_UPDATE_GROWTH: usize = 500;
 const SLACK_REPLY_DRAFT_INITIAL_MIN_LEN: usize = 40;
+const SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES: usize = 8_000;
+const SLACK_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
 const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 use crate::{
@@ -1864,7 +1866,22 @@ fn slack_markdown_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -
 }
 
 fn slack_reply_draft_text(text: &str) -> String {
-    format!("{text}\n\n{SLACK_REPLY_DRAFT_MARKER}")
+    let preview = slack_reply_draft_preview(text);
+    format!("{preview}\n\n{SLACK_REPLY_DRAFT_MARKER}")
+}
+
+fn slack_reply_draft_preview(text: &str) -> String {
+    if text.len() <= SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES {
+        return text.to_string();
+    }
+
+    let suffix_budget = SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES
+        .saturating_sub(SLACK_REPLY_DRAFT_TRUNCATED_PREFIX.len());
+    let mut start = text.len().saturating_sub(suffix_budget);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{}{}", SLACK_REPLY_DRAFT_TRUNCATED_PREFIX, &text[start..])
 }
 
 fn spawn_slack_verbose_activity_poster(
@@ -4552,6 +4569,41 @@ mod tests {
             slack_reply_draft_text("partial"),
             format!("partial\n\n{SLACK_REPLY_DRAFT_MARKER}")
         );
+    }
+
+    #[test]
+    fn slack_reply_draft_text_truncates_long_preview_to_latest_tail() {
+        let text = format!(
+            "start-{}-tail",
+            "x".repeat(SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES + 200)
+        );
+
+        let draft = slack_reply_draft_text(&text);
+
+        assert!(!draft.contains("start-"));
+        assert!(draft.contains("-tail"));
+        assert!(draft.starts_with(SLACK_REPLY_DRAFT_TRUNCATED_PREFIX));
+        assert!(draft.ends_with(SLACK_REPLY_DRAFT_MARKER));
+        assert!(
+            draft.len()
+                <= SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES
+                    + "\n\n".len()
+                    + SLACK_REPLY_DRAFT_MARKER.len()
+        );
+    }
+
+    #[test]
+    fn slack_reply_draft_preview_truncates_on_utf8_boundary() {
+        let text = format!(
+            "prefix{}tail",
+            "我".repeat(SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES)
+        );
+
+        let preview = slack_reply_draft_preview(&text);
+
+        assert!(preview.starts_with(SLACK_REPLY_DRAFT_TRUNCATED_PREFIX));
+        assert!(preview.ends_with("tail"));
+        assert!(preview.len() <= SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES);
     }
 
     #[test]
