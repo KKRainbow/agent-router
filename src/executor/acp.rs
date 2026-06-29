@@ -24,8 +24,8 @@ use crate::{
     },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorChannelEvent, ExecutorChannelEventKind, ExecutorDescriptor,
-        ExecutorEventSink, ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
+        ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
+        ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
         ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
         TurnCancellation, summarize_json_rpc_error,
     },
@@ -923,11 +923,6 @@ struct AcpLifecycleResponse {
     cancelled: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct AcpProjectionMode {
-    stream_unphased_agent_messages: bool,
-}
-
 #[derive(Debug, Clone)]
 struct JsonRpcServerContext {
     state: SharedJsonRpcState,
@@ -940,22 +935,6 @@ struct JsonRpcServerContext {
     executor: String,
     active_user_id: Arc<Mutex<Option<String>>>,
     active_turn_cancel: Arc<Mutex<Option<TurnCancellation>>>,
-    projection_mode: AcpProjectionMode,
-}
-
-fn acp_projection_mode_for_process(executor: &str, stdio: &StdioCommand) -> AcpProjectionMode {
-    let executor = executor.to_ascii_lowercase();
-    let program_name = Path::new(&stdio.program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(&stdio.program)
-        .to_ascii_lowercase();
-    let codex_subcommand = program_name == "codex" && stdio.args.iter().any(|arg| arg == "acp");
-    AcpProjectionMode {
-        stream_unphased_agent_messages: executor.contains("codex")
-            || program_name.contains("codex-acp")
-            || codex_subcommand,
-    }
 }
 
 impl JsonRpcClient {
@@ -1004,7 +983,6 @@ impl JsonRpcClient {
         let child = Arc::new(Mutex::new(child));
         let active_user_id = Arc::new(Mutex::new(None));
         let active_turn_cancel = Arc::new(Mutex::new(None));
-        let projection_mode = acp_projection_mode_for_process(&executor, stdio);
         let server_context = JsonRpcServerContext {
             state: state.clone(),
             tool_calls,
@@ -1016,7 +994,6 @@ impl JsonRpcClient {
             executor,
             active_user_id: active_user_id.clone(),
             active_turn_cancel: active_turn_cancel.clone(),
-            projection_mode,
         };
 
         tokio::spawn(read_stdout(
@@ -1423,7 +1400,7 @@ async fn dispatch_message(message: Value, context: &JsonRpcServerContext) {
         }
         let update = {
             let mut tool_calls = context.tool_calls.lock().await;
-            project_acp_update_with_state(&message, &mut tool_calls, context.projection_mode)
+            project_acp_update_with_state(&message, &mut tool_calls)
         };
         if let Some(update) = update {
             let _ = context.updates.send(update);
@@ -1722,25 +1699,12 @@ async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
 #[cfg(test)]
 fn project_acp_update(message: &Value) -> Option<ExecutorUpdate> {
     let mut tool_calls = HashMap::new();
-    project_acp_update_with_state(message, &mut tool_calls, AcpProjectionMode::default())
-}
-
-#[cfg(test)]
-fn project_codex_acp_update(message: &Value) -> Option<ExecutorUpdate> {
-    let mut tool_calls = HashMap::new();
-    project_acp_update_with_state(
-        message,
-        &mut tool_calls,
-        AcpProjectionMode {
-            stream_unphased_agent_messages: true,
-        },
-    )
+    project_acp_update_with_state(message, &mut tool_calls)
 }
 
 fn project_acp_update_with_state(
     message: &Value,
     tool_calls: &mut HashMap<String, AcpToolCallState>,
-    mode: AcpProjectionMode,
 ) -> Option<ExecutorUpdate> {
     let params = message.get("params")?;
     let update = params
@@ -1791,8 +1755,6 @@ fn project_acp_update_with_state(
         .to_string();
     let message_phase = acp_message_phase(update);
     let is_agent_message = is_acp_agent_message_kind(kind, update);
-    let stream_unphased_agent_message =
-        mode.stream_unphased_agent_messages && is_agent_message && message_phase.is_none();
     let normalized_kind = if is_agent_message && message_phase == Some("commentary") {
         "agent_progress".to_string()
     } else if is_agent_message {
@@ -1834,8 +1796,6 @@ fn project_acp_update_with_state(
     let mut update =
         ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
     if is_agent_progress && !text.trim().is_empty() {
-        update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text.clone()));
-    } else if stream_unphased_agent_message && !text.trim().is_empty() {
         update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text.clone()));
     } else if let Some(summary) = plan_summary {
         update = update.with_channel_event(ExecutorChannelEvent::agent_progress(summary));
@@ -2335,7 +2295,6 @@ mod tests {
                 }
             }),
             &mut tool_calls,
-            AcpProjectionMode::default(),
         )
         .unwrap();
         assert!(started.channel_event.is_some());
@@ -2352,7 +2311,6 @@ mod tests {
                 }
             }),
             &mut tool_calls,
-            AcpProjectionMode::default(),
         )
         .unwrap();
         assert_eq!(output.title, "Bash");
@@ -2374,7 +2332,6 @@ mod tests {
                 }
             }),
             &mut tool_calls,
-            AcpProjectionMode::default(),
         )
         .unwrap();
         assert_eq!(titled_output.title, "Bash");
@@ -2395,7 +2352,6 @@ mod tests {
                 }
             }),
             &mut tool_calls,
-            AcpProjectionMode::default(),
         )
         .unwrap();
         assert_eq!(repeated_input.title, "Bash");
@@ -2417,7 +2373,6 @@ mod tests {
                 }
             }),
             &mut tool_calls,
-            AcpProjectionMode::default(),
         )
         .unwrap();
         assert!(json_args.channel_event.is_none());
@@ -2440,7 +2395,6 @@ mod tests {
                 }
             }),
             &mut tool_calls,
-            AcpProjectionMode::default(),
         )
         .unwrap();
         let event = started.channel_event.unwrap();
@@ -2459,7 +2413,6 @@ mod tests {
                 }
             }),
             &mut tool_calls,
-            AcpProjectionMode::default(),
         )
         .unwrap();
         assert_eq!(failed.title, "Run tests");
@@ -2504,8 +2457,8 @@ mod tests {
     }
 
     #[test]
-    fn acp_codex_unphased_agent_message_projects_progress_event() {
-        let agent_message = project_codex_acp_update(&json!({
+    fn acp_unphased_agent_message_does_not_project_progress_event() {
+        let agent_message = project_acp_update(&json!({
             "method": "session/update",
             "params": {
                 "update": {
@@ -2518,9 +2471,7 @@ mod tests {
 
         assert_eq!(agent_message.kind, "agent_message_chunk");
         assert_eq!(agent_message.text, "I am checking the instruction shape.");
-        let event = agent_message.channel_event.unwrap();
-        assert_eq!(event.kind, ExecutorChannelEventKind::AgentProgress);
-        assert_eq!(event.text, "I am checking the instruction shape.");
+        assert!(agent_message.channel_event.is_none());
     }
 
     #[test]
@@ -2682,13 +2633,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_codex_unphased_chunks_emit_incremental_progress() {
+    async fn acp_unphased_chunks_remain_final_text_only() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = Vec::new();
 
         for chunk in ["I", " am", " checking"] {
             collect_update(
-                project_codex_acp_update(&json!({
+                project_acp_update(&json!({
                     "method": "session/update",
                     "params": {
                         "update": {
@@ -2707,14 +2658,11 @@ mod tests {
 
         assert_eq!(text_parts, ["I", " am", " checking"]);
         assert_eq!(events.updates.len(), 3);
-        assert_eq!(events.updates[0].channel_event.as_ref().unwrap().text, "I");
-        assert_eq!(
-            events.updates[1].channel_event.as_ref().unwrap().text,
-            " am"
-        );
-        assert_eq!(
-            events.updates[2].channel_event.as_ref().unwrap().text,
-            " checking"
+        assert!(
+            events
+                .updates
+                .iter()
+                .all(|update| update.channel_event.is_none())
         );
     }
 
@@ -2831,28 +2779,6 @@ mod tests {
         assert!(!is_json_rpc_like(&json!({"method": "startup"})));
         assert!(!is_json_rpc_like(&json!({"hello": "world"})));
         assert!(!is_json_rpc_like(&json!("banner")));
-    }
-
-    #[test]
-    fn codex_acp_projection_mode_streams_unphased_agent_messages_only_for_codex() {
-        assert!(
-            acp_projection_mode_for_process(
-                "codex-zbs",
-                &stdio_command(
-                    "/home/admin/.local/share/zed/external_agents/registry/codex-acp/codex-acp",
-                    &[]
-                )
-            )
-            .stream_unphased_agent_messages
-        );
-        assert!(
-            acp_projection_mode_for_process("codex", &stdio_command("codex", &["acp"]))
-                .stream_unphased_agent_messages
-        );
-        assert!(
-            !acp_projection_mode_for_process("kimi", &stdio_command("kimi", &["acp"]))
-                .stream_unphased_agent_messages
-        );
     }
 
     #[tokio::test]

@@ -10,7 +10,10 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
@@ -21,6 +24,7 @@ use crate::{
         RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
         TurnReservation, is_slash_command_input, render_compact_channel_events,
     },
+    text::truncate_chars,
 };
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
@@ -28,6 +32,9 @@ const QQ_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+const QQ_REPLY_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(20);
+const QQ_REPLY_CHECKPOINT_MIN_GROWTH: usize = 500;
+const QQ_REPLY_CHECKPOINT_PREVIEW_CHARS: usize = 240;
 const QQ_MSG_TYPE_TEXT: u8 = 0;
 const QQ_MSG_TYPE_MARKDOWN: u8 = 2;
 #[derive(Debug, Clone)]
@@ -298,6 +305,8 @@ impl QqBotChannel {
             msg_id: message.msg_id,
             channel_events: self.cfg.channel_events,
             pending_events: Vec::new(),
+            reply_checkpoints: QqReplyCheckpoints::default(),
+            checkpoint_poster: None,
         };
         let input = RouterInput {
             session_key: message.session_key,
@@ -632,6 +641,53 @@ struct QqRouterOutputSink {
     msg_id: String,
     channel_events: ChannelEventMode,
     pending_events: Vec<RouterChannelEvent>,
+    reply_checkpoints: QqReplyCheckpoints,
+    checkpoint_poster: Option<QqReplyCheckpointPoster>,
+}
+
+struct QqReplyCheckpointPoster {
+    checkpoints: mpsc::UnboundedSender<String>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct QqReplyCheckpoints {
+    text: String,
+    started_at: Option<Instant>,
+    last_checkpoint_at: Option<Instant>,
+    last_checkpoint_len: usize,
+}
+
+impl QqReplyCheckpoints {
+    fn push_chunk(&mut self, chunk: String) -> Option<String> {
+        let now = Instant::now();
+        self.started_at.get_or_insert(now);
+        self.text.push_str(&chunk);
+        if self.text.trim().is_empty() {
+            return None;
+        }
+        let growth = self.text.len().saturating_sub(self.last_checkpoint_len);
+        let should_send = if let Some(last) = self.last_checkpoint_at {
+            now.duration_since(last) >= QQ_REPLY_CHECKPOINT_MIN_INTERVAL && growth > 0
+        } else {
+            self.started_at.is_some_and(|started| {
+                now.duration_since(started) >= QQ_REPLY_CHECKPOINT_MIN_INTERVAL
+            }) || self.text.len() >= QQ_REPLY_CHECKPOINT_MIN_GROWTH
+        } || growth >= QQ_REPLY_CHECKPOINT_MIN_GROWTH;
+        if !should_send {
+            return None;
+        }
+        self.last_checkpoint_at = Some(now);
+        self.last_checkpoint_len = self.text.len();
+        Some(render_qq_reply_checkpoint(&self.text))
+    }
+}
+
+fn render_qq_reply_checkpoint(text: &str) -> String {
+    format!(
+        "Still generating reply:\n{}",
+        truncate_chars(text.trim(), QQ_REPLY_CHECKPOINT_PREVIEW_CHARS)
+    )
 }
 
 #[async_trait::async_trait]
@@ -657,7 +713,30 @@ impl RouterOutputSink for QqRouterOutputSink {
         }
     }
 
+    fn send_reply_chunk(&mut self, chunk: String) {
+        if self.channel_events == ChannelEventMode::Off {
+            return;
+        }
+        let Some(checkpoint) = self.reply_checkpoints.push_chunk(chunk) else {
+            return;
+        };
+        if self.checkpoint_poster.is_none() {
+            self.checkpoint_poster = Some(spawn_qq_reply_checkpoint_poster(
+                self.channel.clone(),
+                self.session_key.clone(),
+                self.target.clone(),
+                self.msg_id.clone(),
+            ));
+        }
+        if let Some(poster) = &self.checkpoint_poster
+            && poster.checkpoints.send(checkpoint).is_err()
+        {
+            tracing::warn!("QQ reply checkpoint poster stopped before receiving checkpoint");
+        }
+    }
+
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+        self.flush_reply_checkpoints().await;
         if let Some(summary) = render_compact_channel_events(&self.pending_events)
             && let Err(err) = self
                 .channel
@@ -669,6 +748,43 @@ impl RouterOutputSink for QqRouterOutputSink {
         self.channel
             .send_markdown_reply_message(&self.session_key, &self.target, &self.msg_id, &text)
             .await
+    }
+}
+
+impl QqRouterOutputSink {
+    async fn flush_reply_checkpoints(&mut self) {
+        if let Some(poster) = self.checkpoint_poster.take() {
+            drop(poster.checkpoints);
+            if let Err(err) = poster.handle.await {
+                tracing::warn!(error = %err, "QQ reply checkpoint worker failed");
+            }
+        }
+    }
+}
+
+fn spawn_qq_reply_checkpoint_poster(
+    channel: QqBotChannel,
+    session_key: String,
+    target: QqReplyTarget,
+    msg_id: String,
+) -> QqReplyCheckpointPoster {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let handle = tokio::spawn(async move {
+        while let Some(mut checkpoint) = rx.recv().await {
+            while let Ok(next) = rx.try_recv() {
+                checkpoint = next;
+            }
+            if let Err(err) = channel
+                .send_reply_message(&session_key, &target, &msg_id, &checkpoint)
+                .await
+            {
+                tracing::warn!(error = %err, "failed to post QQ reply checkpoint");
+            }
+        }
+    });
+    QqReplyCheckpointPoster {
+        checkpoints: tx,
+        handle,
     }
 }
 
@@ -915,6 +1031,24 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn qq_reply_checkpoint_suppresses_short_initial_chunks() {
+        let mut checkpoints = QqReplyCheckpoints::default();
+
+        assert_eq!(checkpoints.push_chunk("short reply".to_string()), None);
+    }
+
+    #[test]
+    fn qq_reply_checkpoint_renders_long_reply_preview() {
+        let mut checkpoints = QqReplyCheckpoints::default();
+        let checkpoint = checkpoints
+            .push_chunk("a".repeat(QQ_REPLY_CHECKPOINT_MIN_GROWTH))
+            .unwrap();
+
+        assert!(checkpoint.starts_with("Still generating reply:\n"));
+        assert!(checkpoint.ends_with("..."));
+    }
 
     #[derive(Debug, Default)]
     struct RecordingRouter {

@@ -105,6 +105,7 @@ fn render_unknown_router_slash_command(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterOutputEvent {
     Channel(RouterChannelEvent),
+    ReplyChunk(String),
     FinalReply(String),
 }
 
@@ -176,8 +177,7 @@ fn render_compact_channel_events_inner(
         }
     }
 
-    let has_activity_detail =
-        latest_reasoning.is_some() || tool_total > 0 || !attention.is_empty();
+    let has_activity_detail = latest_reasoning.is_some() || tool_total > 0 || !attention.is_empty();
     if !has_activity_detail {
         return None;
     }
@@ -366,6 +366,7 @@ pub enum RouterChannelEventKind {
 #[async_trait]
 pub trait RouterOutputSink: Send {
     fn send_channel_event(&mut self, event: RouterChannelEvent);
+    fn send_reply_chunk(&mut self, _chunk: String) {}
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()>;
 }
 
@@ -1672,14 +1673,27 @@ impl<'a> RouterExecutorEventSink<'a> {
 #[async_trait]
 impl ExecutorEventSink for RouterExecutorEventSink<'_> {
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
-        if let Some(event) = channel_event_from_executor_update(self.executor, &update)
-            && self.turn.is_output_allowed().await
-        {
-            self.output.send_channel_event(event);
+        if self.turn.is_output_allowed().await {
+            if let Some(chunk) = reply_chunk_from_executor_update(&update) {
+                self.output.send_reply_chunk(chunk);
+            }
+            if let Some(event) = channel_event_from_executor_update(self.executor, &update) {
+                self.output.send_channel_event(event);
+            }
         }
         self.updates.push(update);
         Ok(())
     }
+}
+
+fn reply_chunk_from_executor_update(update: &ExecutorUpdate) -> Option<String> {
+    if update.kind != "agent_message_chunk" {
+        return None;
+    }
+    if update.channel_event.is_some() {
+        return None;
+    }
+    (!update.text.is_empty()).then(|| update.text.clone())
 }
 
 fn channel_event_from_executor_update(
@@ -2051,6 +2065,10 @@ mod tests {
             self.events.push(RouterOutputEvent::Channel(event));
         }
 
+        fn send_reply_chunk(&mut self, chunk: String) {
+            self.events.push(RouterOutputEvent::ReplyChunk(chunk));
+        }
+
         async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
             self.events.push(RouterOutputEvent::FinalReply(text));
             Ok(())
@@ -2061,7 +2079,9 @@ mod tests {
         fn final_reply(&self) -> &str {
             match self.events.last().expect("router emitted no events") {
                 RouterOutputEvent::FinalReply(text) => text,
-                RouterOutputEvent::Channel(_) => panic!("last router event was not final reply"),
+                RouterOutputEvent::Channel(_) | RouterOutputEvent::ReplyChunk(_) => {
+                    panic!("last router event was not final reply")
+                }
             }
         }
     }
@@ -3862,6 +3882,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_chunks_project_to_reply_stream_only() {
+        let update = ExecutorUpdate::new("agent_message_chunk", "", "hello", "");
+
+        assert_eq!(
+            reply_chunk_from_executor_update(&update).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(channel_event_from_executor_update("codex", &update), None);
+    }
+
+    #[test]
+    fn commentary_agent_message_chunks_stay_channel_events_only() {
+        let update = ExecutorUpdate::new("agent_message_chunk", "", "status", "")
+            .with_channel_event(ExecutorChannelEvent::agent_progress("status"));
+
+        assert_eq!(reply_chunk_from_executor_update(&update), None);
+        assert!(channel_event_from_executor_update("codex", &update).is_some());
+    }
+
+    #[test]
     fn compact_channel_events_suppress_single_successful_tool() {
         let events = vec![RouterChannelEvent {
             kind: RouterChannelEventKind::ToolCall,
@@ -3905,10 +3945,7 @@ mod tests {
             },
         ];
 
-        assert_eq!(
-            render_compact_channel_events(&events).as_deref(),
-            None
-        );
+        assert_eq!(render_compact_channel_events(&events).as_deref(), None);
         assert_eq!(render_live_compact_channel_events(&events).as_deref(), None);
     }
 
