@@ -24,8 +24,8 @@ use crate::{
     },
     config::{ExecutorConfig, ExecutorProtocol},
     executor::{
-        ExecutorBackend, ExecutorChannelEvent, ExecutorDescriptor, ExecutorEventSink,
-        ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
+        ExecutorBackend, ExecutorChannelEvent, ExecutorChannelEventKind, ExecutorDescriptor,
+        ExecutorEventSink, ExecutorInterruptRequest, ExecutorPrepareRequest, ExecutorPromptOutcome,
         ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate, PreparedExecutor,
         TurnCancellation, summarize_json_rpc_error,
     },
@@ -697,6 +697,7 @@ impl AcpSession {
         tokio::pin!(response_fut);
 
         let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
         let result = loop {
             tokio::select! {
                 result = &mut response_fut => {
@@ -768,7 +769,12 @@ impl AcpSession {
                 received = updates_rx.recv() => {
                     match received {
                         Ok(update) => {
-                            if let Err(err) = collect_update(update, events, &mut text_parts).await {
+                            if let Err(err) = collect_update(
+                                update,
+                                events,
+                                &mut text_parts,
+                                &mut pending_message_chunks,
+                            ).await {
                                 let outcome = self
                                     .failed_prompt_or_cancelled(
                                         &cancel,
@@ -802,7 +808,9 @@ impl AcpSession {
             return ExecutorPromptOutcome::Cancelled;
         }
         while let Ok(update) = updates_rx.try_recv() {
-            if let Err(err) = collect_update(update, events, &mut text_parts).await {
+            if let Err(err) =
+                collect_update(update, events, &mut text_parts, &mut pending_message_chunks).await
+            {
                 let outcome = self
                     .failed_prompt_or_cancelled(&cancel, &session_id, request.id, err)
                     .await;
@@ -823,6 +831,21 @@ impl AcpSession {
             )
             .await;
             return ExecutorPromptOutcome::Cancelled;
+        }
+        if let Err(err) = pending_message_chunks
+            .flush_as_final(events, &mut text_parts)
+            .await
+        {
+            let outcome = self
+                .failed_prompt_or_cancelled(&cancel, &session_id, request.id, err)
+                .await;
+            clear_active_acp_prompt(
+                &active_prompt_turn.active_prompts,
+                &active_prompt_turn.key,
+                request.id,
+            )
+            .await;
+            return outcome;
         }
         let final_text = if text_parts.is_empty() {
             extract_text_result(&result)
@@ -884,11 +907,106 @@ async fn collect_update(
     update: ExecutorUpdate,
     events: &mut dyn ExecutorEventSink,
     text_parts: &mut ReplyTextParts,
+    pending_message_chunks: &mut PendingAcpMessageChunks,
+) -> anyhow::Result<()> {
+    if PendingAcpMessageChunks::should_buffer(&update) {
+        pending_message_chunks.push(update);
+        return Ok(());
+    }
+    if pending_message_chunks.should_flush_as_progress_before(&update) {
+        pending_message_chunks.flush_as_progress(events).await?;
+    } else if pending_message_chunks.should_flush_as_final_before(&update) {
+        pending_message_chunks
+            .flush_as_final(events, text_parts)
+            .await?;
+    }
+    collect_ready_update(update, events, text_parts).await
+}
+
+async fn collect_ready_update(
+    update: ExecutorUpdate,
+    events: &mut dyn ExecutorEventSink,
+    text_parts: &mut ReplyTextParts,
 ) -> anyhow::Result<()> {
     if update.kind == "agent_message_chunk" {
         text_parts.push_update(&update);
     }
     events.send(update).await
+}
+
+#[derive(Debug, Default)]
+struct PendingAcpMessageChunks {
+    updates: Vec<ExecutorUpdate>,
+}
+
+impl PendingAcpMessageChunks {
+    fn should_buffer(update: &ExecutorUpdate) -> bool {
+        update.kind == "agent_message_chunk"
+            && update.channel_event.is_none()
+            && update.reply_message_id.is_none()
+    }
+
+    fn push(&mut self, update: ExecutorUpdate) {
+        self.updates.push(update);
+    }
+
+    fn should_flush_as_progress_before(&self, update: &ExecutorUpdate) -> bool {
+        !self.updates.is_empty() && update_starts_activity(update)
+    }
+
+    fn should_flush_as_final_before(&self, update: &ExecutorUpdate) -> bool {
+        !self.updates.is_empty() && update.kind == "agent_message_chunk"
+    }
+
+    async fn flush_as_progress(
+        &mut self,
+        events: &mut dyn ExecutorEventSink,
+    ) -> anyhow::Result<()> {
+        let text = self.take_text();
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        events
+            .send(
+                ExecutorUpdate::new("agent_progress", "", text.clone(), "")
+                    .with_channel_event(ExecutorChannelEvent::agent_progress(text)),
+            )
+            .await
+    }
+
+    async fn flush_as_final(
+        &mut self,
+        events: &mut dyn ExecutorEventSink,
+        text_parts: &mut ReplyTextParts,
+    ) -> anyhow::Result<()> {
+        let updates = std::mem::take(&mut self.updates);
+        for update in updates {
+            collect_ready_update(update, events, text_parts).await?;
+        }
+        Ok(())
+    }
+
+    fn take_text(&mut self) -> String {
+        let updates = std::mem::take(&mut self.updates);
+        updates
+            .into_iter()
+            .map(|update| update.text)
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+fn update_starts_activity(update: &ExecutorUpdate) -> bool {
+    if matches!(
+        update.channel_event.as_ref().map(|event| event.kind),
+        Some(ExecutorChannelEventKind::AgentProgress | ExecutorChannelEventKind::ToolCall)
+    ) {
+        return true;
+    }
+    matches!(
+        update.kind.as_str(),
+        "agent_progress" | "plan" | "tool_call"
+    ) || update.kind.starts_with("tool_")
 }
 
 #[derive(Debug, Default)]
@@ -2661,6 +2779,7 @@ mod tests {
     async fn acp_commentary_agent_message_does_not_enter_final_text() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
         collect_update(
             project_acp_update(&json!({
                 "method": "session/update",
@@ -2675,6 +2794,7 @@ mod tests {
             .unwrap(),
             &mut events,
             &mut text_parts,
+            &mut pending_message_chunks,
         )
         .await
         .unwrap();
@@ -2692,9 +2812,14 @@ mod tests {
             .unwrap(),
             &mut events,
             &mut text_parts,
+            &mut pending_message_chunks,
         )
         .await
         .unwrap();
+        pending_message_chunks
+            .flush_as_final(&mut events, &mut text_parts)
+            .await
+            .unwrap();
 
         assert_eq!(text_parts.parts, ["done"]);
         assert_eq!(events.updates.len(), 2);
@@ -2702,9 +2827,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_unphased_chunks_remain_final_text_only() {
+    async fn acp_unphased_chunks_flush_to_final_text_at_turn_end() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
 
         for chunk in ["I", " am", " checking"] {
             collect_update(
@@ -2720,10 +2846,18 @@ mod tests {
                 .unwrap(),
                 &mut events,
                 &mut text_parts,
+                &mut pending_message_chunks,
             )
             .await
             .unwrap();
         }
+
+        assert!(text_parts.parts.is_empty());
+        assert!(events.updates.is_empty());
+        pending_message_chunks
+            .flush_as_final(&mut events, &mut text_parts)
+            .await
+            .unwrap();
 
         assert_eq!(text_parts.parts, ["I", " am", " checking"]);
         assert_eq!(events.updates.len(), 3);
@@ -2736,9 +2870,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_unphased_chunks_before_tool_flush_as_progress() {
+        let mut events = CollectingExecutorEventSink::default();
+        let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
+
+        for chunk in ["I will", " inspect", " the config."] {
+            collect_update(
+                project_acp_update(&json!({
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": chunk}
+                        }
+                    }
+                }))
+                .unwrap(),
+                &mut events,
+                &mut text_parts,
+                &mut pending_message_chunks,
+            )
+            .await
+            .unwrap();
+        }
+
+        collect_update(
+            project_acp_update(&json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-1",
+                        "title": "Bash",
+                        "rawInput": {"command": "cargo test"},
+                        "status": "pending"
+                    }
+                }
+            }))
+            .unwrap(),
+            &mut events,
+            &mut text_parts,
+            &mut pending_message_chunks,
+        )
+        .await
+        .unwrap();
+
+        assert!(text_parts.parts.is_empty());
+        assert_eq!(events.updates.len(), 2);
+        let progress = events.updates[0].channel_event.as_ref().unwrap();
+        assert_eq!(progress.kind, ExecutorChannelEventKind::AgentProgress);
+        assert_eq!(progress.text, "I will inspect the config.");
+        let tool = events.updates[1].channel_event.as_ref().unwrap();
+        assert_eq!(tool.kind, ExecutorChannelEventKind::ToolCall);
+    }
+
+    #[tokio::test]
     async fn acp_distinct_reply_message_ids_separate_final_text() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
 
         for (id, text) in [("msg-1", "first"), ("msg-2", "second")] {
             collect_update(
@@ -2755,6 +2946,7 @@ mod tests {
                 .unwrap(),
                 &mut events,
                 &mut text_parts,
+                &mut pending_message_chunks,
             )
             .await
             .unwrap();
@@ -2766,9 +2958,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_pending_unphased_chunks_flush_before_identified_final_chunk() {
+        let mut events = CollectingExecutorEventSink::default();
+        let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
+
+        collect_update(
+            project_acp_update(&json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "hello "}
+                    }
+                }
+            }))
+            .unwrap(),
+            &mut events,
+            &mut text_parts,
+            &mut pending_message_chunks,
+        )
+        .await
+        .unwrap();
+        collect_update(
+            project_acp_update(&json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "id": "msg-1",
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "world"}
+                    }
+                }
+            }))
+            .unwrap(),
+            &mut events,
+            &mut text_parts,
+            &mut pending_message_chunks,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(text_parts.join(), "hello world");
+        assert_eq!(events.updates.len(), 2);
+        assert_eq!(events.updates[0].reply_message_id, None);
+        assert_eq!(events.updates[1].reply_message_id.as_deref(), Some("msg-1"));
+    }
+
+    #[tokio::test]
     async fn acp_payload_message_id_beats_wrapper_event_id() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
 
         for (event_id, text) in [("event-1", "first"), ("event-2", " chunk")] {
             collect_update(
@@ -2790,6 +3031,7 @@ mod tests {
                 .unwrap(),
                 &mut events,
                 &mut text_parts,
+                &mut pending_message_chunks,
             )
             .await
             .unwrap();
@@ -2804,6 +3046,7 @@ mod tests {
     async fn acp_codex_event_commentary_does_not_enter_final_text() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
         collect_update(
             project_acp_update(&json!({
                 "method": "session/update",
@@ -2821,6 +3064,7 @@ mod tests {
             .unwrap(),
             &mut events,
             &mut text_parts,
+            &mut pending_message_chunks,
         )
         .await
         .unwrap();
@@ -2841,9 +3085,14 @@ mod tests {
             .unwrap(),
             &mut events,
             &mut text_parts,
+            &mut pending_message_chunks,
         )
         .await
         .unwrap();
+        pending_message_chunks
+            .flush_as_final(&mut events, &mut text_parts)
+            .await
+            .unwrap();
 
         assert_eq!(text_parts.parts, ["done"]);
         assert_eq!(events.updates.len(), 2);
