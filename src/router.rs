@@ -600,6 +600,12 @@ struct PendingOrchestratorDecision {
     generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionSourceMetadata {
+    source: &'static str,
+    source_kind: &'static str,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawRouteDecision {
     action: String,
@@ -1442,6 +1448,7 @@ where
         };
         let transcript =
             render_orchestrator_transcript(&state.transcript, orchestrator.max_transcript_messages);
+        let session_source = session_source_metadata(&input.session_key);
         format!(
             "You are the route decision executor for Agent Router.\n\
 You do not execute the user's task.\n\
@@ -1452,12 +1459,14 @@ Decision schema:\n\
 {{\"action\":\"handoff\",\"executor\":\"executor-name\",\"reason\":\"short reason\"}}\n\n\
 Configured task executors:\n{task_executors}\n\n\
 Current session:\n\
+- source: {}\n\
+- source_kind: {}\n\
 - default_executor: {}\n\
 - active_executor: none\n\n\
 Routing policy markdown:\n{policy}\n\n\
 Recent user-visible transcript:\n{transcript}\n\n\
 Current user message:\n{}",
-            state.default_executor, input.text
+            session_source.source, session_source.source_kind, state.default_executor, input.text
         )
     }
 
@@ -2104,6 +2113,41 @@ fn parse_route_decision(text: &str) -> anyhow::Result<RouteDecision> {
             })
         }
         other => anyhow::bail!("unsupported route decision action `{other}`"),
+    }
+}
+
+fn session_source_metadata(session_key: &str) -> SessionSourceMetadata {
+    let mut parts = session_key.split(':');
+    match parts.next() {
+        Some("slack") => {
+            let rest = parts.collect::<Vec<_>>();
+            let source_kind = match rest.as_slice() {
+                ["channel", ..] => "channel",
+                ["dm", ..] => "dm",
+                ["user-dm", ..] => "user-dm",
+                [_, "slash", ..] => "slash",
+                _ => "unknown",
+            };
+            SessionSourceMetadata {
+                source: "slack",
+                source_kind,
+            }
+        }
+        Some("qq") => {
+            let source_kind = match parts.next() {
+                Some("c2c") => "c2c",
+                Some("group") => "group",
+                _ => "unknown",
+            };
+            SessionSourceMetadata {
+                source: "qq",
+                source_kind,
+            }
+        }
+        _ => SessionSourceMetadata {
+            source: "unknown",
+            source_kind: "unknown",
+        },
     }
 }
 
@@ -3051,6 +3095,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_source_metadata_derives_low_sensitivity_channel_metadata() {
+        let cases = [
+            (
+                "slack:channel:C1:111.000",
+                SessionSourceMetadata {
+                    source: "slack",
+                    source_kind: "channel",
+                },
+            ),
+            (
+                "slack:dm:D1:111.000",
+                SessionSourceMetadata {
+                    source: "slack",
+                    source_kind: "dm",
+                },
+            ),
+            (
+                "slack:C1:slash:U1",
+                SessionSourceMetadata {
+                    source: "slack",
+                    source_kind: "slash",
+                },
+            ),
+            (
+                "qq:c2c:user-openid",
+                SessionSourceMetadata {
+                    source: "qq",
+                    source_kind: "c2c",
+                },
+            ),
+            (
+                "qq:group:group-openid",
+                SessionSourceMetadata {
+                    source: "qq",
+                    source_kind: "group",
+                },
+            ),
+            (
+                "local-session",
+                SessionSourceMetadata {
+                    source: "unknown",
+                    source_kind: "unknown",
+                },
+            ),
+        ];
+
+        for (session_key, expected) in cases {
+            assert_eq!(session_source_metadata(session_key), expected);
+        }
+    }
+
     fn slack_thread_and_extra_context_request(
         session_key: &str,
         content: &str,
@@ -3153,6 +3249,9 @@ mod tests {
                 .session_key
                 .contains("__agent_router_orchestrator__")
         );
+        assert!(prompts[0].prompt.contains("- source: slack"));
+        assert!(prompts[0].prompt.contains("- source_kind: dm"));
+        assert!(!prompts[0].prompt.contains("slack:dm:D1:111.000"));
         assert!(prompts[0].prompt.contains("Routing policy markdown:"));
         assert!(prompts[0].prompt.contains("please edit this repo"));
         assert_eq!(prompts[1].executor, "codex");

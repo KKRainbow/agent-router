@@ -154,7 +154,10 @@ Optional initial routing can be enabled with `router.orchestrator`. When enabled
 new sessions start as auto-pending; the configured routing executor returns a
 strict JSON decision, and Agent Router sets the real active executor before
 delivering the original user message. Use `/agent auto` to clear the current
-selection and rerun initial routing on the next normal message.
+selection and rerun initial routing on the next normal message. The routing
+prompt includes low-sensitivity session source metadata (`source` and
+`source_kind`), such as Slack DM or QQ group, without exposing the full channel
+session key.
 
 ## Non-Goals
 
