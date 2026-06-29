@@ -714,9 +714,6 @@ impl RouterOutputSink for QqRouterOutputSink {
     }
 
     fn send_reply_chunk(&mut self, chunk: String) {
-        if self.channel_events == ChannelEventMode::Off {
-            return;
-        }
         let Some(checkpoint) = self.reply_checkpoints.push_chunk(chunk) else {
             return;
         };
@@ -1076,6 +1073,40 @@ mod tests {
                 .push_chunk("b".repeat(QQ_REPLY_CHECKPOINT_MIN_GROWTH))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn qq_reply_chunks_are_independent_of_activity_mode() {
+        let channel = QqBotChannel::new(
+            QqConfig {
+                enabled: true,
+                app_id: String::new(),
+                client_secret: String::new(),
+                sandbox: false,
+                intents: 0,
+                channel_events: ChannelEventMode::Off,
+                allowed_users: BTreeSet::new(),
+                allowed_groups: BTreeSet::new(),
+            },
+            Arc::new(ApprovalBroker::default()),
+        );
+        let mut output = QqRouterOutputSink {
+            channel,
+            session_key: "qq:c2c:u1".to_string(),
+            target: QqReplyTarget::C2c {
+                openid: "u1".to_string(),
+            },
+            msg_id: "m1".to_string(),
+            channel_events: ChannelEventMode::Off,
+            pending_events: Vec::new(),
+            reply_checkpoints: QqReplyCheckpoints::default(),
+            checkpoint_poster: None,
+        };
+
+        output.send_reply_chunk("short reply".to_string());
+
+        assert_eq!(output.reply_checkpoints.text, "short reply");
+        assert!(output.checkpoint_poster.is_none());
     }
 
     #[derive(Debug, Default)]
