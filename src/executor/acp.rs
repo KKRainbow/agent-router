@@ -880,17 +880,12 @@ impl AcpSession {
 }
 
 async fn collect_update(
-    mut update: ExecutorUpdate,
+    update: ExecutorUpdate,
     events: &mut dyn ExecutorEventSink,
     text_parts: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     if update.kind == "agent_message_chunk" {
         text_parts.push(update.text.clone());
-        if let Some(event) = &mut update.channel_event
-            && event.kind == ExecutorChannelEventKind::AgentProgress
-        {
-            event.text = text_parts.join("");
-        }
     }
     events.send(update).await
 }
@@ -2687,7 +2682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_codex_unphased_chunks_emit_cumulative_progress() {
+    async fn acp_codex_unphased_chunks_emit_incremental_progress() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = Vec::new();
 
@@ -2715,11 +2710,11 @@ mod tests {
         assert_eq!(events.updates[0].channel_event.as_ref().unwrap().text, "I");
         assert_eq!(
             events.updates[1].channel_event.as_ref().unwrap().text,
-            "I am"
+            " am"
         );
         assert_eq!(
             events.updates[2].channel_event.as_ref().unwrap().text,
-            "I am checking"
+            " checking"
         );
     }
 
