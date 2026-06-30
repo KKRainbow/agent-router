@@ -947,7 +947,7 @@ impl SlackSocketModeChannel {
         let mut skipped_cached_files = 0usize;
         let mut failed_files = 0usize;
         let file_refs = if self.cfg.context_sync.files {
-            collect_context_file_refs(&event.files, &messages, &linked_threads)
+            collect_context_file_refs(event, &messages, &linked_threads)
         } else {
             Vec::new()
         };
@@ -2541,13 +2541,14 @@ fn slack_file_ref_needs_info(file: &SlackFileRef) -> bool {
 }
 
 fn collect_context_file_refs(
-    event_files: &[SlackFileRef],
+    event: &SlackMessageEvent,
     current_messages: &[SlackThreadMessage],
     linked_threads: &[LinkedSlackThread],
 ) -> Vec<SlackFileRef> {
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
-    for file in event_files
+    for file in event
+        .files
         .iter()
         .chain(
             current_messages
@@ -2563,6 +2564,21 @@ fn collect_context_file_refs(
     {
         if seen.insert(file.id.clone()) {
             files.push(file.clone());
+        }
+    }
+    for text in std::iter::once(event.text.as_str())
+        .chain(current_messages.iter().map(|message| message.text.as_str()))
+        .chain(
+            linked_threads
+                .iter()
+                .flat_map(|thread| thread.messages.iter())
+                .map(|message| message.text.as_str()),
+        )
+    {
+        for file in extract_slack_file_link_refs(text) {
+            if seen.insert(file.id.clone()) {
+                files.push(file);
+            }
         }
     }
     files
@@ -2719,6 +2735,41 @@ fn parse_slack_timestamp(raw: &str) -> Option<String> {
     }
     let (seconds, micros) = timestamp.split_at(timestamp.len() - 6);
     Some(format!("{seconds}.{micros}"))
+}
+
+fn extract_slack_file_link_refs(text: &str) -> Vec<SlackFileRef> {
+    text.split(|ch: char| ch.is_whitespace() || matches!(ch, '<' | '>' | '|'))
+        .filter(|part| part.contains("/files/"))
+        .map(|part| part.trim_matches(|ch| matches!(ch, ',' | ')' | ']' | '.')))
+        .filter(|part| part.starts_with("http://") || part.starts_with("https://"))
+        .filter_map(parse_slack_file_permalink)
+        .collect()
+}
+
+fn parse_slack_file_permalink(raw: &str) -> Option<SlackFileRef> {
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "https" || !is_allowed_slack_file_host(url.host_str()?) {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let file_index = segments.iter().position(|segment| *segment == "files")?;
+    let file_id = segments.get(file_index + 2)?.trim();
+    if file_id.is_empty() {
+        return None;
+    }
+    let name = segments
+        .get(file_index + 3)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&file_id)
+        .to_string();
+    Some(SlackFileRef {
+        id: file_id.to_string(),
+        name,
+        mimetype: None,
+        size_bytes: 0,
+        url_private: None,
+        url_private_download: None,
+    })
 }
 
 fn parse_slack_file_url(raw: &str) -> anyhow::Result<Url> {
@@ -3825,10 +3876,25 @@ mod tests {
         }))
         .unwrap();
 
-        let files = collect_context_file_refs(&[], &[first, second], &[]);
+        let event = thread_reply("");
+        let files = collect_context_file_refs(&event, &[first, second], &[]);
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, "F1");
+    }
+
+    #[test]
+    fn collect_context_file_refs_includes_slack_file_permalink_from_text() {
+        let event = thread_reply(
+            "<@BOT> try this API https://smartx1.slack.com/files/U03LA0JQ491/F0BDLKSPEF9/clio-api.md",
+        );
+
+        let files = collect_context_file_refs(&event, &[], &[]);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, "F0BDLKSPEF9");
+        assert_eq!(files[0].name, "clio-api.md");
+        assert!(slack_file_ref_needs_info(&files[0]));
     }
 
     #[test]
