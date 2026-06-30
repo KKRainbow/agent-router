@@ -15,6 +15,14 @@ routing, shared context projection, and reply delivery.
 An adapter that translates an external channel, such as Slack or QQ, into
 router inputs and delivers router outputs back to that channel.
 
+### Channel Context Resolver
+
+A channel-owned Module that reads native channel context, such as a Slack
+thread, linked channel thread, or channel file, and returns a generic
+`ContextSyncRequest` plus channel cache outcomes. Router-owned context
+materialization, artifact commits, and session state updates remain outside the
+resolver.
+
 ### Session
 
 A durable user-visible conversation identity. A session may map to a Slack
