@@ -3,6 +3,8 @@ use std::collections::{BTreeSet, VecDeque};
 pub mod qq;
 pub mod slack;
 
+pub(crate) mod output;
+
 #[derive(Debug)]
 pub(crate) struct EventDeduper {
     capacity: usize,

@@ -2,17 +2,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{
-    sync::{Mutex, mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SLACK_REPLY_DRAFT_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
@@ -24,18 +21,19 @@ const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 use crate::{
     approval::SharedApprovalBroker,
-    channel::EventDeduper,
+    channel::{
+        EventDeduper,
+        output::{ChannelOutputPolicy, ChannelOutputSink, ChannelReplyPort, PostedMessage},
+    },
     config::{ChannelEventMode, SlackConfig},
     router::{
-        ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
-        RouterChannelEvent, RouterOutputSink, RouterService, render_live_compact_channel_events,
+        ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome, RouterService,
     },
     session::context::{
         ContextArtifactInput, ContextArtifactRecord, ContextArtifactRemovalInput,
         ContextFileContent, ContextFileInput, ContextSyncIssueInput, ContextSyncRequest,
         sanitize_path_segment,
     },
-    text::append_reply_message_break,
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -317,8 +315,13 @@ impl SlackSocketModeChannel {
             .map(|context| context.failed_file_sync_keys.clone())
             .unwrap_or_default();
         let reply_target = event.reply_target();
-        let mut output =
-            SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
+        let mut output = ChannelOutputSink::new(
+            SlackReplyPort {
+                channel: self.clone(),
+            },
+            reply_target,
+            slack_output_policy(self.cfg.channel_events),
+        );
         router
             .finish_channel_input(ticket, context.map(|context| context.request), &mut output)
             .await?;
@@ -354,8 +357,13 @@ impl SlackSocketModeChannel {
             text_len = text.len(),
             "routing Slack slash command"
         );
-        let mut output =
-            SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
+        let mut output = ChannelOutputSink::new(
+            SlackReplyPort {
+                channel: self.clone(),
+            },
+            reply_target,
+            slack_output_policy(self.cfg.channel_events),
+        );
         let outcome = router
             .begin_channel_input(ChannelInput {
                 session_key,
@@ -440,16 +448,6 @@ impl SlackSocketModeChannel {
     ) -> anyhow::Result<Option<String>> {
         self.post_message_body_with_ts(target, slack_message_body(target, text))
             .await
-    }
-
-    async fn post_markdown_message(
-        &self,
-        target: &SlackReplyTarget,
-        text: &str,
-    ) -> anyhow::Result<()> {
-        self.post_markdown_message_with_ts(target, text)
-            .await
-            .map(|_| ())
     }
 
     async fn post_markdown_message_with_ts(
@@ -1511,282 +1509,64 @@ fn context_record_unresolved_file_ids(record: &ContextArtifactRecord) -> Vec<Str
         .collect()
 }
 
-struct SlackRouterOutputSink {
+#[derive(Clone)]
+struct SlackReplyPort {
     channel: SlackSocketModeChannel,
-    target: SlackReplyTarget,
-    channel_events: ChannelEventMode,
-    verbose_activity: SlackVerboseActivity,
-    compact_activity: SlackCompactActivity,
-    reply_draft: SlackReplyDraft,
 }
 
-impl SlackRouterOutputSink {
-    fn new(
-        channel: SlackSocketModeChannel,
-        target: SlackReplyTarget,
-        channel_events: ChannelEventMode,
-    ) -> Self {
-        Self {
-            channel,
-            target,
-            channel_events,
-            verbose_activity: SlackVerboseActivity::default(),
-            compact_activity: SlackCompactActivity::default(),
-            reply_draft: SlackReplyDraft::default(),
-        }
-    }
-
-    async fn flush_channel_events(&mut self) -> Option<String> {
-        match self.channel_events {
-            ChannelEventMode::Off => None,
-            ChannelEventMode::Compact => self.compact_activity.flush().await,
-            ChannelEventMode::Verbose => {
-                self.verbose_activity.flush().await;
-                None
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct SlackVerboseActivity {
-    poster: Option<SlackVerboseActivityPoster>,
-}
-
-struct SlackVerboseActivityPoster {
-    events: mpsc::UnboundedSender<RouterChannelEvent>,
-    handle: JoinHandle<()>,
-}
-
-#[derive(Default)]
-struct SlackCompactActivity {
-    events: Vec<RouterChannelEvent>,
-    updater: Option<SlackCompactActivityUpdater>,
-}
-
-struct SlackCompactActivityUpdater {
-    updates: mpsc::UnboundedSender<String>,
-    handle: JoinHandle<Option<String>>,
-}
-
-#[derive(Default)]
-struct SlackReplyDraft {
-    text: String,
-    updater: Option<SlackReplyDraftUpdater>,
-    last_update_at: Option<Instant>,
-    last_update_len: usize,
-}
-
-struct SlackReplyDraftUpdater {
-    updates: mpsc::UnboundedSender<SlackReplyDraftUpdate>,
-    handle: JoinHandle<()>,
-}
-
-enum SlackReplyDraftUpdate {
-    Preview(String),
-    Final {
-        text: String,
-        done: oneshot::Sender<anyhow::Result<()>>,
-    },
-    Discard {
-        done: oneshot::Sender<()>,
-    },
-}
-
-impl SlackVerboseActivity {
-    fn send(
-        &mut self,
-        channel: SlackSocketModeChannel,
-        target: SlackReplyTarget,
-        event: RouterChannelEvent,
-    ) {
-        if self.poster.is_none() {
-            self.poster = Some(spawn_slack_verbose_activity_poster(channel, target));
-        }
-        if let Some(poster) = &self.poster
-            && poster.events.send(event).is_err()
-        {
-            tracing::warn!("verbose Slack activity poster stopped before receiving event");
-        }
-    }
-
-    async fn flush(&mut self) {
-        if let Some(poster) = self.poster.take() {
-            drop(poster.events);
-            await_slack_activity_worker(poster.handle, "verbose").await;
-        }
-    }
-}
-
-impl SlackCompactActivity {
-    fn send(
-        &mut self,
-        channel: SlackSocketModeChannel,
-        target: SlackReplyTarget,
-        event: RouterChannelEvent,
-    ) {
-        self.events.push(event);
-        let Some(summary) = render_live_compact_channel_events(&self.events) else {
-            return;
-        };
-        if self.updater.is_none() {
-            self.updater = Some(spawn_slack_compact_activity_updater(channel, target));
-        }
-        if let Some(updater) = &self.updater
-            && updater.updates.send(summary).is_err()
-        {
-            tracing::warn!("compact Slack activity updater stopped before receiving update");
-        }
-    }
-
-    async fn flush(&mut self) -> Option<String> {
-        if let Some(updater) = self.updater.take() {
-            drop(updater.updates);
-            return await_slack_compact_activity_worker(updater.handle).await;
-        }
-        None
-    }
-}
-
-impl SlackReplyDraft {
-    fn break_message(&mut self) {
-        append_reply_message_break(&mut self.text);
-    }
-
-    fn send_chunk(
-        &mut self,
-        channel: SlackSocketModeChannel,
-        target: SlackReplyTarget,
-        chunk: String,
-    ) {
-        self.text.push_str(&chunk);
-        if self.text.trim().is_empty() {
-            return;
-        }
-        if self.updater.is_none() {
-            self.updater = Some(spawn_slack_reply_draft_updater(channel, target));
-        }
-        let now = Instant::now();
-        if !self.should_send_preview(now) {
-            return;
-        }
-        if let Some(updater) = &self.updater {
-            if updater
-                .updates
-                .send(SlackReplyDraftUpdate::Preview(self.text.clone()))
-                .is_ok()
-            {
-                self.last_update_at = Some(now);
-                self.last_update_len = self.text.len();
-            } else {
-                tracing::warn!("Slack reply draft updater stopped before receiving preview");
-            }
-        }
-    }
-
-    fn should_send_preview(&self, now: Instant) -> bool {
-        if let Some(last) = self.last_update_at {
-            return now.duration_since(last) >= SLACK_REPLY_DRAFT_UPDATE_INTERVAL
-                || self.text.len().saturating_sub(self.last_update_len)
-                    >= SLACK_REPLY_DRAFT_UPDATE_GROWTH;
-        }
-        self.text.len() >= SLACK_REPLY_DRAFT_INITIAL_MIN_LEN
-    }
-
-    async fn finalize(
-        &mut self,
-        channel: SlackSocketModeChannel,
-        target: SlackReplyTarget,
-        text: String,
-    ) -> anyhow::Result<()> {
-        self.text = text.clone();
-        let Some(updater) = self.updater.take() else {
-            return channel.post_markdown_message(&target, &text).await;
-        };
-        let (done_tx, done_rx) = oneshot::channel();
-        if updater
-            .updates
-            .send(SlackReplyDraftUpdate::Final {
-                text,
-                done: done_tx,
-            })
-            .is_err()
-        {
-            await_slack_activity_worker(updater.handle, "reply_draft").await;
-            anyhow::bail!("Slack reply draft updater stopped before final reply");
-        }
-        drop(updater.updates);
-        let result = done_rx.await.unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "Slack reply draft updater dropped final ack"
-            ))
-        });
-        await_slack_activity_worker(updater.handle, "reply_draft").await;
-        result
-    }
-
-    async fn discard(&mut self) {
-        self.text.clear();
-        let Some(updater) = self.updater.take() else {
-            return;
-        };
-        let (done_tx, done_rx) = oneshot::channel();
-        if updater
-            .updates
-            .send(SlackReplyDraftUpdate::Discard { done: done_tx })
-            .is_err()
-        {
-            await_slack_activity_worker(updater.handle, "reply_draft").await;
-            return;
-        }
-        drop(updater.updates);
-        let _ = done_rx.await;
-        await_slack_activity_worker(updater.handle, "reply_draft").await;
-    }
+fn slack_output_policy(activity_mode: ChannelEventMode) -> ChannelOutputPolicy {
+    let mut policy = ChannelOutputPolicy::streaming_draft(activity_mode);
+    policy.draft_update_interval = SLACK_REPLY_DRAFT_UPDATE_INTERVAL;
+    policy.draft_update_growth = SLACK_REPLY_DRAFT_UPDATE_GROWTH;
+    policy.draft_initial_min_len = SLACK_REPLY_DRAFT_INITIAL_MIN_LEN;
+    policy.draft_preview_max_bytes = SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES;
+    policy.draft_truncated_prefix = SLACK_REPLY_DRAFT_TRUNCATED_PREFIX;
+    policy.draft_marker = SLACK_REPLY_DRAFT_MARKER;
+    policy
 }
 
 #[async_trait::async_trait]
-impl RouterOutputSink for SlackRouterOutputSink {
-    fn send_channel_event(&mut self, event: RouterChannelEvent) {
-        match self.channel_events {
-            ChannelEventMode::Off => {}
-            ChannelEventMode::Compact => {
-                self.compact_activity
-                    .send(self.channel.clone(), self.target.clone(), event);
-            }
-            ChannelEventMode::Verbose => {
-                self.verbose_activity
-                    .send(self.channel.clone(), self.target.clone(), event);
-            }
-        }
+impl ChannelReplyPort for SlackReplyPort {
+    type Target = SlackReplyTarget;
+
+    async fn post_text(&self, target: &Self::Target, text: &str) -> anyhow::Result<PostedMessage> {
+        Ok(self
+            .channel
+            .post_message_with_ts(target, text)
+            .await?
+            .map_or_else(PostedMessage::without_id, PostedMessage::with_id))
     }
 
-    fn send_reply_chunk(&mut self, chunk: String) {
-        self.reply_draft
-            .send_chunk(self.channel.clone(), self.target.clone(), chunk);
+    async fn post_markdown(
+        &self,
+        target: &Self::Target,
+        text: &str,
+    ) -> anyhow::Result<PostedMessage> {
+        let Some(id) = self
+            .channel
+            .post_markdown_message_with_ts(target, text)
+            .await?
+        else {
+            anyhow::bail!("Slack final reply message response omitted ts");
+        };
+        Ok(PostedMessage::with_id(id))
     }
 
-    fn send_reply_break(&mut self) {
-        self.reply_draft.break_message();
+    async fn update_text(&self, target: &Self::Target, id: &str, text: &str) -> anyhow::Result<()> {
+        self.channel.update_message(target, id, text).await
     }
 
-    async fn discard_reply_stream(&mut self) {
-        self.reply_draft.discard().await;
+    async fn update_markdown(
+        &self,
+        target: &Self::Target,
+        id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.channel.update_markdown_message(target, id, text).await
     }
 
-    async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
-        let compact_activity_ts = self.flush_channel_events().await;
-        let result = self
-            .reply_draft
-            .finalize(self.channel.clone(), self.target.clone(), text)
-            .await;
-        if result.is_ok()
-            && let Some(ts) = compact_activity_ts
-            && let Err(err) = self.channel.delete_message(&self.target, &ts).await
-        {
-            tracing::warn!(error = %err, "failed to delete final Slack activity message");
-        }
-        result
+    async fn delete(&self, target: &Self::Target, id: &str) -> anyhow::Result<()> {
+        self.channel.delete_message(target, id).await
     }
 }
 
@@ -1834,11 +1614,13 @@ fn slack_markdown_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -
     }))
 }
 
+#[cfg(test)]
 fn slack_reply_draft_text(text: &str) -> String {
     let preview = slack_reply_draft_preview(text);
     format!("{preview}\n\n{SLACK_REPLY_DRAFT_MARKER}")
 }
 
+#[cfg(test)]
 fn slack_reply_draft_preview(text: &str) -> String {
     if text.len() <= SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES {
         return text.to_string();
@@ -1851,168 +1633,6 @@ fn slack_reply_draft_preview(text: &str) -> String {
         start += 1;
     }
     format!("{}{}", SLACK_REPLY_DRAFT_TRUNCATED_PREFIX, &text[start..])
-}
-
-fn spawn_slack_verbose_activity_poster(
-    channel: SlackSocketModeChannel,
-    target: SlackReplyTarget,
-) -> SlackVerboseActivityPoster {
-    let (tx, mut rx) = mpsc::unbounded_channel::<RouterChannelEvent>();
-    let handle = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if let Err(err) = channel.post_message(&target, &event.render_text()).await {
-                tracing::warn!(error = %err, "failed to post Slack channel event");
-            }
-        }
-    });
-    SlackVerboseActivityPoster { events: tx, handle }
-}
-
-fn spawn_slack_compact_activity_updater(
-    channel: SlackSocketModeChannel,
-    target: SlackReplyTarget,
-) -> SlackCompactActivityUpdater {
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let handle = tokio::spawn(async move {
-        let mut message_ts = None;
-        while let Some(mut summary) = rx.recv().await {
-            while let Ok(next) = rx.try_recv() {
-                summary = next;
-            }
-            if let Some(ts) = message_ts.as_deref() {
-                if let Err(err) = channel.update_message(&target, ts, &summary).await {
-                    tracing::warn!(error = %err, "failed to update compact Slack activity message");
-                }
-            } else {
-                match channel.post_message_with_ts(&target, &summary).await {
-                    Ok(Some(ts)) => message_ts = Some(ts),
-                    Ok(None) => {
-                        tracing::warn!("compact Slack activity message response omitted ts");
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to post compact Slack activity message");
-                    }
-                }
-            }
-        }
-        message_ts
-    });
-    SlackCompactActivityUpdater {
-        updates: tx,
-        handle,
-    }
-}
-
-fn spawn_slack_reply_draft_updater(
-    channel: SlackSocketModeChannel,
-    target: SlackReplyTarget,
-) -> SlackReplyDraftUpdater {
-    let (tx, mut rx) = mpsc::unbounded_channel::<SlackReplyDraftUpdate>();
-    let handle = tokio::spawn(async move {
-        let mut message_ts = None;
-        while let Some(mut update) = rx.recv().await {
-            while let Ok(next) = rx.try_recv() {
-                update = next;
-            }
-            match update {
-                SlackReplyDraftUpdate::Preview(text) => {
-                    let text = slack_reply_draft_text(&text);
-                    if let Err(err) =
-                        upsert_slack_reply_draft(&channel, &target, &mut message_ts, &text).await
-                    {
-                        tracing::warn!(error = %err, "failed to upsert Slack reply draft");
-                    }
-                }
-                SlackReplyDraftUpdate::Final { text, done } => {
-                    let result =
-                        finalize_slack_reply_draft(&channel, &target, &mut message_ts, &text)
-                            .await
-                            .map(|_| ());
-                    let _ = done.send(result);
-                    break;
-                }
-                SlackReplyDraftUpdate::Discard { done } => {
-                    if let Some(ts) = message_ts.as_deref()
-                        && let Err(err) = channel.delete_message(&target, ts).await
-                    {
-                        tracing::warn!(error = %err, "failed to delete Slack reply draft");
-                    }
-                    let _ = done.send(());
-                    break;
-                }
-            }
-        }
-    });
-    SlackReplyDraftUpdater {
-        updates: tx,
-        handle,
-    }
-}
-
-async fn upsert_slack_reply_draft(
-    channel: &SlackSocketModeChannel,
-    target: &SlackReplyTarget,
-    message_ts: &mut Option<String>,
-    text: &str,
-) -> anyhow::Result<()> {
-    if let Some(ts) = message_ts.as_deref() {
-        channel.update_message(target, ts, text).await?;
-        return Ok(());
-    }
-    match channel.post_message_with_ts(target, text).await? {
-        Some(ts) => {
-            *message_ts = Some(ts);
-            Ok(())
-        }
-        None => anyhow::bail!("Slack reply draft message response omitted ts"),
-    }
-}
-
-async fn finalize_slack_reply_draft(
-    channel: &SlackSocketModeChannel,
-    target: &SlackReplyTarget,
-    message_ts: &mut Option<String>,
-    text: &str,
-) -> anyhow::Result<()> {
-    if let Some(ts) = message_ts.as_deref() {
-        if let Err(err) = channel.update_markdown_message(target, ts, text).await {
-            tracing::warn!(
-                error = %err,
-                "failed to update Slack reply draft as final reply; posting final reply instead"
-            );
-            match channel.post_markdown_message_with_ts(target, text).await? {
-                Some(new_ts) => {
-                    *message_ts = Some(new_ts);
-                    return Ok(());
-                }
-                None => anyhow::bail!("Slack fallback final reply response omitted ts"),
-            }
-        }
-        return Ok(());
-    }
-    match channel.post_markdown_message_with_ts(target, text).await? {
-        Some(ts) => {
-            *message_ts = Some(ts);
-            Ok(())
-        }
-        None => anyhow::bail!("Slack final reply message response omitted ts"),
-    }
-}
-
-async fn await_slack_activity_worker(handle: JoinHandle<()>, mode: &'static str) {
-    if let Err(err) = handle.await {
-        tracing::warn!(error = %err, mode, "Slack activity worker failed");
-    }
-}
-
-async fn await_slack_compact_activity_worker(handle: JoinHandle<Option<String>>) -> Option<String> {
-    match handle.await {
-        Ok(message_ts) => message_ts,
-        Err(err) => {
-            tracing::warn!(error = %err, mode = "compact", "Slack activity worker failed");
-            None
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3195,7 +2815,9 @@ fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::approval::{ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection};
-    use crate::router::{ChannelRouteTicket, RouterInput, TurnBeginMode, TurnReservation};
+    use crate::router::{
+        ChannelRouteTicket, RouterInput, RouterOutputSink, TurnBeginMode, TurnReservation,
+    };
     use crate::session::ContextSyncRequest;
 
     use serde_json::json;
@@ -4706,34 +4328,6 @@ mod tests {
         assert!(preview.starts_with(SLACK_REPLY_DRAFT_TRUNCATED_PREFIX));
         assert!(preview.ends_with("tail"));
         assert!(preview.len() <= SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES);
-    }
-
-    #[test]
-    fn slack_reply_draft_delays_tiny_initial_preview() {
-        let now = Instant::now();
-        let mut draft = SlackReplyDraft {
-            text: "我".to_string(),
-            ..SlackReplyDraft::default()
-        };
-
-        assert!(!draft.should_send_preview(now));
-
-        draft.text = "a".repeat(SLACK_REPLY_DRAFT_INITIAL_MIN_LEN);
-
-        assert!(draft.should_send_preview(now));
-    }
-
-    #[test]
-    fn slack_reply_draft_breaks_between_messages() {
-        let mut draft = SlackReplyDraft {
-            text: "first".to_string(),
-            ..SlackReplyDraft::default()
-        };
-
-        draft.break_message();
-        draft.text.push_str("second");
-
-        assert_eq!(draft.text, "first\n\nsecond");
     }
 
     #[test]
