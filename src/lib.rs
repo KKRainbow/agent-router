@@ -11,7 +11,8 @@ pub mod session;
 mod text;
 
 pub use router::{
-    AgentRouter, RouterChannelEvent, RouterChannelEventKind, RouterInput, RouterOutputEvent,
+    AgentRouter, ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
+    ChannelRouteTicket, RouterChannelEvent, RouterChannelEventKind, RouterInput, RouterOutputEvent,
     RouterOutputSink, RouterService,
 };
 

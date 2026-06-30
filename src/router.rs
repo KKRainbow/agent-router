@@ -1,3 +1,4 @@
+mod intake;
 mod turns;
 
 use std::{
@@ -36,6 +37,10 @@ use crate::{
     text::truncate_chars,
 };
 
+pub use self::intake::{
+    ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
+    ChannelRouteTicket,
+};
 use self::turns::{InterruptedTurn, TurnGuard, TurnRegistry};
 pub use self::turns::{TurnBeginMode, TurnReservation};
 
@@ -410,6 +415,26 @@ pub trait RouterOutputSink: Send {
 
 #[async_trait]
 pub trait RouterService: Send + Sync + 'static {
+    async fn begin_channel_input(
+        &self,
+        input: ChannelInput,
+    ) -> anyhow::Result<ChannelIntakeOutcome> {
+        intake::begin_channel_input(self, input).await
+    }
+
+    async fn finish_channel_input(
+        &self,
+        ticket: ChannelRouteTicket,
+        context: Option<ContextSyncRequest>,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        intake::finish_channel_input(self, ticket, context, output).await
+    }
+
+    async fn has_pending_approval(&self, _session_key: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn reserve_turn(
         &self,
         _session_key: &str,
@@ -2480,6 +2505,10 @@ where
     S: SessionStore,
     E: ExecutorBackend,
 {
+    async fn has_pending_approval(&self, session_key: &str) -> anyhow::Result<bool> {
+        Ok(self.approvals.has_pending_for_session(session_key).await)
+    }
+
     async fn reserve_turn(
         &self,
         session_key: &str,

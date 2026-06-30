@@ -1,10 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -26,12 +23,12 @@ const SLACK_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
 const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 use crate::{
-    approval::{SharedApprovalBroker, is_approval_command},
+    approval::SharedApprovalBroker,
     channel::EventDeduper,
     config::{ChannelEventMode, SlackConfig},
     router::{
-        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
-        is_slash_command_input, render_live_compact_channel_events,
+        ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
+        RouterChannelEvent, RouterOutputSink, RouterService, render_live_compact_channel_events,
     },
     session::context::{
         ContextArtifactInput, ContextArtifactRecord, ContextArtifactRemovalInput,
@@ -51,7 +48,6 @@ pub struct SlackSocketModeChannel {
     http: Client,
     seen_events: Arc<Mutex<EventDeduper>>,
     context_cache: Arc<Mutex<SlackContextCache>>,
-    next_context_cache_sequence: Arc<AtomicU64>,
 }
 
 impl SlackSocketModeChannel {
@@ -62,7 +58,6 @@ impl SlackSocketModeChannel {
             http: Client::new(),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(512))),
             context_cache: Arc::new(Mutex::new(SlackContextCache::default())),
-            next_context_cache_sequence: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -225,97 +220,80 @@ impl SlackSocketModeChannel {
             return Ok(());
         }
         let session_key = event.session_key();
-        let approval_command = is_approval_command(&text);
-        let approval_trigger =
-            approval_command && self.approvals.has_pending_for_session(&session_key).await;
         let should_route = is_dm
             || !self.cfg.require_mention
             || mentioned
-            || approval_trigger
             || self.cfg.free_response_channels.contains(&event.channel);
-        if !should_route {
-            if event.is_thread_reply() {
-                if is_slash_command_input(&text) {
-                    tracing::info!(
-                        channel = %event.channel,
-                        user_id = %event.user,
-                        session_key = %session_key,
-                        text_len = text.len(),
-                        "ignored unmentioned Slack thread slash command"
-                    );
-                    return Ok(());
-                }
-                tracing::info!(
-                    channel = %event.channel,
-                    user_id = %event.user,
-                    session_key = %session_key,
-                    text_len = text.len(),
-                    "observing Slack thread message"
-                );
-                router
-                    .observe(RouterInput {
-                        session_key,
-                        text,
-                        user_id: Some(event.user),
-                    })
-                    .await?;
-            }
-            return Ok(());
-        }
-        if approval_trigger {
+        let intent = if should_route {
+            ChannelInputIntent::Route
+        } else if event.is_thread_reply() {
             tracing::info!(
                 channel = %event.channel,
                 user_id = %event.user,
                 session_key = %session_key,
-                "routing Slack approval command"
+                text_len = text.len(),
+                "passing unmentioned Slack thread message to router intake"
             );
-            let reply_target = event.reply_target();
-            let mut output =
-                SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
-            router
-                .handle_with_context(
-                    RouterInput {
-                        session_key,
-                        text,
-                        user_id: Some(event.user),
-                    },
-                    None,
-                    &mut output,
-                )
-                .await?;
-            return Ok(());
-        }
-        let command = text.split_whitespace().next().unwrap_or("");
-        let mut context_cache_sequence = None;
-        let turn_reservation = if approval_command
-            || matches!(command, "/stop" | "/agent" | "/yolo")
-            || is_slash_command_input(&text)
-        {
-            None
+            ChannelInputIntent::RouteIfPendingApprovalElseObserve
         } else {
-            let cache_sequence = self
-                .next_context_cache_sequence
-                .fetch_add(1, Ordering::Relaxed);
-            self.remember_context_cache_sequence(&session_key, cache_sequence)
-                .await;
-            context_cache_sequence = Some(cache_sequence);
-            router
-                .reserve_turn(&session_key, TurnBeginMode::ReplaceActive)
-                .await?
+            ChannelInputIntent::Ignore
         };
-        let context_cache_token =
-            context_cache_sequence.map(|cache_sequence| SlackContextCacheToken {
+        let outcome = router
+            .begin_channel_input(ChannelInput {
                 session_key: session_key.clone(),
-                cache_sequence,
-            });
-        tracing::info!(
-            channel = %event.channel,
-            user_id = %event.user,
-            session_key = %session_key,
-            text_len = text.len(),
-            "routing Slack message"
-        );
-        let context = if self.should_sync_context(&text) {
+                text: text.clone(),
+                user_id: Some(event.user.clone()),
+                source: "slack".to_string(),
+                intent,
+                context_policy: ChannelContextPolicy {
+                    source: "slack".to_string(),
+                    enabled: self.should_sync_context(),
+                },
+            })
+            .await?;
+        let ChannelIntakeOutcome::Route {
+            ticket,
+            context_allowed,
+        } = outcome
+        else {
+            return Ok(());
+        };
+        if should_route {
+            tracing::info!(
+                channel = %event.channel,
+                user_id = %event.user,
+                session_key = %session_key,
+                text_len = text.len(),
+                "routing Slack message"
+            );
+        } else if event.is_thread_reply() {
+            tracing::info!(
+                channel = %event.channel,
+                user_id = %event.user,
+                session_key = %session_key,
+                text_len = text.len(),
+                "routing Slack approval command from unmentioned thread"
+            );
+        }
+        let context_cache_token = if context_allowed {
+            if let Some(cache_sequence) = ticket.context_sequence() {
+                self.remember_context_cache_sequence(&session_key, cache_sequence)
+                    .await;
+                Some(SlackContextCacheToken {
+                    session_key: session_key.clone(),
+                    cache_sequence,
+                })
+            } else {
+                tracing::warn!(
+                    session_key = %session_key,
+                    "skipping Slack context sync because router did not provide a route sequence"
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let context = if context_cache_token.is_some() {
             let existing_context = router.context_artifacts(&session_key, "slack").await?;
             Some(
                 self.current_thread_context_request(
@@ -341,32 +319,9 @@ impl SlackSocketModeChannel {
         let reply_target = event.reply_target();
         let mut output =
             SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
-        if let Some(reservation) = turn_reservation {
-            router
-                .handle_reserved(
-                    RouterInput {
-                        session_key,
-                        text,
-                        user_id: Some(event.user),
-                    },
-                    reservation,
-                    context.map(|context| context.request),
-                    &mut output,
-                )
-                .await?;
-        } else {
-            router
-                .handle_with_context(
-                    RouterInput {
-                        session_key,
-                        text,
-                        user_id: Some(event.user),
-                    },
-                    context.map(|context| context.request),
-                    &mut output,
-                )
-                .await?;
-        }
+        router
+            .finish_channel_input(ticket, context.map(|context| context.request), &mut output)
+            .await?;
         for cache_key in succeeded_file_sync_keys {
             self.mark_file_sync_succeeded(cache_key, context_cache_token.as_ref())
                 .await;
@@ -401,15 +356,21 @@ impl SlackSocketModeChannel {
         );
         let mut output =
             SlackRouterOutputSink::new(self.clone(), reply_target, self.cfg.channel_events);
+        let outcome = router
+            .begin_channel_input(ChannelInput {
+                session_key,
+                text,
+                user_id: Some(command.user_id),
+                source: "slack".to_string(),
+                intent: ChannelInputIntent::Route,
+                context_policy: ChannelContextPolicy::disabled("slack"),
+            })
+            .await?;
+        let ChannelIntakeOutcome::Route { ticket, .. } = outcome else {
+            return Ok(());
+        };
         router
-            .handle(
-                RouterInput {
-                    session_key,
-                    text,
-                    user_id: Some(command.user_id),
-                },
-                &mut output,
-            )
+            .finish_channel_input(ticket, None, &mut output)
             .await?;
         Ok(())
     }
@@ -736,16 +697,12 @@ impl SlackSocketModeChannel {
                 && self.cfg.allowed_channels.contains(linked_channel))
     }
 
-    fn should_sync_context(&self, text: &str) -> bool {
-        let command = text.split_whitespace().next().unwrap_or("");
+    fn should_sync_context(&self) -> bool {
         self.cfg.context_sync.enabled
             && !self.cfg.bot_token.is_empty()
             && (self.cfg.context_sync.current_thread
                 || self.cfg.context_sync.linked_threads
                 || self.cfg.context_sync.files)
-            && !is_approval_command(text)
-            && !matches!(command, "/stop" | "/agent" | "/yolo")
-            && !is_slash_command_input(text)
     }
 
     async fn current_thread_context_request(
@@ -3238,7 +3195,8 @@ fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::approval::{ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalSelection};
-    use crate::router::TurnReservation;
+    use crate::router::{ChannelRouteTicket, RouterInput, TurnBeginMode, TurnReservation};
+    use crate::session::ContextSyncRequest;
 
     use serde_json::json;
 
@@ -3246,6 +3204,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingRouter {
+        pending_approval: bool,
         handled: Mutex<Vec<RouterInput>>,
         observed: Mutex<Vec<RouterInput>>,
         reserved: Mutex<Vec<String>>,
@@ -3253,6 +3212,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RouterService for RecordingRouter {
+        async fn has_pending_approval(&self, _session_key: &str) -> anyhow::Result<bool> {
+            Ok(self.pending_approval)
+        }
+
         async fn reserve_turn(
             &self,
             session_key: &str,
@@ -3274,6 +3237,56 @@ mod tests {
         async fn observe(&self, input: RouterInput) -> anyhow::Result<()> {
             self.observed.lock().await.push(input);
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct IntakeOnlyRouter {
+        began: Mutex<Vec<ChannelInput>>,
+        finished: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouterService for IntakeOnlyRouter {
+        async fn begin_channel_input(
+            &self,
+            input: ChannelInput,
+        ) -> anyhow::Result<ChannelIntakeOutcome> {
+            self.began.lock().await.push(input.clone());
+            Ok(ChannelIntakeOutcome::Route {
+                ticket: ChannelRouteTicket::for_test(input),
+                context_allowed: false,
+            })
+        }
+
+        async fn finish_channel_input(
+            &self,
+            _ticket: ChannelRouteTicket,
+            _context: Option<ContextSyncRequest>,
+            _output: &mut dyn RouterOutputSink,
+        ) -> anyhow::Result<()> {
+            *self.finished.lock().await += 1;
+            Ok(())
+        }
+
+        async fn reserve_turn(
+            &self,
+            _session_key: &str,
+            _mode: TurnBeginMode,
+        ) -> anyhow::Result<Option<TurnReservation>> {
+            panic!("Slack adapter should not reserve turns directly")
+        }
+
+        async fn handle(
+            &self,
+            _input: RouterInput,
+            _output: &mut dyn RouterOutputSink,
+        ) -> anyhow::Result<()> {
+            panic!("Slack adapter should not handle routed input directly")
+        }
+
+        async fn observe(&self, _input: RouterInput) -> anyhow::Result<()> {
+            panic!("Slack adapter should not observe input directly")
         }
     }
 
@@ -5067,6 +5080,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_adapter_uses_channel_intake_interface_for_routed_messages() {
+        let channel = SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+        let event = SlackMessageEvent {
+            event_key: "Ev1".to_string(),
+            channel: "D1".to_string(),
+            user: "U1".to_string(),
+            text: "hello".to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+            files: Vec::new(),
+        };
+
+        channel
+            .handle_message_event(event, router_service, "BOT")
+            .await
+            .unwrap();
+
+        let began = router.began.lock().await;
+        assert_eq!(began.len(), 1);
+        assert_eq!(began[0].intent, ChannelInputIntent::Route);
+        drop(began);
+        assert_eq!(*router.finished.lock().await, 1);
+    }
+
+    #[tokio::test]
     async fn slack_app_entry_slash_command_routes_payload_text() {
         let channel = SlackSocketModeChannel::new(
             test_slack_config(true),
@@ -5135,7 +5178,10 @@ mod tests {
         });
         let prompt = prompts.recv().await.unwrap();
         let channel = SlackSocketModeChannel::new(test_slack_config(true), approvals.clone());
-        let router = Arc::new(RecordingRouter::default());
+        let router = Arc::new(RecordingRouter {
+            pending_approval: true,
+            ..Default::default()
+        });
         let router_service: Arc<dyn RouterService> = router.clone();
 
         channel

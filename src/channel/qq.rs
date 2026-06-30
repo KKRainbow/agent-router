@@ -17,12 +17,13 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    approval::{SharedApprovalBroker, is_approval_command},
+    approval::SharedApprovalBroker,
     channel::EventDeduper,
     config::{ChannelEventMode, QqConfig},
     router::{
-        RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, TurnBeginMode,
-        TurnReservation, is_slash_command_input, render_compact_channel_events,
+        ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
+        ChannelRouteTicket, RouterChannelEvent, RouterOutputSink, RouterService,
+        render_compact_channel_events,
     },
     text::{append_reply_message_break, truncate_chars},
 };
@@ -236,40 +237,27 @@ impl QqBotChannel {
             return Ok(());
         }
 
-        if is_approval_command(&message.text) {
-            let reply_context_sequence = self
-                .next_reply_context_sequence
-                .fetch_add(1, Ordering::Relaxed);
-            let channel = self.clone();
-            tokio::spawn(async move {
-                if let Err(err) = channel
-                    .route_message(message, None, reply_context_sequence, router)
-                    .await
-                {
-                    tracing::warn!(error = %err, "failed to handle QQ approval command");
-                }
-            });
+        let outcome = router
+            .begin_channel_input(ChannelInput {
+                session_key: message.session_key.clone(),
+                text: message.text.clone(),
+                user_id: Some(message.user_id.clone()),
+                source: "qq".to_string(),
+                intent: ChannelInputIntent::Route,
+                context_policy: ChannelContextPolicy::disabled("qq"),
+            })
+            .await?;
+        let ChannelIntakeOutcome::Route { ticket, .. } = outcome else {
             return Ok(());
-        }
-
-        let command = message.text.split_whitespace().next().unwrap_or("");
+        };
         let reply_context_sequence = self
             .next_reply_context_sequence
             .fetch_add(1, Ordering::Relaxed);
-        let turn_reservation = if matches!(command, "/stop" | "/agent" | "/yolo")
-            || is_slash_command_input(&message.text)
-        {
-            None
-        } else {
-            router
-                .reserve_turn(&message.session_key, TurnBeginMode::ReplaceActive)
-                .await?
-        };
         let channel = self.clone();
         tokio::spawn(async move {
             let session_key = message.session_key.clone();
             if let Err(err) = channel
-                .route_message(message, turn_reservation, reply_context_sequence, router)
+                .route_message(message, ticket, reply_context_sequence, router)
                 .await
             {
                 tracing::warn!(
@@ -285,7 +273,7 @@ impl QqBotChannel {
     async fn route_message(
         &self,
         message: QqInboundMessage,
-        turn_reservation: Option<TurnReservation>,
+        ticket: ChannelRouteTicket,
         reply_context_sequence: u64,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
@@ -308,18 +296,7 @@ impl QqBotChannel {
             reply_checkpoints: QqReplyCheckpoints::default(),
             checkpoint_poster: None,
         };
-        let input = RouterInput {
-            session_key: message.session_key,
-            text: message.text,
-            user_id: Some(message.user_id),
-        };
-        if let Some(reservation) = turn_reservation {
-            router
-                .handle_reserved(input, reservation, None, &mut output)
-                .await
-        } else {
-            router.handle(input, &mut output).await
-        }
+        router.finish_channel_input(ticket, None, &mut output).await
     }
 
     fn spawn_approval_notifier(self: Arc<Self>) {
@@ -1044,6 +1021,8 @@ mod tests {
     use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
     use crate::approval::ApprovalBroker;
+    use crate::router::{ChannelRouteTicket, RouterInput, TurnBeginMode, TurnReservation};
+    use crate::session::ContextSyncRequest;
     use serde_json::json;
     use tokio::sync::Mutex;
 
@@ -1159,6 +1138,56 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct IntakeOnlyRouter {
+        began: Mutex<Vec<ChannelInput>>,
+        finished: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouterService for IntakeOnlyRouter {
+        async fn begin_channel_input(
+            &self,
+            input: ChannelInput,
+        ) -> anyhow::Result<ChannelIntakeOutcome> {
+            self.began.lock().await.push(input.clone());
+            Ok(ChannelIntakeOutcome::Route {
+                ticket: ChannelRouteTicket::for_test(input),
+                context_allowed: false,
+            })
+        }
+
+        async fn finish_channel_input(
+            &self,
+            _ticket: ChannelRouteTicket,
+            _context: Option<ContextSyncRequest>,
+            _output: &mut dyn RouterOutputSink,
+        ) -> anyhow::Result<()> {
+            *self.finished.lock().await += 1;
+            Ok(())
+        }
+
+        async fn reserve_turn(
+            &self,
+            _session_key: &str,
+            _mode: TurnBeginMode,
+        ) -> anyhow::Result<Option<TurnReservation>> {
+            panic!("QQ adapter should not reserve turns directly")
+        }
+
+        async fn handle(
+            &self,
+            _input: RouterInput,
+            _output: &mut dyn RouterOutputSink,
+        ) -> anyhow::Result<()> {
+            panic!("QQ adapter should not handle routed input directly")
+        }
+
+        async fn observe(&self, _input: RouterInput) -> anyhow::Result<()> {
+            panic!("QQ adapter should not observe input directly")
+        }
+    }
+
     #[test]
     fn parses_c2c_message() {
         let data = json!({
@@ -1268,6 +1297,51 @@ mod tests {
         .expect("QQ slash command was not routed");
         let handled = router.handled.lock().await;
         assert_eq!(handled[0].text, "/status");
+    }
+
+    #[tokio::test]
+    async fn qq_adapter_uses_channel_intake_interface_for_routed_messages() {
+        let channel = QqBotChannel::new(
+            QqConfig {
+                enabled: true,
+                app_id: String::new(),
+                client_secret: String::new(),
+                sandbox: false,
+                intents: 0,
+                channel_events: ChannelEventMode::Off,
+                allowed_users: BTreeSet::new(),
+                allowed_groups: BTreeSet::new(),
+            },
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let data = json!({
+            "id": "m1",
+            "content": "hello",
+            "author": {
+                "id": "legacy",
+                "user_openid": "u_open"
+            }
+        });
+
+        channel
+            .handle_dispatch("C2C_MESSAGE_CREATE", &data, router.clone())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if *router.finished.lock().await > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("QQ routed message did not finish through intake");
+        let began = router.began.lock().await;
+        assert_eq!(began.len(), 1);
+        assert_eq!(began[0].intent, ChannelInputIntent::Route);
     }
 
     #[test]
