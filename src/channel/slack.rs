@@ -1579,11 +1579,14 @@ impl SlackRouterOutputSink {
         }
     }
 
-    async fn flush_channel_events(&mut self) {
+    async fn flush_channel_events(&mut self) -> Option<String> {
         match self.channel_events {
-            ChannelEventMode::Off => {}
+            ChannelEventMode::Off => None,
             ChannelEventMode::Compact => self.compact_activity.flush().await,
-            ChannelEventMode::Verbose => self.verbose_activity.flush().await,
+            ChannelEventMode::Verbose => {
+                self.verbose_activity.flush().await;
+                None
+            }
         }
     }
 }
@@ -1606,7 +1609,7 @@ struct SlackCompactActivity {
 
 struct SlackCompactActivityUpdater {
     updates: mpsc::UnboundedSender<String>,
-    handle: JoinHandle<()>,
+    handle: JoinHandle<Option<String>>,
 }
 
 #[derive(Default)]
@@ -1679,11 +1682,12 @@ impl SlackCompactActivity {
         }
     }
 
-    async fn flush(&mut self) {
+    async fn flush(&mut self) -> Option<String> {
         if let Some(updater) = self.updater.take() {
             drop(updater.updates);
-            await_slack_activity_worker(updater.handle, "compact").await;
+            return await_slack_compact_activity_worker(updater.handle).await;
         }
+        None
     }
 }
 
@@ -1814,10 +1818,18 @@ impl RouterOutputSink for SlackRouterOutputSink {
     }
 
     async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
-        self.flush_channel_events().await;
-        self.reply_draft
+        let compact_activity_ts = self.flush_channel_events().await;
+        let result = self
+            .reply_draft
             .finalize(self.channel.clone(), self.target.clone(), text)
-            .await
+            .await;
+        if result.is_ok()
+            && let Some(ts) = compact_activity_ts
+            && let Err(err) = self.channel.delete_message(&self.target, &ts).await
+        {
+            tracing::warn!(error = %err, "failed to delete final Slack activity message");
+        }
+        result
     }
 }
 
@@ -1926,6 +1938,7 @@ fn spawn_slack_compact_activity_updater(
                 }
             }
         }
+        message_ts
     });
     SlackCompactActivityUpdater {
         updates: tx,
@@ -2032,6 +2045,16 @@ async fn finalize_slack_reply_draft(
 async fn await_slack_activity_worker(handle: JoinHandle<()>, mode: &'static str) {
     if let Err(err) = handle.await {
         tracing::warn!(error = %err, mode, "Slack activity worker failed");
+    }
+}
+
+async fn await_slack_compact_activity_worker(handle: JoinHandle<Option<String>>) -> Option<String> {
+    match handle.await {
+        Ok(message_ts) => message_ts,
+        Err(err) => {
+            tracing::warn!(error = %err, mode = "compact", "Slack activity worker failed");
+            None
+        }
     }
 }
 
