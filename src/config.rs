@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -16,6 +17,7 @@ pub struct AppConfig {
     pub workspace: WorkspaceConfig,
     pub slack: SlackConfig,
     pub qq: QqConfig,
+    pub web: WebConfig,
     pub machines: BTreeMap<String, MachineConfig>,
     pub executors: BTreeMap<String, ExecutorConfig>,
 }
@@ -84,6 +86,15 @@ pub struct QqConfig {
     pub allowed_groups: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WebConfig {
+    pub enabled: bool,
+    pub bind: SocketAddr,
+    pub static_dir: PathBuf,
+    pub channel_events: ChannelEventMode,
+    pub auth_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelEventMode {
     Off,
@@ -118,6 +129,7 @@ struct FileConfig {
     machines: Option<BTreeMap<String, FileMachineConfig>>,
     slack: Option<FileSlackConfig>,
     qq: Option<FileQqConfig>,
+    web: Option<FileWebConfig>,
     executors: Option<BTreeMap<String, FileExecutorConfig>>,
 }
 
@@ -193,6 +205,15 @@ struct FileQqConfig {
     channel_events: Option<String>,
     allowed_users: Option<StringList>,
     allowed_groups: Option<StringList>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileWebConfig {
+    enabled: Option<bool>,
+    bind: Option<String>,
+    static_dir: Option<PathBuf>,
+    channel_events: Option<String>,
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,6 +375,39 @@ impl AppConfig {
                 .unwrap_or_default(),
         };
 
+        let web_file = file_cfg.web.unwrap_or_default();
+        let web_bind = env_cfg
+            .web_bind
+            .or(web_file.bind)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1:8787".to_string());
+        let web_auth_token = env_cfg
+            .web_auth_token
+            .or(web_file.auth_token)
+            .filter(|value| !value.trim().is_empty());
+        let web = WebConfig {
+            enabled: env_cfg.web_enabled.or(web_file.enabled).unwrap_or(false),
+            bind: parse_socket_addr("web.bind", &web_bind)?,
+            static_dir: env_cfg
+                .web_static_dir
+                .or(web_file.static_dir)
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| PathBuf::from("web/dist")),
+            channel_events: env_cfg
+                .web_channel_events
+                .or(web_file.channel_events)
+                .map(|value| parse_channel_event_mode("web.channel_events", &value))
+                .transpose()?
+                .unwrap_or(ChannelEventMode::Compact),
+            auth_token: web_auth_token,
+        };
+        if web.enabled && !web.bind.ip().is_loopback() {
+            anyhow::ensure!(
+                web.auth_token.is_some(),
+                "web.auth_token or WEB_AUTH_TOKEN is required when web.bind is non-loopback"
+            );
+        }
+
         let mut executors = BTreeMap::new();
         if let Some(raw_executors) = file_cfg.executors {
             for (name, raw) in raw_executors {
@@ -411,6 +465,7 @@ impl AppConfig {
             workspace,
             slack,
             qq,
+            web,
             machines,
             executors,
         })
@@ -438,6 +493,11 @@ struct EnvConfig {
     qq_channel_events: Option<String>,
     qq_allowed_users: Option<BTreeSet<String>>,
     qq_allowed_groups: Option<BTreeSet<String>>,
+    web_enabled: Option<bool>,
+    web_bind: Option<String>,
+    web_static_dir: Option<PathBuf>,
+    web_channel_events: Option<String>,
+    web_auth_token: Option<String>,
 }
 
 impl EnvConfig {
@@ -467,6 +527,11 @@ impl EnvConfig {
                 .or_else(|| env_set("QQBOT_ALLOWED_USERS")),
             qq_allowed_groups: env_set("QQ_ALLOWED_GROUPS")
                 .or_else(|| env_set("QQBOT_ALLOWED_GROUPS")),
+            web_enabled: env_bool("WEB_ENABLED"),
+            web_bind: nonempty_env("WEB_BIND"),
+            web_static_dir: nonempty_env("WEB_STATIC_DIR").map(PathBuf::from),
+            web_channel_events: nonempty_env("WEB_CHANNEL_EVENTS"),
+            web_auth_token: nonempty_env("WEB_AUTH_TOKEN"),
         }
     }
 }
@@ -677,6 +742,13 @@ fn parse_channel_event_mode(field: &str, value: &str) -> anyhow::Result<ChannelE
     }
 }
 
+fn parse_socket_addr(field: &str, value: &str) -> anyhow::Result<SocketAddr> {
+    value
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|err| anyhow::anyhow!("{field} `{}` is not a valid socket address: {err}", value))
+}
+
 fn nonempty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
@@ -743,6 +815,11 @@ mod tests {
         assert_eq!(cfg.slack.context_sync.max_files_per_turn, 20);
         assert_eq!(cfg.slack.context_sync.max_linked_threads_per_turn, 10);
         assert_eq!(cfg.qq.channel_events, ChannelEventMode::Compact);
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1:8787".parse().unwrap());
+        assert_eq!(cfg.web.static_dir, PathBuf::from("web/dist"));
+        assert_eq!(cfg.web.channel_events, ChannelEventMode::Compact);
+        assert_eq!(cfg.web.auth_token, None);
     }
 
     #[test]
@@ -979,6 +1056,87 @@ qq:
             cfg.qq.allowed_groups,
             ["g1", "g2", "g3"].into_iter().map(str::to_string).collect()
         );
+    }
+
+    #[test]
+    fn parses_web_config() {
+        let raw = r#"
+web:
+  enabled: true
+  bind: 127.0.0.1:9000
+  static_dir: /tmp/agent-router-web
+  channel_events: verbose
+  auth_token: local-token
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(cfg.web.static_dir, PathBuf::from("/tmp/agent-router-web"));
+        assert_eq!(cfg.web.channel_events, ChannelEventMode::Verbose);
+        assert_eq!(cfg.web.auth_token.as_deref(), Some("local-token"));
+    }
+
+    #[test]
+    fn env_web_config_overrides_file_config() {
+        let raw = r#"
+web:
+  enabled: false
+  bind: 127.0.0.1:9000
+  static_dir: web/dist
+  channel_events: off
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(
+            file_cfg,
+            EnvConfig {
+                web_enabled: Some(true),
+                web_bind: Some("127.0.0.1:9100".to_string()),
+                web_static_dir: Some(PathBuf::from("/tmp/web-dist")),
+                web_channel_events: Some("verbose".to_string()),
+                web_auth_token: Some("env-token".to_string()),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1:9100".parse().unwrap());
+        assert_eq!(cfg.web.static_dir, PathBuf::from("/tmp/web-dist"));
+        assert_eq!(cfg.web.channel_events, ChannelEventMode::Verbose);
+        assert_eq!(cfg.web.auth_token.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn enabled_web_requires_auth_token_for_non_loopback_bind() {
+        let raw = r#"
+web:
+  enabled: true
+  bind: 0.0.0.0:8787
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("WEB_AUTH_TOKEN is required when web.bind is non-loopback")
+        );
+    }
+
+    #[test]
+    fn enabled_web_allows_non_loopback_bind_with_auth_token() {
+        let raw = r#"
+web:
+  enabled: true
+  bind: 0.0.0.0:8787
+  auth_token: token
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert_eq!(cfg.web.bind, "0.0.0.0:8787".parse().unwrap());
+        assert_eq!(cfg.web.auth_token.as_deref(), Some("token"));
     }
 
     #[test]

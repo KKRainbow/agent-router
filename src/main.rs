@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use agent_router::{
     approval::ApprovalBroker,
-    channel::{qq::QqBotChannel, slack::SlackSocketModeChannel},
+    channel::{qq::QqBotChannel, slack::SlackSocketModeChannel, web::WebChannel},
     config::{AppConfig, default_config_path, load_dotenv},
     executor::registry::ExecutorRegistry,
     machine::MachineRegistry,
@@ -114,9 +114,14 @@ async fn main() -> anyhow::Result<()> {
             )
         });
     }
+    if config.web.enabled {
+        tracing::info!("starting web channel");
+        let router = router.clone();
+        channels.spawn(async move { ("web", WebChannel::new(config.web).run(router).await) });
+    }
     anyhow::ensure!(
         !channels.is_empty(),
-        "no channels enabled; configure Slack or QQ credentials, or set a channel's enabled flag"
+        "no channels enabled; configure Slack, QQ, or web credentials, or set a channel's enabled flag"
     );
 
     while let Some(result) = channels.join_next().await {

@@ -451,6 +451,10 @@ pub trait RouterService: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    async fn session_state(&self, _session_key: &str) -> anyhow::Result<Option<SessionState>> {
+        Ok(None)
+    }
+
     async fn sync_context(&self, _request: ContextSyncRequest) -> anyhow::Result<()> {
         Ok(())
     }
@@ -2719,6 +2723,12 @@ where
             .into_iter()
             .filter(|record| record.source == source)
             .collect())
+    }
+
+    async fn session_state(&self, session_key: &str) -> anyhow::Result<Option<SessionState>> {
+        let lock = self.session_lock(session_key).await;
+        let _guard = lock.lock().await;
+        Ok(self.store.load(session_key).await)
     }
 
     async fn sync_context(&self, request: ContextSyncRequest) -> anyhow::Result<()> {

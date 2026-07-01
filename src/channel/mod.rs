@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, VecDeque};
 pub(crate) mod context;
 pub mod qq;
 pub mod slack;
+pub mod web;
 
 pub(crate) mod output;
 
