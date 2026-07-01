@@ -9,7 +9,7 @@ export type WebStreamEvent =
       title: string;
       text: string;
     }
-  | { type: "activity_snapshot"; text: string }
+  | { type: "activity_snapshot"; snapshot: ActivitySnapshot }
   | { type: "reply_delta"; text: string }
   | { type: "reply_break" }
   | { type: "final_reply"; text: string }
@@ -26,6 +26,30 @@ export type ChatActivity = {
   text: string;
 };
 
+export type ActivityCount = {
+  label: string;
+  count: number;
+};
+
+export type ActivityAttention = {
+  label: string;
+  code: boolean;
+  status: string;
+};
+
+export type ActivitySnapshot = {
+  executor: string;
+  latest_reasoning: string | null;
+  commands: ActivityCount[];
+  command_remaining: number;
+  tools: ActivityCount[];
+  tool_remaining: number;
+  attention: ActivityAttention[];
+  attention_remaining: number;
+  progress: string[];
+  progress_omitted: number;
+};
+
 export type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -35,7 +59,7 @@ export type ChatMessage = {
   committed?: boolean;
   localOnly?: boolean;
   activities?: ChatActivity[];
-  activitySummary?: string;
+  activitySnapshot?: ActivitySnapshot;
 };
 
 export type WebTranscriptMessage = {

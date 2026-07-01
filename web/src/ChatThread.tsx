@@ -17,7 +17,14 @@ import {
 
 import { useChatContext } from "./ChatContext";
 import { MarkdownText } from "./MarkdownText";
-import type { ActivityKind, ChatActivity, ChatMessage } from "./types";
+import type {
+  ActivityAttention,
+  ActivityCount,
+  ActivityKind,
+  ActivitySnapshot,
+  ChatActivity,
+  ChatMessage,
+} from "./types";
 
 export function ChatShell() {
   const {
@@ -163,12 +170,8 @@ function RunningActivityPanel() {
   const message = isRunning ? currentStreamingAssistant(messages) : undefined;
   if (!message) return null;
 
-  if (message.activitySummary?.trim()) {
-    return (
-      <div className="activity-panel compact" role="status" aria-live="polite">
-        <pre className="activity-summary">{message.activitySummary}</pre>
-      </div>
-    );
+  if (message.activitySnapshot) {
+    return <ActivitySnapshotPanel snapshot={message.activitySnapshot} />;
   }
 
   const activities = message.activities ?? [];
@@ -178,6 +181,107 @@ function RunningActivityPanel() {
     <div className="activity-panel verbose" role="status" aria-live="polite">
       <ActivityRows activities={activities} />
     </div>
+  );
+}
+
+function ActivitySnapshotPanel({ snapshot }: { snapshot: ActivitySnapshot }) {
+  return (
+    <div className="activity-panel compact" role="status" aria-live="polite">
+      <div className="activity-panel-header">
+        <span className="activity-panel-title">Activity</span>
+        <span className="activity-panel-executor">{snapshot.executor}</span>
+      </div>
+      {snapshot.latest_reasoning ? (
+        <div className="activity-reasoning">
+          <span>Reasoning</span>
+          <strong>{snapshot.latest_reasoning}</strong>
+        </div>
+      ) : null}
+      <ActivityCountSection
+        className="commands"
+        code
+        items={snapshot.commands}
+        label="Commands"
+        remaining={snapshot.command_remaining}
+      />
+      <ActivityCountSection
+        className="tools"
+        items={snapshot.tools}
+        label="Tools"
+        remaining={snapshot.tool_remaining}
+      />
+      {snapshot.attention.length ? (
+        <div className="activity-section attention">
+          <div className="activity-section-label">Attention</div>
+          <div className="activity-attention-list">
+            {snapshot.attention.map((item, index) => (
+              <ActivityAttentionItem
+                item={item}
+                key={`${index}:${item.label}:${item.status}`}
+              />
+            ))}
+            {snapshot.attention_remaining > 0 ? (
+              <span className="activity-more">+{snapshot.attention_remaining}</span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {snapshot.progress.length ? (
+        <div className="activity-section progress">
+          <div className="activity-section-label">Progress</div>
+          <ol className="activity-progress-list">
+            {snapshot.progress_omitted > 0 ? (
+              <li className="activity-progress-muted">
+                {snapshot.progress_omitted} earlier
+              </li>
+            ) : null}
+            {snapshot.progress.map((item, index) => (
+              <li key={`${index}:${item}`}>{item}</li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ActivityCountSection({
+  className,
+  code = false,
+  items,
+  label,
+  remaining,
+}: {
+  className: string;
+  code?: boolean;
+  items: ActivityCount[];
+  label: string;
+  remaining: number;
+}) {
+  if (!items.length) return null;
+
+  return (
+    <div className={`activity-section ${className}`}>
+      <div className="activity-section-label">{label}</div>
+      <div className="activity-chip-list">
+        {items.map((item) => (
+          <span className="activity-chip" key={item.label}>
+            {code ? <code>{item.label}</code> : <span>{item.label}</span>}
+            {item.count > 1 ? <span>x{item.count}</span> : null}
+          </span>
+        ))}
+        {remaining > 0 ? <span className="activity-more">+{remaining}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+function ActivityAttentionItem({ item }: { item: ActivityAttention }) {
+  return (
+    <span className="activity-attention-item">
+      {item.code ? <code>{item.label}</code> : <span>{item.label}</span>}
+      <strong>{item.status}</strong>
+    </span>
   );
 }
 

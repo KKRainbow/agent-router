@@ -10,7 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -138,17 +138,93 @@ impl RouterChannelEvent {
 }
 
 pub(crate) fn render_compact_channel_events(events: &[RouterChannelEvent]) -> Option<String> {
-    render_compact_channel_events_inner(events, true)
+    compact_channel_activity_inner(events, true).map(|activity| activity.render_text())
 }
 
 pub(crate) fn render_live_compact_channel_events(events: &[RouterChannelEvent]) -> Option<String> {
-    render_compact_channel_events_inner(events, false)
+    live_compact_channel_activity(events).map(|activity| activity.render_text())
 }
 
-fn render_compact_channel_events_inner(
+pub(crate) fn live_compact_channel_activity(
+    events: &[RouterChannelEvent],
+) -> Option<CompactChannelActivity> {
+    compact_channel_activity_inner(events, false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CompactChannelActivity {
+    pub executor: String,
+    pub latest_reasoning: Option<String>,
+    pub commands: Vec<CompactChannelActivityCount>,
+    pub command_remaining: usize,
+    pub tools: Vec<CompactChannelActivityCount>,
+    pub tool_remaining: usize,
+    pub attention: Vec<CompactChannelActivityAttention>,
+    pub attention_remaining: usize,
+    pub progress: Vec<String>,
+    pub progress_omitted: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CompactChannelActivityCount {
+    pub label: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CompactChannelActivityAttention {
+    pub label: String,
+    pub code: bool,
+    pub status: String,
+}
+
+impl CompactChannelActivity {
+    fn render_text(&self) -> String {
+        let mut lines = vec![format!("[{}] Activity", self.executor)];
+        if let Some(reasoning) = self.latest_reasoning.as_deref()
+            && !reasoning.is_empty()
+        {
+            lines.push(format!("Reasoning: {reasoning}"));
+        }
+        append_compact_count_lines(
+            &mut lines,
+            "Commands",
+            &self.commands,
+            self.command_remaining,
+            true,
+        );
+        append_compact_count_lines(&mut lines, "Tools", &self.tools, self.tool_remaining, false);
+        if !self.attention.is_empty() {
+            lines.push("Attention:".to_string());
+            for item in &self.attention {
+                let label = if item.code {
+                    inline_code(&item.label)
+                } else {
+                    item.label.clone()
+                };
+                lines.push(format!("- {label}: {}", item.status));
+            }
+            if self.attention_remaining > 0 {
+                lines.push(format!("- {} more", self.attention_remaining));
+            }
+        }
+        if !self.progress.is_empty() {
+            lines.push("Progress:".to_string());
+            if self.progress_omitted > 0 {
+                lines.push(format!("- {} earlier", self.progress_omitted));
+            }
+            for progress in &self.progress {
+                lines.push(format!("- {progress}"));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+fn compact_channel_activity_inner(
     events: &[RouterChannelEvent],
     suppress_single_successful_tool: bool,
-) -> Option<String> {
+) -> Option<CompactChannelActivity> {
     let first = events.first()?;
     let mut progress_items = Vec::new();
     let mut last_progress_text: Option<String> = None;
@@ -182,7 +258,7 @@ fn render_compact_channel_events_inner(
                     }
                 }
                 if let Some(status) = compact_attention_status(event) {
-                    attention.push(format!("{}: {status}", item.attention_label()));
+                    attention.push(item.attention(status));
                 }
             }
         }
@@ -202,35 +278,25 @@ fn render_compact_channel_events_inner(
         return None;
     }
 
-    let mut lines = vec![format!("[{}] Activity", first.executor)];
-    if let Some(reasoning) = latest_reasoning
-        && !reasoning.is_empty()
-    {
-        lines.push(format!("Reasoning: {reasoning}"));
-    }
-    append_compact_count_lines(&mut lines, "Commands", &command_counts, true);
-    append_compact_count_lines(&mut lines, "Tools", &tool_counts, false);
-    if !attention.is_empty() {
-        lines.push("Attention:".to_string());
-        for item in attention.iter().take(6) {
-            lines.push(format!("- {item}"));
-        }
-        let remaining = attention.len().saturating_sub(6);
-        if remaining > 0 {
-            lines.push(format!("- {remaining} more"));
-        }
-    }
-    if !progress_items.is_empty() {
-        lines.push("Progress:".to_string());
-        let omitted = progress_items.len().saturating_sub(6);
-        if omitted > 0 {
-            lines.push(format!("- {omitted} earlier"));
-        }
-        for progress in progress_items.iter().skip(omitted) {
-            lines.push(format!("- {progress}"));
-        }
-    }
-    Some(lines.join("\n"))
+    let (commands, command_remaining) = compact_count_items(command_counts);
+    let (tools, tool_remaining) = compact_count_items(tool_counts);
+    let attention_remaining = attention.len().saturating_sub(6);
+    let attention = attention.into_iter().take(6).collect();
+    let progress_omitted = progress_items.len().saturating_sub(6);
+    let progress = progress_items.into_iter().skip(progress_omitted).collect();
+
+    Some(CompactChannelActivity {
+        executor: first.executor.clone(),
+        latest_reasoning,
+        commands,
+        command_remaining,
+        tools,
+        tool_remaining,
+        attention,
+        attention_remaining,
+        progress,
+        progress_omitted,
+    })
 }
 
 fn push_compact_progress(
@@ -265,10 +331,18 @@ enum CompactToolItem {
 }
 
 impl CompactToolItem {
-    fn attention_label(&self) -> String {
+    fn attention(&self, status: String) -> CompactChannelActivityAttention {
         match self {
-            CompactToolItem::Command(command) => inline_code(command),
-            CompactToolItem::Tool(label) => label.clone(),
+            CompactToolItem::Command(command) => CompactChannelActivityAttention {
+                label: command.clone(),
+                code: true,
+                status,
+            },
+            CompactToolItem::Tool(label) => CompactChannelActivityAttention {
+                label: label.clone(),
+                code: false,
+                status,
+            },
         }
     }
 }
@@ -285,7 +359,8 @@ fn push_compact_count(counts: &mut Vec<(String, usize)>, label: String) {
 fn append_compact_count_lines(
     lines: &mut Vec<String>,
     heading: &str,
-    counts: &[(String, usize)],
+    counts: &[CompactChannelActivityCount],
+    remaining: usize,
     format_as_code: bool,
 ) {
     if counts.is_empty() {
@@ -293,27 +368,36 @@ fn append_compact_count_lines(
     }
 
     lines.push(format!("{heading}:"));
-    for (label, count) in counts.iter().take(6) {
+    for item in counts {
         let label = if format_as_code {
-            inline_code(label)
+            inline_code(&item.label)
         } else {
-            label.clone()
+            item.label.clone()
         };
-        let suffix = if *count > 1 {
-            format!(" x{count}")
+        let suffix = if item.count > 1 {
+            format!(" x{}", item.count)
         } else {
             String::new()
         };
         lines.push(format!("- {label}{suffix}"));
     }
+    if remaining > 0 {
+        lines.push(format!("- {remaining} more"));
+    }
+}
+
+fn compact_count_items(counts: Vec<(String, usize)>) -> (Vec<CompactChannelActivityCount>, usize) {
     let remaining = counts
         .iter()
         .skip(6)
         .map(|(_, count)| *count)
         .sum::<usize>();
-    if remaining > 0 {
-        lines.push(format!("- {remaining} more"));
-    }
+    let items = counts
+        .into_iter()
+        .take(6)
+        .map(|(label, count)| CompactChannelActivityCount { label, count })
+        .collect();
+    (items, remaining)
 }
 
 fn compact_tool_item(event: &RouterChannelEvent) -> CompactToolItem {
@@ -7723,6 +7807,51 @@ mod tests {
                 "[codex] Activity\nReasoning: Need to inspect the failing test first.\nCommands:\n- `cargo test -q`\n- `sleep 3` x3\nTools:\n- read_file\nProgress:\n- I will inspect the failing test first."
             )
         );
+    }
+
+    #[test]
+    fn live_compact_channel_activity_exposes_structured_snapshot() {
+        let events = vec![
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "codex".to_string(),
+                title: "Progress".to_string(),
+                text: "First step.".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ReasoningSummary,
+                executor: "codex".to_string(),
+                title: "Reasoning".to_string(),
+                text: "Need a targeted fix.".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "Bash".to_string(),
+                text: "$ cargo test -q\nexit: 2\nstatus: failed".to_string(),
+            },
+            RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "codex".to_string(),
+                title: "dynamicToolCall".to_string(),
+                text: "read_file\nstatus: completed".to_string(),
+            },
+        ];
+
+        let activity = live_compact_channel_activity(&events).unwrap();
+
+        assert_eq!(activity.executor, "codex");
+        assert_eq!(
+            activity.latest_reasoning.as_deref(),
+            Some("Need a targeted fix.")
+        );
+        assert_eq!(activity.commands[0].label, "cargo test -q");
+        assert_eq!(activity.commands[0].count, 1);
+        assert_eq!(activity.tools[0].label, "read_file");
+        assert_eq!(activity.attention[0].label, "cargo test -q");
+        assert!(activity.attention[0].code);
+        assert_eq!(activity.attention[0].status, "exit: 2");
+        assert_eq!(activity.progress, vec!["First step.".to_string()]);
     }
 
     #[test]

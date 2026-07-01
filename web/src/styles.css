@@ -278,22 +278,153 @@ button {
 }
 
 .activity-panel.compact {
+  display: grid;
+  gap: 10px;
   overflow: hidden;
   border: 1px solid #d7ddd5;
   border-radius: 8px;
+  padding: 10px 12px;
   background: #fbfcfa;
   box-shadow: 0 8px 24px rgb(31 45 36 / 8%);
 }
 
-.activity-summary {
-  margin: 0;
-  padding: 10px 12px;
-  color: #49584d;
-  font: inherit;
+.activity-panel-header,
+.activity-reasoning,
+.activity-section {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.activity-panel-header {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.activity-panel-title {
+  color: #223027;
   font-size: 12px;
-  line-height: 1.5;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.activity-panel-executor {
+  max-width: 180px;
+  overflow: hidden;
+  border: 1px solid #d7ddd5;
+  border-radius: 8px;
+  padding: 2px 8px;
+  color: #5a675e;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-reasoning span,
+.activity-section-label {
+  color: #6a766d;
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.activity-reasoning strong {
+  color: #49584d;
+  font-size: 12px;
+  font-weight: 550;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+}
+
+.activity-chip-list,
+.activity-attention-list {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.activity-chip,
+.activity-attention-item,
+.activity-more {
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 26px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d7ddd5;
+  border-radius: 8px;
+  padding: 3px 8px;
+  background: #ffffff;
+  color: #435247;
+  font-size: 12px;
+}
+
+.activity-chip code,
+.activity-attention-item code {
+  min-width: 0;
+  overflow: hidden;
+  color: #1f2d24;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-chip span,
+.activity-attention-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-section.commands .activity-chip {
+  border-color: #c8d3cc;
+  background: #f5f8f5;
+}
+
+.activity-section.tools .activity-chip {
+  border-color: #cfd5df;
+  background: #f6f7fb;
+}
+
+.activity-section.attention {
+  border-top: 1px solid #e1d8ca;
+  padding-top: 8px;
+}
+
+.activity-attention-item {
+  border-color: #e2cbb1;
+  background: #fff8ef;
+  color: #674a22;
+}
+
+.activity-attention-item strong {
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.activity-more {
+  color: #68756c;
+  font-weight: 750;
+}
+
+.activity-progress-list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  color: #49584d;
+  font-size: 12px;
+}
+
+.activity-progress-list li {
+  overflow-wrap: anywhere;
+}
+
+.activity-progress-muted {
+  color: #7b857e;
 }
 
 .activity-list {

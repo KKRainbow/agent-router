@@ -11,6 +11,19 @@ import {
   updateCachedSessionMessages,
 } from "./store";
 
+const COMPACT_SNAPSHOT = {
+  executor: "kimi",
+  latest_reasoning: null,
+  commands: [{ label: "cargo test", count: 1 }],
+  command_remaining: 0,
+  tools: [],
+  tool_remaining: 0,
+  attention: [],
+  attention_remaining: 0,
+  progress: [],
+  progress_omitted: 0,
+};
+
 describe("chat store", () => {
   it("appends a user message and streaming assistant draft", () => {
     const messages = appendUserAndDraft([], "hello", "user-1", "assistant-1");
@@ -47,11 +60,11 @@ describe("chat store", () => {
     });
     messages = applyStreamEvent(messages, "assistant-1", {
       type: "activity_snapshot",
-      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+      snapshot: COMPACT_SNAPSHOT,
     });
 
     expect(messages[1]).toMatchObject({
-      activitySummary: "[kimi] Activity\nCommands:\n- `cargo test`",
+      activitySnapshot: COMPACT_SNAPSHOT,
     });
 
     messages = applyStreamEvent(messages, "assistant-1", {
@@ -73,7 +86,7 @@ describe("chat store", () => {
         },
       ],
     });
-    expect(messages[1].activitySummary).toBeUndefined();
+    expect(messages[1].activitySnapshot).toBeUndefined();
     expect(messages[0]).toMatchObject({ localOnly: false });
   });
 
@@ -82,7 +95,7 @@ describe("chat store", () => {
 
     messages = applyStreamEvent(messages, "assistant-1", {
       type: "activity_snapshot",
-      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+      snapshot: COMPACT_SNAPSHOT,
     });
     messages = applyStreamEvent(messages, "assistant-1", {
       type: "error",
@@ -94,7 +107,7 @@ describe("chat store", () => {
       status: "error",
       localOnly: true,
     });
-    expect(messages[1].activitySummary).toBeUndefined();
+    expect(messages[1].activitySnapshot).toBeUndefined();
   });
 
   it("clears compact activity summary when the stream finishes without final reply", () => {
@@ -102,12 +115,12 @@ describe("chat store", () => {
 
     messages = applyStreamEvent(messages, "assistant-1", {
       type: "activity_snapshot",
-      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+      snapshot: COMPACT_SNAPSHOT,
     });
     messages = applyStreamEvent(messages, "assistant-1", { type: "done" });
 
     expect(messages[1]).toMatchObject({ status: "complete" });
-    expect(messages[1].activitySummary).toBeUndefined();
+    expect(messages[1].activitySnapshot).toBeUndefined();
   });
 
   it("keeps slash command final replies local-only", () => {
@@ -131,7 +144,7 @@ describe("chat store", () => {
     let messages = appendUserAndDraft([], "run", "user-1", "assistant-1");
     messages = applyStreamEvent(messages, "assistant-1", {
       type: "activity_snapshot",
-      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+      snapshot: COMPACT_SNAPSHOT,
     });
     messages = applyCancelReply(messages, "assistant-1", "Stopped the active turn.");
 
@@ -140,7 +153,7 @@ describe("chat store", () => {
       status: "complete",
       localOnly: true,
     });
-    expect(messages[1].activitySummary).toBeUndefined();
+    expect(messages[1].activitySnapshot).toBeUndefined();
     expect(messages[0]).toMatchObject({ localOnly: true });
   });
 

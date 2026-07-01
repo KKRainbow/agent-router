@@ -24,8 +24,8 @@ use crate::{
     ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
     config::{ChannelEventMode, WebAssetSource, WebConfig},
     router::{
-        RouterChannelEvent, RouterChannelEventKind, RouterOutputSink, RouterService,
-        render_live_compact_channel_events,
+        CompactChannelActivity, RouterChannelEvent, RouterChannelEventKind, RouterOutputSink,
+        RouterService, live_compact_channel_activity,
     },
     session::{MessageRole, SessionState, TranscriptMessage},
 };
@@ -485,8 +485,8 @@ impl RouterOutputSink for NdjsonOutputSink {
             ChannelEventMode::Off => {}
             ChannelEventMode::Compact => {
                 self.activity_events.push(event);
-                if let Some(text) = render_live_compact_channel_events(&self.activity_events) {
-                    send_stream_event(&self.tx, &WebStreamEvent::ActivitySnapshot { text });
+                if let Some(snapshot) = live_compact_channel_activity(&self.activity_events) {
+                    send_stream_event(&self.tx, &WebStreamEvent::ActivitySnapshot { snapshot });
                 }
             }
             ChannelEventMode::Verbose => {
@@ -550,7 +550,7 @@ pub(crate) enum WebStreamEvent {
         text: String,
     },
     ActivitySnapshot {
-        text: String,
+        snapshot: CompactChannelActivity,
     },
     ReplyDelta {
         text: String,
@@ -704,10 +704,15 @@ mod tests {
             text: "cargo test".to_string(),
         })
         .unwrap();
-        let snapshot = serde_json::to_string(&WebStreamEvent::ActivitySnapshot {
-            text: "[kimi] Activity\nCommands:\n- `cargo test`".to_string(),
-        })
+        let snapshot = live_compact_channel_activity(&[RouterChannelEvent {
+            kind: RouterChannelEventKind::ToolCall,
+            executor: "kimi".to_string(),
+            title: "Bash".to_string(),
+            text: "$ cargo test\nexit: 0\nstatus: completed".to_string(),
+        }])
         .unwrap();
+        let snapshot =
+            serde_json::to_value(&WebStreamEvent::ActivitySnapshot { snapshot }).unwrap();
 
         assert_eq!(
             activity,
@@ -715,7 +720,21 @@ mod tests {
         );
         assert_eq!(
             snapshot,
-            r#"{"type":"activity_snapshot","text":"[kimi] Activity\nCommands:\n- `cargo test`"}"#
+            serde_json::json!({
+                "type": "activity_snapshot",
+                "snapshot": {
+                    "executor": "kimi",
+                    "latest_reasoning": null,
+                    "commands": [{ "label": "cargo test", "count": 1 }],
+                    "command_remaining": 0,
+                    "tools": [],
+                    "tool_remaining": 0,
+                    "attention": [],
+                    "attention_remaining": 0,
+                    "progress": [],
+                    "progress_omitted": 0
+                }
+            })
         );
     }
 
@@ -955,9 +974,24 @@ mod tests {
         assert_eq!(lines[1], r#"{"type":"reply_delta","text":"hel"}"#);
         assert_eq!(lines[2], r#"{"type":"reply_delta","text":"lo"}"#);
         assert_eq!(lines[3], r#"{"type":"reply_break"}"#);
+        let snapshot: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
         assert_eq!(
-            lines[4],
-            r#"{"type":"activity_snapshot","text":"[kimi] Activity\nCommands:\n- `cargo test`"}"#
+            snapshot,
+            serde_json::json!({
+                "type": "activity_snapshot",
+                "snapshot": {
+                    "executor": "kimi",
+                    "latest_reasoning": null,
+                    "commands": [{ "label": "cargo test", "count": 1 }],
+                    "command_remaining": 0,
+                    "tools": [],
+                    "tool_remaining": 0,
+                    "attention": [],
+                    "attention_remaining": 0,
+                    "progress": [],
+                    "progress_omitted": 0
+                }
+            })
         );
         assert_eq!(lines[5], r#"{"type":"final_reply","text":"hello"}"#);
         assert_eq!(lines[6], r#"{"type":"done"}"#);
