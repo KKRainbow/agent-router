@@ -96,6 +96,40 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 ```
 
+Slack app setup:
+
+In the Slack app settings, enable Socket Mode and create an app-level token for
+`SLACK_APP_TOKEN` with:
+
+```text
+connections:write
+```
+
+In OAuth & Permissions, add these Bot Token Scopes:
+
+```text
+chat:write
+app_mentions:read
+channels:history
+groups:history
+im:history
+mpim:history
+users:read
+files:read
+```
+
+Then enable Event Subscriptions and subscribe to these bot events:
+
+```text
+app_mention
+message.channels
+message.groups
+message.im
+message.mpim
+```
+
+Reinstall the Slack app after changing scopes or event subscriptions.
+
 QQ:
 
 ```bash
