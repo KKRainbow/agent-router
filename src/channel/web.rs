@@ -1,30 +1,35 @@
-use std::{convert::Infallible, path::PathBuf, sync::Arc};
+use std::{
+    convert::Infallible,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{Path as AxumPath, State},
-    http::{Request, StatusCode, header},
+    http::{Request, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
-use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 use crate::{
     ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
-    config::{ChannelEventMode, WebConfig},
+    config::{ChannelEventMode, WebAssetSource, WebConfig},
     router::{RouterChannelEvent, RouterChannelEventKind, RouterOutputSink, RouterService},
     session::{MessageRole, SessionState, TranscriptMessage},
 };
 
 const WEB_USER_ID: &str = "local";
 const WEB_SOURCE: &str = "web";
+static WEB_DIST: Dir<'static> = include_dir!("$OUT_DIR/web-dist-embed");
 
 #[derive(Debug, Clone)]
 pub struct WebChannel {
@@ -38,14 +43,21 @@ impl WebChannel {
 
     pub async fn run(self, router: Arc<dyn RouterService>) -> anyhow::Result<()> {
         let bind = self.cfg.bind;
-        let static_dir = self.cfg.static_dir.clone();
+        let asset_source = self.cfg.asset_source.clone();
         let app = build_app(self.cfg, router);
         let listener = tokio::net::TcpListener::bind(bind).await?;
-        tracing::info!(
-            bind = %bind,
-            static_dir = %static_dir.display(),
-            "serving web channel"
-        );
+        match asset_source {
+            WebAssetSource::Embedded => {
+                tracing::info!(bind = %bind, "serving web channel with embedded assets");
+            }
+            WebAssetSource::StaticDir(static_dir) => {
+                tracing::info!(
+                    bind = %bind,
+                    static_dir = %static_dir.display(),
+                    "serving web channel with static assets"
+                );
+            }
+        }
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -54,13 +66,14 @@ impl WebChannel {
 #[derive(Clone)]
 struct WebState {
     router: Arc<dyn RouterService>,
+    asset_source: WebAssetSource,
     channel_events: ChannelEventMode,
 }
 
 pub(crate) fn build_app(cfg: WebConfig, router: Arc<dyn RouterService>) -> Router {
-    let static_dir = cfg.static_dir.clone();
     let state = Arc::new(WebState {
         router,
+        asset_source: cfg.asset_source,
         channel_events: cfg.channel_events,
     });
 
@@ -69,19 +82,191 @@ pub(crate) fn build_app(cfg: WebConfig, router: Arc<dyn RouterService>) -> Route
         .route("/sessions/{session_id}/transcript", get(transcript))
         .route("/sessions/{session_id}/messages", post(post_message))
         .route("/sessions/{session_id}/stop", post(post_stop))
-        .with_state(state);
+        .with_state(state.clone());
 
     if let Some(token) = cfg.auth_token {
         api = api.route_layer(middleware::from_fn_with_state(token, require_auth));
     }
 
-    Router::new().nest("/api/web", api).fallback_service(
-        ServeDir::new(&static_dir).not_found_service(ServeFile::new(index_file(static_dir))),
+    Router::new()
+        .nest("/api/web", api)
+        .fallback(get(web_static_asset))
+        .with_state(state)
+}
+
+async fn web_static_asset(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    match &state.asset_source {
+        WebAssetSource::Embedded => embedded_static_asset(uri.path()),
+        WebAssetSource::StaticDir(static_dir) => runtime_static_asset(static_dir, uri.path()).await,
+    }
+}
+
+fn embedded_static_asset(path: &str) -> Response {
+    let asset_path = static_asset_path(path);
+    if let Some(file) = WEB_DIST.get_file(asset_path.url_path.as_str()) {
+        return embedded_file_response(file, asset_path.url_path.as_str());
+    }
+
+    if let Some(file) = WEB_DIST.get_file("index.html") {
+        return embedded_file_response(file, "index.html");
+    }
+
+    (StatusCode::NOT_FOUND, "embedded web UI is empty").into_response()
+}
+
+async fn runtime_static_asset(static_dir: &Path, path: &str) -> Response {
+    let asset_path = static_asset_path(path);
+    let file_path = static_dir.join(&asset_path.relative_path);
+
+    match runtime_file_response(&file_path, asset_path.url_path.as_str()).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+
+    let index_path = static_dir.join("index.html");
+    match runtime_file_response(&index_path, "index.html").await {
+        Ok(Some(response)) => response,
+        Ok(None) => (StatusCode::NOT_FOUND, "static web UI index.html not found").into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn runtime_file_response(
+    path: &Path,
+    asset_path: &str,
+) -> Result<Option<Response>, Response> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(err) if is_missing_static_asset(&err) => return Ok(None),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "failed to inspect web static asset");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to inspect static web asset",
+            )
+                .into_response());
+        }
+    }
+
+    match tokio::fs::read(path).await {
+        Ok(contents) => Ok(Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, asset_content_type(asset_path))
+                .body(Body::from(contents))
+                .expect("valid runtime asset response"),
+        )),
+        Err(err) if is_missing_static_asset(&err) => Ok(None),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "failed to read web static asset");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read static web asset",
+            )
+                .into_response())
+        }
+    }
+}
+
+fn is_missing_static_asset(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
     )
 }
 
-fn index_file(static_dir: PathBuf) -> PathBuf {
-    static_dir.join("index.html")
+#[derive(Debug, PartialEq, Eq)]
+struct StaticAssetPath {
+    relative_path: PathBuf,
+    url_path: String,
+}
+
+fn static_asset_path(path: &str) -> StaticAssetPath {
+    let Some(segments) = safe_static_asset_segments(path) else {
+        return index_asset_path();
+    };
+
+    let mut relative_path = PathBuf::new();
+    for segment in &segments {
+        relative_path.push(segment);
+    }
+    StaticAssetPath {
+        url_path: segments.join("/"),
+        relative_path,
+    }
+}
+
+fn safe_static_asset_segments(path: &str) -> Option<Vec<String>> {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        return Some(vec!["index.html".to_string()]);
+    }
+
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if !is_safe_static_asset_segment(segment) {
+            return None;
+        }
+        segments.push(segment.to_string());
+    }
+
+    if segments.is_empty() {
+        Some(vec!["index.html".to_string()])
+    } else {
+        Some(segments)
+    }
+}
+
+fn is_safe_static_asset_segment(segment: &str) -> bool {
+    if segment == "." || segment == ".." || segment.contains(['\\', ':']) {
+        return false;
+    }
+    matches!(
+        Path::new(segment).components().next(),
+        Some(Component::Normal(_))
+    ) && Path::new(segment).components().count() == 1
+}
+
+fn index_asset_path() -> StaticAssetPath {
+    StaticAssetPath {
+        relative_path: PathBuf::from("index.html"),
+        url_path: "index.html".to_string(),
+    }
+}
+
+fn embedded_file_response(file: &include_dir::File<'_>, path: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, asset_content_type(path))
+        .body(Body::from(Bytes::copy_from_slice(file.contents())))
+        .expect("valid embedded asset response")
+}
+
+fn asset_content_type(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+    {
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "ico" => "image/x-icon",
+        "jpeg" | "jpg" => "image/jpeg",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "txt" => "text/plain; charset=utf-8",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn require_auth(
@@ -469,7 +654,7 @@ impl IntoResponse for WebError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, net::SocketAddr};
+    use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf};
 
     use axum::{
         body::to_bytes,
@@ -507,6 +692,174 @@ mod tests {
         assert_eq!(
             line,
             r#"{"type":"activity","kind":"tool_call","executor":"kimi","title":"Bash","text":"cargo test"}"#
+        );
+    }
+
+    #[test]
+    fn static_asset_paths_are_relative_and_safe() {
+        assert_eq!(
+            static_asset_path("/assets/app.js"),
+            StaticAssetPath {
+                relative_path: ["assets", "app.js"].iter().collect::<PathBuf>(),
+                url_path: "assets/app.js".to_string(),
+            }
+        );
+        assert_eq!(static_asset_path("/"), index_asset_path());
+        assert_eq!(static_asset_path("/../secret.txt"), index_asset_path());
+        assert_eq!(
+            static_asset_path("/C:/Users/secret.txt"),
+            index_asset_path()
+        );
+        assert_eq!(static_asset_path("/assets\\secret.txt"), index_asset_path());
+    }
+
+    #[tokio::test]
+    async fn serves_embedded_index_from_binary() {
+        let app = build_app(web_config(None), Arc::new(RecordingRouter::default()));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<html"));
+    }
+
+    #[tokio::test]
+    async fn serves_embedded_index_for_frontend_routes() {
+        let app = build_app(web_config(None), Arc::new(RecordingRouter::default()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/local-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<html"));
+    }
+
+    #[tokio::test]
+    async fn static_dir_serves_runtime_assets_instead_of_embedded_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><html><body>runtime static dir</body></html>",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("assets")).unwrap();
+        fs::write(
+            dir.path().join("assets").join("app.js"),
+            "console.log('ok');",
+        )
+        .unwrap();
+
+        let mut cfg = web_config(None);
+        cfg.asset_source = WebAssetSource::StaticDir(dir.path().to_path_buf());
+        let app = build_app(cfg, Arc::new(RecordingRouter::default()));
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("runtime static dir")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "console.log('ok');"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/dev-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("runtime static dir")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("runtime static dir")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("runtime static dir")
         );
     }
 
@@ -712,7 +1065,7 @@ mod tests {
         WebConfig {
             enabled: true,
             bind: "127.0.0.1:8787".parse::<SocketAddr>().unwrap(),
-            static_dir: PathBuf::from("web/dist"),
+            asset_source: WebAssetSource::Embedded,
             channel_events: ChannelEventMode::Compact,
             auth_token: auth_token.map(str::to_string),
         }

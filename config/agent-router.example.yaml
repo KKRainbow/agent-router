@@ -98,3 +98,16 @@ qq:
   sandbox: false
   allowed_users: []
   allowed_groups: []
+
+web:
+  # Local browser chat UI. Frontend assets are embedded into the Rust binary at
+  # build time from web/dist; run `npm --prefix web run build` before packaging.
+  enabled: false
+  bind: 127.0.0.1:8787
+  # Omit static_dir to serve embedded assets. Set it or WEB_STATIC_DIR for local
+  # debugging; static-dir mode does not fall back to embedded assets.
+  # static_dir: web/dist
+  # channel_events: off | compact | verbose
+  channel_events: compact
+  # Required when binding to a non-loopback address.
+  # auth_token: local-token

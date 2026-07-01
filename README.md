@@ -31,6 +31,7 @@ Channels:
 
 - Slack Socket Mode
 - Tencent QQ Official Bot Gateway
+- Local browser web chat
 
 Agent integrations:
 
@@ -61,7 +62,8 @@ For example:
 Requirements:
 
 - Rust toolchain
-- Credentials for at least one supported channel
+- Node.js and npm when rebuilding the bundled web UI
+- Credentials or local config for at least one supported channel
 - At least one configured agent command available on `PATH`
 
 Run with the example configuration:
@@ -151,6 +153,21 @@ QQ_ALLOWED_USERS=...
 QQ_ALLOWED_GROUPS=...
 ```
 
+Web chat:
+
+```bash
+npm --prefix web install
+npm --prefix web run build
+WEB_ENABLED=true cargo run -- --config config/agent-router.example.yaml
+```
+
+The Rust build embeds `web/dist` into the binary. Rebuild the frontend before
+packaging a release binary; if `web/dist` is missing, the binary embeds a small
+placeholder page. Set `web.static_dir` or `WEB_STATIC_DIR` for local debugging;
+that switches the web channel to runtime static files instead of embedded
+assets. `WEB_AUTH_TOKEN` is required when `WEB_BIND` uses a non-loopback
+address.
+
 ## Configuration Overview
 
 The example config defines a default agent, available agent backends, and
@@ -178,6 +195,13 @@ qq:
   sandbox: false
   allowed_users: []
   allowed_groups: []
+
+web:
+  enabled: false
+  bind: 127.0.0.1:8787
+  # Omit static_dir to serve embedded assets; set it to use runtime files.
+  # static_dir: web/dist
+  channel_events: compact
 ```
 
 Each chat session has one active agent. New sessions start with

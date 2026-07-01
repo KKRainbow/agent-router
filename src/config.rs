@@ -90,9 +90,15 @@ pub struct QqConfig {
 pub struct WebConfig {
     pub enabled: bool,
     pub bind: SocketAddr,
-    pub static_dir: PathBuf,
+    pub asset_source: WebAssetSource,
     pub channel_events: ChannelEventMode,
     pub auth_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebAssetSource {
+    Embedded,
+    StaticDir(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,14 +391,16 @@ impl AppConfig {
             .web_auth_token
             .or(web_file.auth_token)
             .filter(|value| !value.trim().is_empty());
+        let web_static_dir = env_cfg
+            .web_static_dir
+            .or(web_file.static_dir)
+            .filter(|path| !path.as_os_str().is_empty());
         let web = WebConfig {
             enabled: env_cfg.web_enabled.or(web_file.enabled).unwrap_or(false),
             bind: parse_socket_addr("web.bind", &web_bind)?,
-            static_dir: env_cfg
-                .web_static_dir
-                .or(web_file.static_dir)
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| PathBuf::from("web/dist")),
+            asset_source: web_static_dir
+                .map(WebAssetSource::StaticDir)
+                .unwrap_or(WebAssetSource::Embedded),
             channel_events: env_cfg
                 .web_channel_events
                 .or(web_file.channel_events)
@@ -817,7 +825,7 @@ mod tests {
         assert_eq!(cfg.qq.channel_events, ChannelEventMode::Compact);
         assert!(!cfg.web.enabled);
         assert_eq!(cfg.web.bind, "127.0.0.1:8787".parse().unwrap());
-        assert_eq!(cfg.web.static_dir, PathBuf::from("web/dist"));
+        assert_eq!(cfg.web.asset_source, WebAssetSource::Embedded);
         assert_eq!(cfg.web.channel_events, ChannelEventMode::Compact);
         assert_eq!(cfg.web.auth_token, None);
     }
@@ -1073,7 +1081,10 @@ web:
 
         assert!(cfg.web.enabled);
         assert_eq!(cfg.web.bind, "127.0.0.1:9000".parse().unwrap());
-        assert_eq!(cfg.web.static_dir, PathBuf::from("/tmp/agent-router-web"));
+        assert_eq!(
+            cfg.web.asset_source,
+            WebAssetSource::StaticDir(PathBuf::from("/tmp/agent-router-web"))
+        );
         assert_eq!(cfg.web.channel_events, ChannelEventMode::Verbose);
         assert_eq!(cfg.web.auth_token.as_deref(), Some("local-token"));
     }
@@ -1103,7 +1114,10 @@ web:
 
         assert!(cfg.web.enabled);
         assert_eq!(cfg.web.bind, "127.0.0.1:9100".parse().unwrap());
-        assert_eq!(cfg.web.static_dir, PathBuf::from("/tmp/web-dist"));
+        assert_eq!(
+            cfg.web.asset_source,
+            WebAssetSource::StaticDir(PathBuf::from("/tmp/web-dist"))
+        );
         assert_eq!(cfg.web.channel_events, ChannelEventMode::Verbose);
         assert_eq!(cfg.web.auth_token.as_deref(), Some("env-token"));
     }
