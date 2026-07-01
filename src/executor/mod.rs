@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod claude_stream_json;
 pub mod codex_app_server;
+pub mod pi_rpc;
 pub mod registry;
 
 use async_trait::async_trait;
@@ -79,6 +80,12 @@ pub enum ExecutorSlashCommandSupport {
 pub struct ExecutorSlashCommandRequest {
     pub session_key: String,
     pub executor: String,
+    pub cwd: Option<PathBuf>,
+    pub turn: Option<ExecutorTurnRef>,
+    pub cancel: TurnCancellation,
+    /// Last committed Backend Session id from the Executor Binding, when the
+    /// slash command starts a backend session directly.
+    pub previous_session_id: Option<String>,
     pub command: ExecutorSlashCommand,
     pub user_id: Option<String>,
 }
@@ -86,6 +93,10 @@ pub struct ExecutorSlashCommandRequest {
 #[derive(Debug)]
 pub enum ExecutorSlashCommandOutcome {
     Completed(ExecutorResponse),
+    CompletedWithSession {
+        response: ExecutorResponse,
+        prepared: PreparedExecutor,
+    },
     Unsupported,
     Failed(anyhow::Error),
 }

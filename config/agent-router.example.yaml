@@ -49,6 +49,11 @@ executors:
     protocol: app_server
     machine: local
     command: codex
+  pi:
+    protocol: pi_rpc
+    machine: local
+    command: pi
+    args: []
   # route-planner:
   #   protocol: acp
   #   machine: local

@@ -51,7 +51,7 @@ impl ApprovalRequest {
             .or_else(|| {
                 self.options
                     .iter()
-                    .find(|option| option.kind.starts_with("reject") || option.id.contains("deny"))
+                    .find(|option| option.kind.starts_with("reject"))
             })
             .map(|option| option.id.clone())
     }
@@ -79,6 +79,7 @@ pub struct ApprovalPrompt {
     pub requester_user_id: Option<String>,
     pub title: String,
     pub body: String,
+    pub options: Vec<ApprovalOption>,
     cancellation: ApprovalCancellation,
 }
 
@@ -97,7 +98,25 @@ impl ApprovalPrompt {
             lines.push(self.body.clone());
         }
         lines.push(String::new());
-        lines.push(format!("Approve: /approve {}", self.id));
+        let selectable_options = self
+            .options
+            .iter()
+            .filter(|option| !approval_option_is_deny(option))
+            .collect::<Vec<_>>();
+        let requires_explicit_option = selectable_options
+            .first()
+            .is_some_and(|option| self.options.len() > 2 || !option.kind.starts_with("allow"));
+        if selectable_options.len() > 1 || requires_explicit_option {
+            lines.push("Options:".to_string());
+            for option in selectable_options {
+                lines.push(format!(
+                    "- {}: /approve {} {}",
+                    option.name, self.id, option.id
+                ));
+            }
+        } else {
+            lines.push(format!("Approve: /approve {}", self.id));
+        }
         lines.push(format!("Deny: /deny {}", self.id));
         lines.join("\n")
     }
@@ -302,6 +321,7 @@ impl ApprovalBroker {
             requester_user_id: request.requester_user_id.clone(),
             title: request.title.clone(),
             body: request.body.clone(),
+            options: request.options.clone(),
             cancellation: cancel.clone(),
         };
         {
@@ -401,11 +421,29 @@ impl ApprovalBroker {
             }
 
             let selection = match command.decision {
-                ApprovalDecision::Approve => pending
-                    .request
-                    .allow_option_id()
-                    .map(ApprovalSelection::Selected)
-                    .unwrap_or(ApprovalSelection::Cancelled),
+                ApprovalDecision::Approve => {
+                    if let Some(option_id) = command.option_id {
+                        if pending.request.options.iter().any(|option| {
+                            option.id == option_id && !approval_option_is_deny(option)
+                        }) {
+                            ApprovalSelection::Selected(option_id)
+                        } else {
+                            return Some(ApprovalCommandReply {
+                                text: format!(
+                                    "Approval {target_id} option `{option_id}` is not available."
+                                ),
+                            });
+                        }
+                    } else if let Some(option_id) = pending.request.allow_option_id() {
+                        ApprovalSelection::Selected(option_id)
+                    } else {
+                        return Some(ApprovalCommandReply {
+                            text: format!(
+                                "Approval {target_id} requires an option. Use `/approve {target_id} <option-id>`."
+                            ),
+                        });
+                    }
+                }
                 ApprovalDecision::Deny => pending
                     .request
                     .deny_option_id()
@@ -444,6 +482,7 @@ impl ApprovalBroker {
 struct ApprovalCommand {
     decision: ApprovalDecision,
     target_id: Option<String>,
+    option_id: Option<String>,
 }
 
 fn parse_approval_command(text: &str) -> Option<ApprovalCommand> {
@@ -455,9 +494,11 @@ fn parse_approval_command(text: &str) -> Option<ApprovalCommand> {
         _ => return None,
     };
     let target_id = parts.next().map(ToOwned::to_owned);
+    let option_id = parts.next().map(ToOwned::to_owned);
     Some(ApprovalCommand {
         decision,
         target_id,
+        option_id,
     })
 }
 
@@ -472,6 +513,10 @@ fn remove_session_order(state: &mut ApprovalState, session_key: &str, id: &str) 
             state.session_order.remove(session_key);
         }
     }
+}
+
+fn approval_option_is_deny(option: &ApprovalOption) -> bool {
+    option.id == "deny" || option.kind.starts_with("reject")
 }
 
 fn slack_slash_session_matches(pending_session: &str, command_session: &str) -> bool {
@@ -538,6 +583,36 @@ mod tests {
         ApprovalRequest {
             requester_user_id: None,
             ..request(session_key)
+        }
+    }
+
+    fn select_request(session_key: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            session_key: session_key.to_string(),
+            executor: "pi".to_string(),
+            requester_user_id: Some("U1".to_string()),
+            title: "Pick target".to_string(),
+            body: "Choose one option.".to_string(),
+            options: vec![
+                ApprovalOption {
+                    id: "first".to_string(),
+                    kind: "select".to_string(),
+                    name: "First".to_string(),
+                    auto_approvable: false,
+                },
+                ApprovalOption {
+                    id: "second".to_string(),
+                    kind: "select".to_string(),
+                    name: "Second".to_string(),
+                    auto_approvable: false,
+                },
+                ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                    auto_approvable: false,
+                },
+            ],
         }
     }
 
@@ -695,6 +770,165 @@ mod tests {
         assert_eq!(
             pending.await.unwrap(),
             ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_option_prompt_renders_explicit_approval_choices() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending =
+            tokio::spawn(async move { request_broker.request(select_request("s1")).await });
+
+        let prompt = prompts.recv().await.unwrap();
+        let text = prompt.render_text();
+        assert!(text.contains(&format!("/approve {} first", prompt.id)));
+        assert!(text.contains(&format!("/approve {} second", prompt.id)));
+        assert!(text.contains(&format!("/deny {}", prompt.id)));
+
+        let reply = broker
+            .resolve_command("s1", &format!("/deny {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn single_non_allow_option_prompt_renders_explicit_approval_choice() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            let mut request = select_request("s1");
+            request.options = vec![
+                ApprovalOption {
+                    id: "option_1".to_string(),
+                    kind: "select".to_string(),
+                    name: "Only target".to_string(),
+                    auto_approvable: false,
+                },
+                ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                    auto_approvable: false,
+                },
+            ];
+            request_broker.request(request).await
+        });
+
+        let prompt = prompts.recv().await.unwrap();
+        let text = prompt.render_text();
+        assert!(text.contains(&format!("/approve {} option_1", prompt.id)));
+
+        let reply = broker
+            .resolve_command(
+                "s1",
+                &format!("/approve {} option_1", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("option_1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_option_approval_selects_explicit_option() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending =
+            tokio::spawn(async move { request_broker.request(select_request("s1")).await });
+
+        let prompt = prompts.recv().await.unwrap();
+        let reply = broker
+            .resolve_command("s1", &format!("/approve {} second", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("second".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_option_approval_allows_non_reject_option_id_containing_deny() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            let mut request = select_request("s1");
+            request.options.insert(
+                1,
+                ApprovalOption {
+                    id: "deny_value".to_string(),
+                    kind: "select".to_string(),
+                    name: "Deny value".to_string(),
+                    auto_approvable: false,
+                },
+            );
+            request_broker.request(request).await
+        });
+
+        let prompt = prompts.recv().await.unwrap();
+        let reply = broker
+            .resolve_command(
+                "s1",
+                &format!("/approve {} deny_value", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny_value".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_option_approval_requires_explicit_option() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending =
+            tokio::spawn(async move { request_broker.request(select_request("s1")).await });
+
+        let prompt = prompts.recv().await.unwrap();
+        let reply = broker
+            .resolve_command("s1", &format!("/approve {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+        assert!(reply.text.contains("requires an option"));
+        assert!(broker.has_pending(&prompt.id).await);
+
+        let reply = broker
+            .resolve_command("s1", &format!("/approve {} missing", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+        assert!(reply.text.contains("not available"));
+        assert!(broker.has_pending(&prompt.id).await);
+
+        broker
+            .resolve_command("s1", &format!("/deny {}", prompt.id), Some("U1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
         );
     }
 

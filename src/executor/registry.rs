@@ -11,6 +11,7 @@ use crate::{
         ExecutorSlashCommandOutcome, ExecutorSlashCommandRequest, ExecutorSlashCommandSupport,
         ExecutorTurnRef, PreparedExecutor, TurnCancellation, acp::AcpExecutorManager,
         claude_stream_json::ClaudeStreamJsonManager, codex_app_server::CodexAppServerManager,
+        pi_rpc::PiRpcExecutorManager,
     },
     machine::MachineRegistry,
 };
@@ -21,6 +22,7 @@ pub struct ExecutorRegistry {
     acp: AcpExecutorManager,
     claude_stream_json: ClaudeStreamJsonManager,
     codex_app_server: CodexAppServerManager,
+    pi_rpc: PiRpcExecutorManager,
 }
 
 impl ExecutorRegistry {
@@ -50,6 +52,11 @@ impl ExecutorRegistry {
             codex_app_server: CodexAppServerManager::with_machines(
                 executors.clone(),
                 machines.clone(),
+                approvals.clone(),
+            ),
+            pi_rpc: PiRpcExecutorManager::with_machines(
+                executors.clone(),
+                machines.clone(),
                 approvals,
             ),
             executors,
@@ -65,6 +72,7 @@ impl ExecutorRegistry {
             ExecutorProtocol::Acp => Ok(&self.acp),
             ExecutorProtocol::AppServer => Ok(&self.codex_app_server),
             ExecutorProtocol::ClaudeStreamJson => Ok(&self.claude_stream_json),
+            ExecutorProtocol::PiRpc => Ok(&self.pi_rpc),
         }
     }
 }
@@ -79,6 +87,7 @@ impl ExecutorBackend for ExecutorRegistry {
         let mut executors = self.acp.list();
         executors.extend(self.claude_stream_json.list());
         executors.extend(self.codex_app_server.list());
+        executors.extend(self.pi_rpc.list());
         executors.sort_by(|left, right| left.name.cmp(&right.name));
         executors
     }
@@ -175,6 +184,18 @@ mod tests {
                 },
             ),
             (
+                "pi".to_string(),
+                ExecutorConfig {
+                    name: "pi".to_string(),
+                    protocol: ExecutorProtocol::PiRpc,
+                    machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
+                    command: "pi".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+            (
                 "kimi".to_string(),
                 ExecutorConfig {
                     name: "kimi".to_string(),
@@ -206,6 +227,7 @@ mod tests {
                 ("claude".to_string(), "claude_stream_json".to_string()),
                 ("codex".to_string(), "app_server".to_string()),
                 ("kimi".to_string(), "acp".to_string()),
+                ("pi".to_string(), "pi_rpc".to_string()),
             ]
         );
     }
@@ -221,6 +243,7 @@ mod tests {
             registry.get("claude").unwrap().protocol,
             "claude_stream_json"
         );
+        assert_eq!(registry.get("pi").unwrap().protocol, "pi_rpc");
         assert!(registry.get("missing").is_none());
     }
 }

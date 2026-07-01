@@ -876,7 +876,7 @@ where
         if let Err(err) = self
             .executor
             .interrupt(ExecutorInterruptRequest {
-                turn: turn_ref,
+                turn: turn_ref.clone(),
                 reason: turn.reason,
             })
             .await
@@ -886,6 +886,19 @@ where
                 session_key = %turn.session_key,
                 generation = turn.generation,
                 "executor interrupt request failed"
+            );
+        }
+        if turn.discard_session_on_interrupt
+            && let Err(err) = self
+                .executor
+                .discard_session(turn_ref, "interrupted uncommitted control turn")
+                .await
+        {
+            tracing::debug!(
+                error = %err,
+                session_key = %turn.session_key,
+                generation = turn.generation,
+                "executor discard after interrupt failed"
             );
         }
     }
@@ -977,7 +990,7 @@ where
                 let _ = reservation.abandon_if_current().await;
             }
             return self
-                .handle_agent_slash_command(input, command, output)
+                .handle_agent_slash_command(input, command, context, output)
                 .await;
         }
         if is_slash_command_input(text) {
@@ -1205,12 +1218,13 @@ where
         &self,
         input: RouterInput,
         command: ExecutorSlashCommand,
+        context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
         let session_key = input.session_key.clone();
         let turn_start_lock = self.turn_start_lock(&session_key).await;
         let mut turn_start_guard = Some(turn_start_lock.lock().await);
-        let (executor_name, support, early_reply) = {
+        let (executor_name, descriptor, support, previous_session_id, early_reply) = {
             let lock = self.session_lock(&session_key).await;
             let _guard = lock.lock().await;
             let mut state = self.load_or_create_session_state(&session_key).await;
@@ -1219,17 +1233,21 @@ where
                 None => {
                     let executor_name = state.default_executor.clone();
                     state.set_active_executor(Some(executor_name.clone()));
-                    self.store.save(state).await;
+                    self.store.save(state.clone()).await;
                     executor_name
                 }
             };
-            self.executor.get(&executor_name).ok_or_else(|| {
+            let descriptor = self.executor.get(&executor_name).ok_or_else(|| {
                 anyhow::anyhow!("active executor `{executor_name}` is not configured")
             })?;
 
             let support = self
                 .executor
                 .slash_command_support(&executor_name, &command);
+            let previous_session_id = state
+                .executor_bindings
+                .get(&executor_name)
+                .and_then(|binding| binding.external_session_id.clone());
             let early_reply = if support == ExecutorSlashCommandSupport::Unsupported {
                 Some(render_unsupported_slash_command(&executor_name, &command))
             } else if support == ExecutorSlashCommandSupport::IdleOnly
@@ -1246,41 +1264,176 @@ where
             } else {
                 None
             };
-            (executor_name, support, early_reply)
+            (
+                executor_name,
+                descriptor,
+                support,
+                previous_session_id,
+                early_reply,
+            )
         };
         if let Some(reply) = early_reply {
             drop(turn_start_guard.take());
             return output.send_final_reply(reply).await;
         }
 
-        let idle_turn_start_guard = if support == ExecutorSlashCommandSupport::IdleOnly {
-            turn_start_guard.take()
+        let session_cwd = {
+            let lock = self.session_lock(&session_key).await;
+            let _guard = lock.lock().await;
+            if let Some(context) = context {
+                self.sync_context_locked(context).await?;
+            }
+            let mut state = self.load_or_create_session_state(&session_key).await;
+            let session_cwd = self.ensure_session_cwd(&mut state)?;
+            self.store.save(state).await;
+            session_cwd
+        };
+
+        let idle_turn_start_guard;
+        let idle_turn;
+        let slash_turn;
+        let slash_cancel;
+        if support == ExecutorSlashCommandSupport::IdleOnly {
+            idle_turn_start_guard = turn_start_guard.take();
+            let begun = self
+                .turns
+                .begin_discarding_session_on_interrupt(&session_key, executor_name.clone())
+                .await;
+            if let Some(replaced) = begun.interrupted {
+                self.interrupt_turn(replaced).await;
+            }
+            slash_turn = Some(begun.guard.executor_turn_ref());
+            slash_cancel = begun.guard.cancellation();
+            idle_turn = Some(begun.guard);
         } else {
             drop(turn_start_guard.take());
-            None
-        };
+            idle_turn_start_guard = None;
+            idle_turn = None;
+            slash_turn = None;
+            slash_cancel = TurnCancellation::default();
+        }
+        drop(idle_turn_start_guard);
 
         let outcome = self
             .executor
             .slash_command(ExecutorSlashCommandRequest {
-                session_key,
+                session_key: session_key.clone(),
                 executor: executor_name.clone(),
+                cwd: session_cwd,
+                turn: slash_turn,
+                cancel: slash_cancel,
+                previous_session_id,
                 command: command.clone(),
                 user_id: input.user_id,
             })
             .await;
-        drop(idle_turn_start_guard);
+        let mut idle_turn = idle_turn;
 
         match outcome {
             ExecutorSlashCommandOutcome::Completed(response) => {
+                if let Some(turn) = idle_turn.take()
+                    && turn.commit_if_current(|| async {}).await.is_none()
+                {
+                    return Ok(());
+                }
+                output.send_final_reply(response.final_text).await
+            }
+            ExecutorSlashCommandOutcome::CompletedWithSession { response, prepared } => {
+                let prepared_machine_id = prepared
+                    .machine_id
+                    .clone()
+                    .unwrap_or_else(|| descriptor.machine_id.clone());
+                let prepared_cwd = prepared.cwd.clone();
+                let prepared_machine_workspace = prepared.machine_workspace.clone();
+                let committed = if let Some(turn) = idle_turn.take() {
+                    let executor_turn = turn.executor_turn_ref();
+                    let discard_session_on_interrupt = turn.discard_session_on_interrupt();
+                    let lock = self.session_lock(&session_key).await;
+                    let _guard = lock.lock().await;
+                    let committed = turn
+                        .commit_if_current(|| async {
+                            let mut latest = self
+                                .store
+                                .load_or_create(&session_key, &self.default_executor)
+                                .await;
+                            let latest_binding = latest.binding_for(&executor_name);
+                            if let Some(machine_workspace) = prepared_machine_workspace {
+                                latest.machine_workspaces.insert(
+                                    machine_workspace.machine_id.clone(),
+                                    machine_workspace,
+                                );
+                            }
+                            latest.executor_bindings.insert(
+                                executor_name.clone(),
+                                update_binding_after_slash_success(
+                                    latest_binding,
+                                    prepared.external_session_id,
+                                    descriptor.protocol,
+                                    prepared_machine_id,
+                                    prepared_cwd.as_deref(),
+                                ),
+                            );
+                            self.store.save(latest).await;
+                        })
+                        .await
+                        .is_some();
+                    drop(_guard);
+                    if !committed && !discard_session_on_interrupt {
+                        let _ = self
+                            .executor
+                            .discard_session(
+                                executor_turn,
+                                "stale slash command completed with uncommitted session",
+                            )
+                            .await;
+                    }
+                    committed
+                } else {
+                    true
+                };
+                if !committed {
+                    return Ok(());
+                }
                 output.send_final_reply(response.final_text).await
             }
             ExecutorSlashCommandOutcome::Unsupported => {
+                if let Some(turn) = idle_turn.take()
+                    && turn.commit_if_current(|| async {}).await.is_none()
+                {
+                    return Ok(());
+                }
                 output
                     .send_final_reply(render_unsupported_slash_command(&executor_name, &command))
                     .await
             }
-            ExecutorSlashCommandOutcome::Failed(err) => Err(err),
+            ExecutorSlashCommandOutcome::Failed(err) => {
+                if let Some(turn) = idle_turn.take() {
+                    let executor_turn = turn.executor_turn_ref();
+                    let lock = self.session_lock(&session_key).await;
+                    let _guard = lock.lock().await;
+                    let failure = err.to_string();
+                    let committed = turn
+                        .commit_if_current(|| async {
+                            self.executor
+                                .discard_session(
+                                    executor_turn,
+                                    "slash command failed with uncommitted session",
+                                )
+                                .await
+                        })
+                        .await;
+                    match committed {
+                        Some(Ok(())) => {}
+                        Some(Err(discard_err)) => {
+                            return Err(anyhow::anyhow!(
+                                "slash command failed ({failure}); also failed to discard uncommitted executor session: {discard_err}"
+                            ));
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                Err(err)
+            }
         }
     }
 
@@ -2779,6 +2932,22 @@ fn update_binding_after_prompt_failure(
     binding
 }
 
+fn update_binding_after_slash_success(
+    mut binding: ExecutorBinding,
+    external_session_id: Option<String>,
+    protocol: String,
+    machine_id: String,
+    cwd: Option<&str>,
+) -> ExecutorBinding {
+    binding.protocol = protocol;
+    binding.machine_id = Some(machine_id);
+    binding.health = ExecutorHealth::Healthy;
+    binding = binding_with_executor_cwd(binding, cwd);
+    binding.external_session_id = external_session_id;
+    binding.seen_context.clear();
+    binding
+}
+
 fn binding_with_executor_cwd(mut binding: ExecutorBinding, cwd: Option<&str>) -> ExecutorBinding {
     if let Some(cwd) = cwd {
         binding.cwd = Some(cwd.to_string());
@@ -2918,7 +3087,7 @@ mod tests {
             ApprovalBroker, ApprovalOption, ApprovalPolicy, ApprovalRequest, ApprovalSelection,
         },
         executor::{
-            ExecutorChannelEvent, ExecutorDescriptor, ExecutorResponse,
+            ExecutorChannelEvent, ExecutorDescriptor, ExecutorInterruptRequest, ExecutorResponse,
             ExecutorSlashCommandOutcome, ExecutorSlashCommandRequest, ExecutorSlashCommandSupport,
             PreparedExecutor, test_support::FakeExecutorBackend,
         },
@@ -2941,6 +3110,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct SlashCommandExecutorBackend {
         commands: Arc<Mutex<Vec<ExecutorSlashCommandRequest>>>,
+        prepared: Option<PreparedExecutor>,
     }
 
     #[async_trait::async_trait]
@@ -2995,9 +3165,14 @@ mod tests {
             let name = request.command.name.clone();
             let args = request.command.args.clone();
             self.commands.lock().await.push(request);
-            ExecutorSlashCommandOutcome::Completed(ExecutorResponse {
+            let response = ExecutorResponse {
                 final_text: format!("slash command: {name} {args}").trim().to_string(),
-            })
+            };
+            if let Some(prepared) = self.prepared.clone() {
+                ExecutorSlashCommandOutcome::CompletedWithSession { response, prepared }
+            } else {
+                ExecutorSlashCommandOutcome::Completed(response)
+            }
         }
     }
 
@@ -3021,6 +3196,250 @@ mod tests {
                 slash_started: tokio::sync::Mutex::new(Some(slash_started)),
                 slash_release: tokio::sync::Mutex::new(Some(slash_release)),
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingIdleSlashExecutorBackend {
+        slash_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        interrupts: Arc<Mutex<Vec<ExecutorInterruptRequest>>>,
+        discarded: Arc<Mutex<Vec<ExecutorTurnRef>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl BlockingIdleSlashExecutorBackend {
+        fn new(slash_started: tokio::sync::oneshot::Sender<()>) -> Self {
+            Self {
+                slash_started: tokio::sync::Mutex::new(Some(slash_started)),
+                interrupts: Arc::new(Mutex::new(Vec::new())),
+                discarded: Arc::new(Mutex::new(Vec::new())),
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SlashContextBoundaryExecutorBackend {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for SlashContextBoundaryExecutorBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            (name == "kimi").then(|| ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "slash-test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            Ok(PreparedExecutor {
+                external_session_id: Some(
+                    request
+                        .previous_session_id
+                        .unwrap_or_else(|| "ext-1".to_string()),
+                ),
+                started_new_session: false,
+                machine_id: Some("local".to_string()),
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            _cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            self.prompts.lock().await.push(request.prompt);
+            ExecutorPromptOutcome::Completed(ExecutorResponse {
+                final_text: "fake response".to_string(),
+            })
+        }
+
+        fn slash_command_support(
+            &self,
+            _executor: &str,
+            _command: &ExecutorSlashCommand,
+        ) -> ExecutorSlashCommandSupport {
+            ExecutorSlashCommandSupport::IdleOnly
+        }
+
+        async fn slash_command(
+            &self,
+            _request: ExecutorSlashCommandRequest,
+        ) -> ExecutorSlashCommandOutcome {
+            ExecutorSlashCommandOutcome::CompletedWithSession {
+                response: ExecutorResponse {
+                    final_text: "slash done".to_string(),
+                },
+                prepared: PreparedExecutor {
+                    external_session_id: Some("ext-1".to_string()),
+                    started_new_session: false,
+                    machine_id: Some("local".to_string()),
+                    cwd: None,
+                    machine_workspace: None,
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingIdleSlashExecutorBackend {
+        discarded: Arc<Mutex<Vec<ExecutorTurnRef>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for FailingIdleSlashExecutorBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            (name == "kimi").then(|| ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "slash-test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            _request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            unreachable!("failed idle slash test does not prepare executor prompts")
+        }
+
+        async fn prompt(
+            &self,
+            _request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            _cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            unreachable!("failed idle slash test does not run executor prompts")
+        }
+
+        fn slash_command_support(
+            &self,
+            _executor: &str,
+            _command: &ExecutorSlashCommand,
+        ) -> ExecutorSlashCommandSupport {
+            ExecutorSlashCommandSupport::IdleOnly
+        }
+
+        async fn slash_command(
+            &self,
+            request: ExecutorSlashCommandRequest,
+        ) -> ExecutorSlashCommandOutcome {
+            assert!(request.turn.is_some());
+            ExecutorSlashCommandOutcome::Failed(anyhow::anyhow!("slash failed"))
+        }
+
+        async fn discard_session(
+            &self,
+            turn: ExecutorTurnRef,
+            _reason: &str,
+        ) -> anyhow::Result<()> {
+            self.discarded.lock().await.push(turn);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for BlockingIdleSlashExecutorBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            (name == "kimi").then(|| ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "slash-test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            _request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            self.events.lock().await.push("prepare");
+            Ok(PreparedExecutor {
+                external_session_id: Some("replacement-session".to_string()),
+                started_new_session: true,
+                machine_id: Some("local".to_string()),
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            _request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            _cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            ExecutorPromptOutcome::Completed(ExecutorResponse {
+                final_text: "replacement response".to_string(),
+            })
+        }
+
+        fn slash_command_support(
+            &self,
+            _executor: &str,
+            _command: &ExecutorSlashCommand,
+        ) -> ExecutorSlashCommandSupport {
+            ExecutorSlashCommandSupport::IdleOnly
+        }
+
+        async fn slash_command(
+            &self,
+            request: ExecutorSlashCommandRequest,
+        ) -> ExecutorSlashCommandOutcome {
+            assert!(request.turn.is_some());
+            if let Some(started) = self.slash_started.lock().await.take() {
+                let _ = started.send(());
+            }
+            let _ = request.cancel.cancelled().await;
+            ExecutorSlashCommandOutcome::CompletedWithSession {
+                response: ExecutorResponse {
+                    final_text: "stale slash response".to_string(),
+                },
+                prepared: PreparedExecutor {
+                    external_session_id: Some("stale-slash-session".to_string()),
+                    started_new_session: true,
+                    machine_id: Some("local".to_string()),
+                    cwd: None,
+                    machine_workspace: None,
+                },
+            }
+        }
+
+        async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {
+            self.interrupts.lock().await.push(request);
+            Ok(())
+        }
+
+        async fn discard_session(
+            &self,
+            turn: ExecutorTurnRef,
+            _reason: &str,
+        ) -> anyhow::Result<()> {
+            self.events.lock().await.push("discard");
+            self.discarded.lock().await.push(turn);
+            Ok(())
         }
     }
 
@@ -5337,6 +5756,15 @@ mod tests {
         let store = Arc::new(InMemorySessionStore::default());
         let executor = Arc::new(SlashCommandExecutorBackend::default());
         let router = AgentRouter::new("kimi", store.clone(), executor.clone());
+        let mut state = SessionState::new("slack:dm:D1:111.000", "kimi");
+        state.executor_bindings.insert(
+            "kimi".to_string(),
+            ExecutorBinding {
+                external_session_id: Some("saved-session".to_string()),
+                ..ExecutorBinding::default()
+            },
+        );
+        store.save(state).await;
 
         let mut output = CollectingRouterOutputSink::default();
         router
@@ -5356,6 +5784,15 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].session_key, "slack:dm:D1:111.000");
         assert_eq!(commands[0].executor, "kimi");
+        assert!(commands[0].cwd.is_none());
+        let turn = commands[0].turn.as_ref().expect("idle slash has turn");
+        assert_eq!(turn.session_key, "slack:dm:D1:111.000");
+        assert_eq!(turn.executor, "kimi");
+        assert!(!commands[0].cancel.is_cancelled_now());
+        assert_eq!(
+            commands[0].previous_session_id.as_deref(),
+            Some("saved-session")
+        );
         assert_eq!(commands[0].user_id.as_deref(), Some("U1"));
         assert_eq!(commands[0].command.raw, "/status --json");
         assert_eq!(commands[0].command.name, "status");
@@ -5364,7 +5801,85 @@ mod tests {
 
         let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
         assert!(saved.transcript.is_empty());
-        assert!(saved.executor_bindings.is_empty());
+        assert_eq!(
+            saved.executor_bindings["kimi"]
+                .external_session_id
+                .as_deref(),
+            Some("saved-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_slash_command_uses_session_workspace_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspaces");
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(SlashCommandExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_workspace_root(Some(workspace_root.clone()));
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "//status".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "slash command: status");
+        let commands = executor.commands.lock().await;
+        let cwd = commands[0].cwd.clone().expect("slash command cwd");
+        assert!(cwd.starts_with(workspace_root.canonicalize().unwrap()));
+        drop(commands);
+        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        assert_eq!(saved.cwd.as_ref(), Some(&cwd));
+    }
+
+    #[tokio::test]
+    async fn agent_slash_command_persists_returned_executor_session() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(SlashCommandExecutorBackend {
+            prepared: Some(PreparedExecutor {
+                external_session_id: Some("slash-session".to_string()),
+                started_new_session: true,
+                machine_id: Some("machine-1".to_string()),
+                cwd: Some("/work/slash".to_string()),
+                machine_workspace: None,
+            }),
+            ..SlashCommandExecutorBackend::default()
+        });
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone());
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "//status".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "slash command: status");
+        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let binding = saved.executor_bindings.get("kimi").unwrap();
+        assert_eq!(
+            binding.external_session_id.as_deref(),
+            Some("slash-session")
+        );
+        assert_eq!(binding.protocol, "slash-test");
+        assert_eq!(binding.machine_id.as_deref(), Some("machine-1"));
+        assert_eq!(binding.cwd.as_deref(), Some("/work/slash"));
+        assert_eq!(binding.health, ExecutorHealth::Healthy);
+        assert!(saved.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -5392,6 +5907,155 @@ mod tests {
         assert_eq!(commands[0].command.raw, "//status");
         assert_eq!(commands[0].command.name, "/status");
         assert_eq!(commands[0].command.args, "");
+    }
+
+    #[tokio::test]
+    async fn failed_idle_agent_slash_command_discards_uncommitted_session() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FailingIdleSlashExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store, executor.clone());
+
+        let mut output = CollectingRouterOutputSink::default();
+        let err = router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "//status".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "slash failed");
+        assert!(output.events.is_empty());
+        let discarded = executor.discarded.lock().await;
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].session_key, "slack:dm:D1:111.000");
+        assert_eq!(discarded[0].executor, "kimi");
+    }
+
+    #[tokio::test]
+    async fn idle_agent_slash_command_can_be_stopped() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (slash_started_tx, slash_started_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(BlockingIdleSlashExecutorBackend::new(slash_started_tx));
+        let router = Arc::new(AgentRouter::new("kimi", store, executor.clone()));
+
+        let slash_router = router.clone();
+        let slash = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            slash_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:dm:D1:111.000".to_string(),
+                        text: "//status".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), slash_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut stop = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/stop".to_string(),
+                    user_id: None,
+                },
+                &mut stop,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stop.final_reply(), "Stopped the active turn.");
+        let slash_output = tokio::time::timeout(Duration::from_secs(1), slash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slash_output.events.is_empty());
+        let interrupts = executor.interrupts.lock().await;
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].turn.session_key, "slack:dm:D1:111.000");
+        assert_eq!(interrupts[0].turn.executor, "kimi");
+        drop(interrupts);
+        let discarded = executor.discarded.lock().await;
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].session_key, "slack:dm:D1:111.000");
+        assert_eq!(discarded[0].executor, "kimi");
+    }
+
+    #[tokio::test]
+    async fn idle_agent_slash_command_can_be_replaced_by_message() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (slash_started_tx, slash_started_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(BlockingIdleSlashExecutorBackend::new(slash_started_tx));
+        let router = Arc::new(AgentRouter::new("kimi", store, executor.clone()));
+
+        let slash_router = router.clone();
+        let slash = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            slash_router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:dm:D1:111.000".to_string(),
+                        text: "//status".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), slash_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut replacement = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "new work".to_string(),
+                    user_id: None,
+                },
+                &mut replacement,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replacement.final_reply(), "replacement response");
+        let slash_output = tokio::time::timeout(Duration::from_secs(1), slash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slash_output.events.is_empty());
+        let interrupts = executor.interrupts.lock().await;
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].turn.session_key, "slack:dm:D1:111.000");
+        assert_eq!(interrupts[0].turn.executor, "kimi");
+        assert_eq!(interrupts[0].reason, InterruptReason::ReplacedByNewMessage);
+        drop(interrupts);
+        let discarded = executor.discarded.lock().await;
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].session_key, "slack:dm:D1:111.000");
+        assert_eq!(discarded[0].executor, "kimi");
+        drop(discarded);
+        assert_eq!(
+            executor.events.lock().await.as_slice(),
+            ["discard", "prepare"]
+        );
     }
 
     #[tokio::test]
@@ -8849,6 +9513,65 @@ mod tests {
         drop(prompts);
         let prepared = executor.prepared.lock().await;
         assert_eq!(prepared[0].previous_session_id.as_deref(), Some("ext-1"));
+    }
+
+    #[tokio::test]
+    async fn successful_native_slash_invalidates_seen_context_even_when_session_id_is_unchanged() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(SlashContextBoundaryExecutorBackend::default());
+        let session_key = "slack:C1:T1";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("kimi".to_string()));
+        let old = TranscriptMessage::user("old");
+        state.transcript.push(old.clone());
+        state.executor_bindings.insert(
+            "kimi".to_string(),
+            ExecutorBinding {
+                protocol: "slash-test".to_string(),
+                external_session_id: Some("ext-1".to_string()),
+                seen_context: vec![message_fingerprint(&old)],
+                ..ExecutorBinding::default()
+            },
+        );
+        store.save(state).await;
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone());
+
+        let mut slash_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "//clear".to_string(),
+                    user_id: None,
+                },
+                &mut slash_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(slash_output.final_reply(), "slash done");
+        assert!(
+            store.load(session_key).await.unwrap().executor_bindings["kimi"]
+                .seen_context
+                .is_empty()
+        );
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "continue".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("user: old"));
+        assert!(prompts[0].contains("Current user message:\ncontinue"));
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ struct ActiveTurn {
     executor: Option<String>,
     executor_session_key: Option<String>,
     cancel: TurnCancellation,
+    discard_session_on_interrupt: bool,
 }
 
 #[derive(Debug)]
@@ -58,6 +59,7 @@ pub(crate) struct TurnGuard {
     generation: u64,
     executor: String,
     cancel: TurnCancellation,
+    discard_session_on_interrupt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +69,7 @@ pub(crate) struct InterruptedTurn {
     pub(crate) executor: Option<String>,
     pub(crate) executor_session_key: Option<String>,
     pub(crate) reason: InterruptReason,
+    pub(crate) discard_session_on_interrupt: bool,
     cancel: TurnCancellation,
 }
 
@@ -79,6 +82,25 @@ impl TurnRegistry {
     }
 
     pub(crate) async fn begin(self: &Arc<Self>, session_key: &str, executor: String) -> BegunTurn {
+        self.begin_with_discard_on_interrupt(session_key, executor, false)
+            .await
+    }
+
+    pub(crate) async fn begin_discarding_session_on_interrupt(
+        self: &Arc<Self>,
+        session_key: &str,
+        executor: String,
+    ) -> BegunTurn {
+        self.begin_with_discard_on_interrupt(session_key, executor, true)
+            .await
+    }
+
+    async fn begin_with_discard_on_interrupt(
+        self: &Arc<Self>,
+        session_key: &str,
+        executor: String,
+        discard_session_on_interrupt: bool,
+    ) -> BegunTurn {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let cancel = TurnCancellation::new();
         let replaced = {
@@ -90,6 +112,7 @@ impl TurnRegistry {
                     executor: Some(executor.clone()),
                     executor_session_key: Some(session_key.to_string()),
                     cancel: cancel.clone(),
+                    discard_session_on_interrupt,
                 },
             )
         }
@@ -104,6 +127,7 @@ impl TurnRegistry {
                 generation,
                 executor,
                 cancel,
+                discard_session_on_interrupt,
             },
             interrupted: replaced,
         }
@@ -121,6 +145,7 @@ impl TurnRegistry {
                     executor: None,
                     executor_session_key: None,
                     cancel: cancel.clone(),
+                    discard_session_on_interrupt: false,
                 },
             )
         }
@@ -209,6 +234,7 @@ impl TurnReservation {
             generation: self.generation,
             executor,
             cancel: turn.cancel.clone(),
+            discard_session_on_interrupt: turn.discard_session_on_interrupt,
         })
     }
 }
@@ -236,6 +262,10 @@ impl TurnGuard {
             executor: self.executor.clone(),
             generation: self.generation,
         }
+    }
+
+    pub(crate) fn discard_session_on_interrupt(&self) -> bool {
+        self.discard_session_on_interrupt
     }
 
     async fn is_current(&self) -> bool {
@@ -305,6 +335,7 @@ fn interrupted_turn(
         executor: turn.executor,
         executor_session_key: turn.executor_session_key,
         reason,
+        discard_session_on_interrupt: turn.discard_session_on_interrupt,
         cancel: turn.cancel,
     }
 }
