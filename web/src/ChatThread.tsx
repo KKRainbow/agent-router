@@ -17,7 +17,7 @@ import {
 
 import { useChatContext } from "./ChatContext";
 import { MarkdownText } from "./MarkdownText";
-import type { ActivityKind } from "./types";
+import type { ActivityKind, ChatActivity, ChatMessage } from "./types";
 
 export function ChatShell() {
   const {
@@ -112,6 +112,7 @@ function ThreadView() {
           </button>
         </ThreadPrimitive.ScrollToBottom>
         <ThreadPrimitive.ViewportFooter className="viewport-footer">
+          <RunningActivityPanel />
           <Composer />
         </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>
@@ -141,14 +142,12 @@ function UserMessage() {
 }
 
 function AssistantMessage() {
-  const messageId = useAuiState((state) => state.message.id);
   return (
     <MessagePrimitive.Root className="message-row assistant-row">
       <div className="assistant-gutter">
         <Terminal size={16} aria-hidden="true" />
       </div>
       <div className="assistant-body">
-        <ActivityList messageId={messageId} />
         <div className="assistant-text">
           <MessagePrimitive.Parts>
             {({ part }) => (part.type === "text" ? <MarkdownText /> : null)}
@@ -159,12 +158,30 @@ function AssistantMessage() {
   );
 }
 
-function ActivityList({ messageId }: { messageId: string }) {
-  const { messages } = useChatContext();
-  const message = messages.find((item) => item.id === messageId);
-  const activities = message?.activities ?? [];
+function RunningActivityPanel() {
+  const { messages, isRunning } = useChatContext();
+  const message = isRunning ? currentStreamingAssistant(messages) : undefined;
+  if (!message) return null;
+
+  if (message.activitySummary?.trim()) {
+    return (
+      <div className="activity-panel compact" role="status" aria-live="polite">
+        <pre className="activity-summary">{message.activitySummary}</pre>
+      </div>
+    );
+  }
+
+  const activities = message.activities ?? [];
   if (!activities.length) return null;
 
+  return (
+    <div className="activity-panel verbose" role="status" aria-live="polite">
+      <ActivityRows activities={activities} />
+    </div>
+  );
+}
+
+function ActivityRows({ activities }: { activities: ChatActivity[] }) {
   return (
     <div className="activity-list">
       {activities.slice(-6).map((activity) => (
@@ -179,6 +196,15 @@ function ActivityList({ messageId }: { messageId: string }) {
       ))}
     </div>
   );
+}
+
+function currentStreamingAssistant(messages: ChatMessage[]) {
+  return messages
+    .slice()
+    .reverse()
+    .find(
+      (message) => message.role === "assistant" && message.status === "streaming",
+    );
 }
 
 function Composer() {

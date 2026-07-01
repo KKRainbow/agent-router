@@ -46,6 +46,15 @@ describe("chat store", () => {
       text: "cargo test",
     });
     messages = applyStreamEvent(messages, "assistant-1", {
+      type: "activity_snapshot",
+      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+    });
+
+    expect(messages[1]).toMatchObject({
+      activitySummary: "[kimi] Activity\nCommands:\n- `cargo test`",
+    });
+
+    messages = applyStreamEvent(messages, "assistant-1", {
       type: "final_reply",
       text: "done",
     });
@@ -64,7 +73,41 @@ describe("chat store", () => {
         },
       ],
     });
+    expect(messages[1].activitySummary).toBeUndefined();
     expect(messages[0]).toMatchObject({ localOnly: false });
+  });
+
+  it("clears compact activity summary on stream errors", () => {
+    let messages = appendUserAndDraft([], "run", "user-1", "assistant-1");
+
+    messages = applyStreamEvent(messages, "assistant-1", {
+      type: "activity_snapshot",
+      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+    });
+    messages = applyStreamEvent(messages, "assistant-1", {
+      type: "error",
+      message: "failed",
+    });
+
+    expect(messages[1]).toMatchObject({
+      text: "failed",
+      status: "error",
+      localOnly: true,
+    });
+    expect(messages[1].activitySummary).toBeUndefined();
+  });
+
+  it("clears compact activity summary when the stream finishes without final reply", () => {
+    let messages = appendUserAndDraft([], "run", "user-1", "assistant-1");
+
+    messages = applyStreamEvent(messages, "assistant-1", {
+      type: "activity_snapshot",
+      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+    });
+    messages = applyStreamEvent(messages, "assistant-1", { type: "done" });
+
+    expect(messages[1]).toMatchObject({ status: "complete" });
+    expect(messages[1].activitySummary).toBeUndefined();
   });
 
   it("keeps slash command final replies local-only", () => {
@@ -86,6 +129,10 @@ describe("chat store", () => {
 
   it("cancel reply clears the running draft", () => {
     let messages = appendUserAndDraft([], "run", "user-1", "assistant-1");
+    messages = applyStreamEvent(messages, "assistant-1", {
+      type: "activity_snapshot",
+      text: "[kimi] Activity\nCommands:\n- `cargo test`",
+    });
     messages = applyCancelReply(messages, "assistant-1", "Stopped the active turn.");
 
     expect(messages[1]).toMatchObject({
@@ -93,6 +140,7 @@ describe("chat store", () => {
       status: "complete",
       localOnly: true,
     });
+    expect(messages[1].activitySummary).toBeUndefined();
     expect(messages[0]).toMatchObject({ localOnly: true });
   });
 

@@ -9,6 +9,7 @@ export type WebStreamEvent =
       title: string;
       text: string;
     }
+  | { type: "activity_snapshot"; text: string }
   | { type: "reply_delta"; text: string }
   | { type: "reply_break" }
   | { type: "final_reply"; text: string }
@@ -34,6 +35,7 @@ export type ChatMessage = {
   committed?: boolean;
   localOnly?: boolean;
   activities?: ChatActivity[];
+  activitySummary?: string;
 };
 
 export type WebTranscriptMessage = {

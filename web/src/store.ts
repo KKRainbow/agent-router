@@ -71,6 +71,7 @@ export function applyStreamEvent(
     return updateAssistant(messages, assistantMessageId, (message) => ({
       ...message,
       status: message.status === "error" ? "error" : "complete",
+      activitySummary: undefined,
     }));
   }
   if (event.type === "reply_delta") {
@@ -90,6 +91,13 @@ export function applyStreamEvent(
       ...message,
       text: event.text,
       status: "complete",
+      activitySummary: undefined,
+    }));
+  }
+  if (event.type === "activity_snapshot") {
+    return updateAssistant(messages, assistantMessageId, (message) => ({
+      ...message,
+      activitySummary: event.text,
     }));
   }
   if (event.type === "activity") {
@@ -110,6 +118,7 @@ export function applyStreamEvent(
     text: message.text || event.message,
     status: "error",
     localOnly: true,
+    activitySummary: undefined,
   }));
 }
 
@@ -124,6 +133,7 @@ export function applyCancelReply(
     text: text || message.text,
     status: "complete",
     localOnly: true,
+    activitySummary: undefined,
   }));
 }
 

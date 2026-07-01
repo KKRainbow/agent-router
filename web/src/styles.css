@@ -273,11 +273,33 @@ button {
   overflow-wrap: anywhere;
 }
 
+.activity-panel {
+  margin-bottom: 10px;
+}
+
+.activity-panel.compact {
+  overflow: hidden;
+  border: 1px solid #d7ddd5;
+  border-radius: 8px;
+  background: #fbfcfa;
+  box-shadow: 0 8px 24px rgb(31 45 36 / 8%);
+}
+
+.activity-summary {
+  margin: 0;
+  padding: 10px 12px;
+  color: #49584d;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .activity-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-bottom: 10px;
 }
 
 .activity-item {

@@ -23,7 +23,10 @@ use uuid::Uuid;
 use crate::{
     ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
     config::{ChannelEventMode, WebAssetSource, WebConfig},
-    router::{RouterChannelEvent, RouterChannelEventKind, RouterOutputSink, RouterService},
+    router::{
+        RouterChannelEvent, RouterChannelEventKind, RouterOutputSink, RouterService,
+        render_live_compact_channel_events,
+    },
     session::{MessageRole, SessionState, TranscriptMessage},
 };
 
@@ -370,6 +373,7 @@ async fn post_message(
         let mut output = NdjsonOutputSink {
             tx: tx.clone(),
             channel_events,
+            activity_events: Vec::new(),
         };
         if let Err(err) = route_web_text(router, session_key, request.text, &mut output).await {
             send_stream_event(
@@ -471,23 +475,32 @@ fn ndjson_response(rx: mpsc::UnboundedReceiver<Bytes>) -> Response {
 struct NdjsonOutputSink {
     tx: mpsc::UnboundedSender<Bytes>,
     channel_events: ChannelEventMode,
+    activity_events: Vec<RouterChannelEvent>,
 }
 
 #[async_trait]
 impl RouterOutputSink for NdjsonOutputSink {
     fn send_channel_event(&mut self, event: RouterChannelEvent) {
-        if self.channel_events == ChannelEventMode::Off {
-            return;
+        match self.channel_events {
+            ChannelEventMode::Off => {}
+            ChannelEventMode::Compact => {
+                self.activity_events.push(event);
+                if let Some(text) = render_live_compact_channel_events(&self.activity_events) {
+                    send_stream_event(&self.tx, &WebStreamEvent::ActivitySnapshot { text });
+                }
+            }
+            ChannelEventMode::Verbose => {
+                send_stream_event(
+                    &self.tx,
+                    &WebStreamEvent::Activity {
+                        kind: event.kind.into(),
+                        executor: event.executor,
+                        title: event.title,
+                        text: event.text,
+                    },
+                );
+            }
         }
-        send_stream_event(
-            &self.tx,
-            &WebStreamEvent::Activity {
-                kind: event.kind.into(),
-                executor: event.executor,
-                title: event.title,
-                text: event.text,
-            },
-        );
     }
 
     fn send_reply_break(&mut self) {
@@ -534,6 +547,9 @@ pub(crate) enum WebStreamEvent {
         kind: WebActivityKind,
         executor: String,
         title: String,
+        text: String,
+    },
+    ActivitySnapshot {
         text: String,
     },
     ReplyDelta {
@@ -681,17 +697,25 @@ mod tests {
 
     #[test]
     fn serializes_stream_events() {
-        let line = serde_json::to_string(&WebStreamEvent::Activity {
+        let activity = serde_json::to_string(&WebStreamEvent::Activity {
             kind: WebActivityKind::ToolCall,
             executor: "kimi".to_string(),
             title: "Bash".to_string(),
             text: "cargo test".to_string(),
         })
         .unwrap();
+        let snapshot = serde_json::to_string(&WebStreamEvent::ActivitySnapshot {
+            text: "[kimi] Activity\nCommands:\n- `cargo test`".to_string(),
+        })
+        .unwrap();
 
         assert_eq!(
-            line,
+            activity,
             r#"{"type":"activity","kind":"tool_call","executor":"kimi","title":"Bash","text":"cargo test"}"#
+        );
+        assert_eq!(
+            snapshot,
+            r#"{"type":"activity_snapshot","text":"[kimi] Activity\nCommands:\n- `cargo test`"}"#
         );
     }
 
@@ -896,16 +920,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_stream_routes_agent_status_and_emits_ndjson() {
+    async fn message_stream_routes_agent_status_and_emits_compact_activity_snapshot() {
         let router = Arc::new(RecordingRouter::with_events(vec![
             RouterOutputEvent::ReplyChunk("hel".to_string()),
             RouterOutputEvent::ReplyChunk("lo".to_string()),
             RouterOutputEvent::ReplyBreak,
             RouterOutputEvent::Channel(RouterChannelEvent {
-                kind: RouterChannelEventKind::AgentProgress,
+                kind: RouterChannelEventKind::ToolCall,
                 executor: "kimi".to_string(),
-                title: "Progress".to_string(),
-                text: "working".to_string(),
+                title: "Bash".to_string(),
+                text: "$ cargo test\nexit: 0\nstatus: completed".to_string(),
             }),
             RouterOutputEvent::FinalReply("hello".to_string()),
         ]));
@@ -933,7 +957,7 @@ mod tests {
         assert_eq!(lines[3], r#"{"type":"reply_break"}"#);
         assert_eq!(
             lines[4],
-            r#"{"type":"activity","kind":"agent_progress","executor":"kimi","title":"Progress","text":"working"}"#
+            r#"{"type":"activity_snapshot","text":"[kimi] Activity\nCommands:\n- `cargo test`"}"#
         );
         assert_eq!(lines[5], r#"{"type":"final_reply","text":"hello"}"#);
         assert_eq!(lines[6], r#"{"type":"done"}"#);
@@ -948,6 +972,82 @@ mod tests {
             began[0].context_policy,
             ChannelContextPolicy::disabled(WEB_SOURCE)
         );
+    }
+
+    #[tokio::test]
+    async fn message_stream_verbose_channel_events_emit_raw_activity() {
+        let router = Arc::new(RecordingRouter::with_events(vec![
+            RouterOutputEvent::Channel(RouterChannelEvent {
+                kind: RouterChannelEventKind::AgentProgress,
+                executor: "kimi".to_string(),
+                title: "Progress".to_string(),
+                text: "working".to_string(),
+            }),
+            RouterOutputEvent::FinalReply("hello".to_string()),
+        ]));
+        let mut cfg = web_config(None);
+        cfg.channel_events = ChannelEventMode::Verbose;
+        let app = build_app(cfg, router);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/web/sessions/session_1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"run"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let lines = body.lines().collect::<Vec<_>>();
+        assert!(lines[0].starts_with(r#"{"type":"accepted","turn_id":"#));
+        assert_eq!(
+            lines[1],
+            r#"{"type":"activity","kind":"agent_progress","executor":"kimi","title":"Progress","text":"working"}"#
+        );
+        assert_eq!(lines[2], r#"{"type":"final_reply","text":"hello"}"#);
+        assert_eq!(lines[3], r#"{"type":"done"}"#);
+    }
+
+    #[tokio::test]
+    async fn message_stream_off_channel_events_emit_no_activity() {
+        let router = Arc::new(RecordingRouter::with_events(vec![
+            RouterOutputEvent::Channel(RouterChannelEvent {
+                kind: RouterChannelEventKind::ToolCall,
+                executor: "kimi".to_string(),
+                title: "Bash".to_string(),
+                text: "$ cargo test\nexit: 0\nstatus: completed".to_string(),
+            }),
+            RouterOutputEvent::FinalReply("hello".to_string()),
+        ]));
+        let mut cfg = web_config(None);
+        cfg.channel_events = ChannelEventMode::Off;
+        let app = build_app(cfg, router);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/web/sessions/session_1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"run"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let lines = body.lines().collect::<Vec<_>>();
+        assert!(lines[0].starts_with(r#"{"type":"accepted","turn_id":"#));
+        assert_eq!(lines[1], r#"{"type":"final_reply","text":"hello"}"#);
+        assert_eq!(lines[2], r#"{"type":"done"}"#);
     }
 
     #[tokio::test]
@@ -1016,6 +1116,7 @@ mod tests {
         let mut output = NdjsonOutputSink {
             tx,
             channel_events: ChannelEventMode::Compact,
+            activity_events: Vec::new(),
         };
 
         let err = route_web_text(
