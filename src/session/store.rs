@@ -311,6 +311,15 @@ impl WorkspaceSessionStore {
         }
         Ok(restored)
     }
+
+    async fn cache_loaded_state(&self, session_key: &str, loaded: SessionState) -> SessionState {
+        let mut guard = self.inner.write().await;
+        if let Some(cached) = guard.get(session_key).cloned() {
+            return cached;
+        }
+        guard.insert(session_key.to_string(), loaded.clone());
+        loaded
+    }
 }
 
 fn validate_persisted_executor_cwd(
@@ -352,11 +361,7 @@ impl SessionStore for WorkspaceSessionStore {
         else {
             return Ok(None);
         };
-        self.inner
-            .write()
-            .await
-            .insert(session_key.to_string(), state.clone());
-        Ok(Some(state))
+        Ok(Some(self.cache_loaded_state(session_key, state).await))
     }
 
     async fn load_or_create(
@@ -933,6 +938,23 @@ mod tests {
         let reloaded = store.load_or_create("web:s1", "kimi").await.unwrap();
 
         assert_eq!(reloaded.active_executor.as_deref(), Some("codex"));
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_load_does_not_overwrite_newer_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let mut stale = SessionState::new("web:s1", "kimi");
+        stale.transcript.push(TranscriptMessage::user("old"));
+        let mut fresh = SessionState::new("web:s1", "kimi");
+        fresh.transcript.push(TranscriptMessage::user("new"));
+        store.save_runtime(fresh.clone()).await.unwrap();
+
+        let loaded = store.cache_loaded_state("web:s1", stale).await;
+        let cached = store.load("web:s1").await.unwrap().unwrap();
+
+        assert_eq!(loaded.transcript[0].content, "new");
+        assert_eq!(cached.transcript[0].content, "new");
     }
 
     #[tokio::test]
