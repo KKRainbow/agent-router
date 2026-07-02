@@ -2870,7 +2870,13 @@ where
     async fn session_state(&self, session_key: &str) -> anyhow::Result<Option<SessionState>> {
         let lock = self.session_lock(session_key).await;
         let _guard = lock.lock().await;
-        self.store.load(session_key).await
+        let Some(mut state) = self.store.load(session_key).await? else {
+            return Ok(None);
+        };
+        if self.normalize_reserved_active_executor(&mut state) {
+            self.store.save(state.clone()).await?;
+        }
+        Ok(Some(state))
     }
 
     async fn sync_context(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
@@ -3216,7 +3222,7 @@ mod tests {
                 ContextFileInput, ContextSyncIssueInput,
             },
             projection::message_fingerprint,
-            store::{InMemorySessionStore, WorkspaceSessionStore},
+            store::{ConfiguredExecutor, InMemorySessionStore, WorkspaceSessionStore},
         },
     };
     use serde_json::json;
@@ -3224,6 +3230,16 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         time::Duration,
     };
+
+    fn test_session_executors(
+        protocol: &str,
+        names: impl IntoIterator<Item = &'static str>,
+    ) -> BTreeMap<String, ConfiguredExecutor> {
+        names
+            .into_iter()
+            .map(|name| (name.to_string(), ConfiguredExecutor::new(protocol, "local")))
+            .collect()
+    }
 
     #[derive(Debug, Default)]
     struct SlashCommandExecutorBackend {
@@ -4503,7 +4519,7 @@ mod tests {
     async fn workspace_session_store_restores_transcript_binding_and_seen_context() {
         let tmp = tempfile::tempdir().unwrap();
         let session_key = "slack:C1:T1";
-        let executors = BTreeSet::from(["kimi".to_string()]);
+        let executors = test_session_executors("fake", ["kimi"]);
         let store = Arc::new(WorkspaceSessionStore::new(
             tmp.path(),
             "kimi",
@@ -4578,11 +4594,7 @@ mod tests {
     async fn workspace_session_store_does_not_persist_handoff_before_turn_commit() {
         let tmp = tempfile::tempdir().unwrap();
         let session_key = "slack:dm:D1:111.000";
-        let executors = BTreeSet::from([
-            "kimi".to_string(),
-            "codex".to_string(),
-            "route-planner".to_string(),
-        ]);
+        let executors = test_session_executors("test", ["kimi", "codex"]);
         let store = Arc::new(WorkspaceSessionStore::new(
             tmp.path(),
             "kimi",
@@ -4661,7 +4673,7 @@ mod tests {
         let store = Arc::new(WorkspaceSessionStore::new(
             tmp.path(),
             "kimi",
-            BTreeSet::from(["kimi".to_string(), "codex".to_string()]),
+            test_session_executors("fake", ["kimi", "codex"]),
         ));
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(None);
@@ -4713,11 +4725,7 @@ mod tests {
         let store = Arc::new(WorkspaceSessionStore::new(
             tmp.path(),
             "kimi",
-            BTreeSet::from([
-                "kimi".to_string(),
-                "codex".to_string(),
-                "route-planner".to_string(),
-            ]),
+            test_session_executors("test", ["kimi", "codex"]),
         ));
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));
@@ -5133,6 +5141,28 @@ mod tests {
         let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.routing_mode, AgentRoutingMode::Auto);
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+    }
+
+    #[tokio::test]
+    async fn session_state_clears_reserved_orchestrator_active_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let session_key = "slack:dm:D1:111.000";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.routing_mode = AgentRoutingMode::Manual;
+        state.set_active_executor(Some("route-planner".to_string()));
+        store.save(state).await.unwrap();
+        let executor = Arc::new(OrchestratorTestBackend::new(r#"{"action":"stay"}"#));
+        let router = AgentRouter::new("kimi", store.clone(), executor).with_orchestrator(Some(
+            test_orchestrator_settings(write_orchestrator_policy(&tmp)),
+        ));
+
+        let state = router.session_state(session_key).await.unwrap().unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
+
+        assert_eq!(state.routing_mode, AgentRoutingMode::Auto);
+        assert_eq!(state.active_executor, None);
+        assert_eq!(saved.active_executor, None);
     }
 
     #[tokio::test]
