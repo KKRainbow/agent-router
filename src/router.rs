@@ -634,9 +634,9 @@ where
                 tracing::warn!(
                     session_key = %request.session_key,
                     error = %err,
-                    "could not load session approval override"
+                    "could not load session approval override; requiring explicit approval"
                 );
-                self.default_mode
+                return None;
             }
         };
         if effective_mode != ApprovalMode::Yolo {
@@ -1073,6 +1073,14 @@ where
             return;
         }
         state.set_active_executor(failure_active_executor.clone());
+        if let Err(err) = self.store.save_runtime(state.clone()).await {
+            tracing::warn!(
+                session_key,
+                error = %err,
+                "could not update runtime route failure rollback"
+            );
+            return;
+        }
         if let Err(err) = self.store.save(state).await {
             tracing::warn!(
                 session_key,
@@ -4645,6 +4653,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_failure_rollback_updates_runtime_cache_when_durable_save_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_key = "slack:dm:D1:111.000";
+        let store = Arc::new(WorkspaceSessionStore::new(
+            tmp.path(),
+            "kimi",
+            BTreeSet::from(["kimi".to_string(), "codex".to_string()]),
+        ));
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(None);
+        store.save(state.clone()).await.unwrap();
+        state.set_active_executor(Some("codex".to_string()));
+        let route_active_executor_revision = state.active_executor_revision;
+        store.save_runtime(state).await.unwrap();
+
+        let snapshot_path = tmp
+            .path()
+            .join(session_workspace_dir_name(session_key))
+            .join(".agent-router")
+            .join("session.json");
+        std::fs::remove_file(&snapshot_path).unwrap();
+        std::fs::create_dir(&snapshot_path).unwrap();
+
+        let router = AgentRouter::new(
+            "kimi",
+            store.clone(),
+            Arc::new(FakeExecutorBackend::default()),
+        )
+        .with_workspace_root(Some(tmp.path().to_path_buf()));
+        router
+            .restore_active_executor_after_failed_route(
+                session_key,
+                InitialRouteSource::OrchestratorHandoff,
+                route_active_executor_revision,
+                &None,
+                99,
+                &TurnCancellation::default(),
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .load(session_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .active_executor,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn orchestrator_handoff_routes_initial_message_to_target_once() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySessionStore::default());
@@ -6100,6 +6160,55 @@ mod tests {
 
         assert_eq!(selection, Some(ApprovalSelection::Cancelled));
         assert!(store.load("slack:dm:D1:111.000").await.unwrap().is_none());
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingLoadSessionStore;
+
+    #[async_trait::async_trait]
+    impl SessionStore for FailingLoadSessionStore {
+        async fn load(&self, _session_key: &str) -> anyhow::Result<Option<SessionState>> {
+            anyhow::bail!("corrupt snapshot")
+        }
+
+        async fn load_or_create(
+            &self,
+            _session_key: &str,
+            _default_executor: &str,
+        ) -> anyhow::Result<SessionState> {
+            anyhow::bail!("corrupt snapshot")
+        }
+
+        async fn save(&self, _state: SessionState) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_approval_policy_load_error_does_not_auto_approve() {
+        let policy = SessionApprovalPolicy::new(
+            "kimi",
+            ApprovalMode::Yolo,
+            Arc::new(FailingLoadSessionStore),
+        );
+
+        let selection = policy
+            .auto_selection(&ApprovalRequest {
+                session_key: "slack:dm:D1:111.000".to_string(),
+                executor: "kimi".to_string(),
+                requester_user_id: Some("U1".to_string()),
+                title: "Run command".to_string(),
+                body: "$ cargo test".to_string(),
+                options: vec![ApprovalOption {
+                    id: "allow_once".to_string(),
+                    kind: "allow_once".to_string(),
+                    name: "Allow once".to_string(),
+                    auto_approvable: true,
+                }],
+            })
+            .await;
+
+        assert_eq!(selection, None);
     }
 
     #[tokio::test]

@@ -164,7 +164,11 @@ impl WorkspaceSessionStore {
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let snapshot: SessionSnapshot = serde_json::from_str(&text).map_err(|err| {
+                let raw_snapshot: RawSessionSnapshot =
+                    serde_json::from_str(&text).map_err(|err| {
+                        anyhow::anyhow!("parse session snapshot {}: {err}", path.display())
+                    })?;
+                let snapshot = SessionSnapshot::try_from(raw_snapshot).map_err(|err| {
                     anyhow::anyhow!("parse session snapshot {}: {err}", path.display())
                 })?;
                 validate_snapshot(&snapshot, session_key, &path)?;
@@ -333,7 +337,7 @@ impl SessionStore for WorkspaceSessionStore {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 struct SessionSnapshot {
     schema_version: u32,
     session_key: String,
@@ -345,6 +349,43 @@ struct SessionSnapshot {
     updated_at_ms: u64,
     transcript: Vec<TranscriptMessage>,
     executor_bindings: BTreeMap<String, PersistedExecutorBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSessionSnapshot {
+    schema_version: u32,
+    session_key: String,
+    default_executor: String,
+    active_executor: serde_json::Value,
+    #[serde(default)]
+    routing_mode: AgentRoutingMode,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    transcript: Vec<TranscriptMessage>,
+    executor_bindings: BTreeMap<String, PersistedExecutorBinding>,
+}
+
+impl TryFrom<RawSessionSnapshot> for SessionSnapshot {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: RawSessionSnapshot) -> anyhow::Result<Self> {
+        let active_executor = match raw.active_executor {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(executor) => Some(executor),
+            other => anyhow::bail!("active_executor must be a string or null, got {}", other),
+        };
+        Ok(Self {
+            schema_version: raw.schema_version,
+            session_key: raw.session_key,
+            default_executor: raw.default_executor,
+            active_executor,
+            routing_mode: raw.routing_mode,
+            created_at_ms: raw.created_at_ms,
+            updated_at_ms: raw.updated_at_ms,
+            transcript: raw.transcript,
+            executor_bindings: raw.executor_bindings,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -720,6 +761,32 @@ mod tests {
         let err = store.load("web:s1").await.unwrap_err();
 
         assert!(err.to_string().contains("belongs to `web:other`"));
+    }
+
+    #[tokio::test]
+    async fn missing_required_active_executor_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let path = store.snapshot_path("web:s1");
+        ensure_dir_path_without_symlinks(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "session_key": "web:s1",
+                "default_executor": "kimi",
+                "created_at_ms": 1,
+                "updated_at_ms": 2,
+                "transcript": [],
+                "executor_bindings": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = store.load("web:s1").await.unwrap_err();
+
+        assert!(err.to_string().contains("active_executor"));
     }
 
     #[cfg(unix)]
