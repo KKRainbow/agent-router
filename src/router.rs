@@ -4524,6 +4524,7 @@ mod tests {
             tmp.path(),
             "kimi",
             executors.clone(),
+            BTreeSet::new(),
         ));
         let executor = Arc::new(FakeExecutorBackend::default());
         let router = AgentRouter::new("kimi", store, executor)
@@ -4542,7 +4543,12 @@ mod tests {
             .await
             .unwrap();
 
-        let restarted_store = Arc::new(WorkspaceSessionStore::new(tmp.path(), "kimi", executors));
+        let restarted_store = Arc::new(WorkspaceSessionStore::new(
+            tmp.path(),
+            "kimi",
+            executors,
+            BTreeSet::new(),
+        ));
         let restarted_executor = Arc::new(FakeExecutorBackend::default());
         let restarted_router =
             AgentRouter::new("kimi", restarted_store.clone(), restarted_executor.clone())
@@ -4599,6 +4605,7 @@ mod tests {
             tmp.path(),
             "kimi",
             executors.clone(),
+            BTreeSet::from(["route-planner".to_string()]),
         ));
         let executor = Arc::new(OrchestratorTestBackend::new(
             r#"{"action":"handoff","executor":"codex","reason":"code work"}"#,
@@ -4618,7 +4625,12 @@ mod tests {
                 let executors = hook_executors.clone();
                 let session_key = hook_session_key.clone();
                 let active_executor = std::thread::spawn(move || {
-                    let store = WorkspaceSessionStore::new(root, "kimi", executors);
+                    let store = WorkspaceSessionStore::new(
+                        root,
+                        "kimi",
+                        executors,
+                        BTreeSet::from(["route-planner".to_string()]),
+                    );
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -4653,7 +4665,12 @@ mod tests {
             observed_active_executor.lock().unwrap().as_ref(),
             Some(&None)
         );
-        let restarted_store = WorkspaceSessionStore::new(tmp.path(), "kimi", executors);
+        let restarted_store = WorkspaceSessionStore::new(
+            tmp.path(),
+            "kimi",
+            executors,
+            BTreeSet::from(["route-planner".to_string()]),
+        );
         assert_eq!(
             restarted_store
                 .load(session_key)
@@ -4674,6 +4691,7 @@ mod tests {
             tmp.path(),
             "kimi",
             test_session_executors("fake", ["kimi", "codex"]),
+            BTreeSet::new(),
         ));
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(None);
@@ -4726,6 +4744,7 @@ mod tests {
             tmp.path(),
             "kimi",
             test_session_executors("test", ["kimi", "codex"]),
+            BTreeSet::from(["route-planner".to_string()]),
         ));
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));

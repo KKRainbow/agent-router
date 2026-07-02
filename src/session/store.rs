@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::machine::session_workspace_dir_name;
+use crate::machine::{LOCAL_MACHINE_ID, session_workspace_dir_name};
 
 use super::{
     AgentRoutingMode, ExecutorBinding, ExecutorHealth, SessionState, TranscriptMessage, now_ms,
@@ -90,12 +90,14 @@ impl ProductionSessionStore {
         workspace_root: Option<PathBuf>,
         default_executor: String,
         configured_executors: BTreeMap<String, ConfiguredExecutor>,
+        reserved_executors: BTreeSet<String>,
     ) -> Self {
         match workspace_root {
             Some(root) => Self::Workspace(WorkspaceSessionStore::new(
                 root,
                 default_executor,
                 configured_executors,
+                reserved_executors,
             )),
             None => Self::InMemory(InMemorySessionStore::default()),
         }
@@ -142,6 +144,7 @@ pub struct WorkspaceSessionStore {
     workspace_root: PathBuf,
     default_executor: String,
     configured_executors: BTreeMap<String, ConfiguredExecutor>,
+    reserved_executors: BTreeSet<String>,
     inner: Arc<RwLock<HashMap<String, SessionState>>>,
 }
 
@@ -150,12 +153,14 @@ impl WorkspaceSessionStore {
         workspace_root: impl Into<PathBuf>,
         default_executor: impl Into<String>,
         configured_executors: BTreeMap<String, ConfiguredExecutor>,
+        reserved_executors: BTreeSet<String>,
     ) -> Self {
         let default_executor = default_executor.into();
         Self {
             workspace_root: workspace_root.into(),
             default_executor,
             configured_executors,
+            reserved_executors,
             inner: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -220,6 +225,14 @@ impl WorkspaceSessionStore {
         };
         let active_executor = match snapshot.active_executor {
             Some(executor) if self.configured_executors.contains_key(&executor) => Some(executor),
+            Some(executor) if self.reserved_executors.contains(&executor) => {
+                tracing::warn!(
+                    session_key,
+                    persisted_active_executor = %executor,
+                    "persisted active executor is reserved for router control; clearing selection"
+                );
+                None
+            }
             Some(executor) => {
                 tracing::warn!(
                     session_key,
@@ -244,7 +257,7 @@ impl WorkspaceSessionStore {
             context_artifacts: Vec::new(),
             machine_workspaces: BTreeMap::new(),
             executor_bindings: self
-                .restore_executor_bindings(session_key, snapshot.executor_bindings),
+                .restore_executor_bindings(session_key, snapshot.executor_bindings)?,
         })
     }
 
@@ -252,46 +265,77 @@ impl WorkspaceSessionStore {
         &self,
         session_key: &str,
         bindings: BTreeMap<String, PersistedExecutorBinding>,
-    ) -> BTreeMap<String, ExecutorBinding> {
-        bindings
-            .into_iter()
-            .filter_map(|(executor, binding)| {
-                let Some(configured) = self.configured_executors.get(&executor) else {
-                    tracing::warn!(
-                        session_key,
-                        executor,
-                        "persisted executor binding is no longer configured; dropping binding"
-                    );
-                    return None;
-                };
-                if binding.protocol != configured.protocol
-                    || binding.machine_id.as_deref() != Some(configured.machine_id.as_str())
-                {
-                    tracing::warn!(
-                        session_key,
-                        executor,
-                        persisted_protocol = %binding.protocol,
-                        configured_protocol = %configured.protocol,
-                        persisted_machine_id = ?binding.machine_id,
-                        configured_machine_id = %configured.machine_id,
-                        "persisted executor binding no longer matches configured executor; dropping binding"
-                    );
-                    return None;
-                }
-                Some((
+    ) -> anyhow::Result<BTreeMap<String, ExecutorBinding>> {
+        let mut restored = BTreeMap::new();
+        for (executor, binding) in bindings {
+            let Some(configured) = self.configured_executors.get(&executor) else {
+                tracing::warn!(
+                    session_key,
                     executor,
-                    ExecutorBinding {
-                        protocol: binding.protocol,
-                        machine_id: binding.machine_id,
-                        external_session_id: binding.external_session_id,
-                        cwd: binding.cwd,
-                        health: ExecutorHealth::Unknown,
-                        seen_context: binding.seen_context,
-                        metadata: BTreeMap::new(),
-                    },
-                ))
-            })
-            .collect()
+                    "persisted executor binding is no longer configured; dropping binding"
+                );
+                continue;
+            };
+            if binding.protocol != configured.protocol
+                || binding.machine_id.as_deref() != Some(configured.machine_id.as_str())
+            {
+                tracing::warn!(
+                    session_key,
+                    executor,
+                    persisted_protocol = %binding.protocol,
+                    configured_protocol = %configured.protocol,
+                    persisted_machine_id = ?binding.machine_id,
+                    configured_machine_id = %configured.machine_id,
+                    "persisted executor binding no longer matches configured executor; dropping binding"
+                );
+                continue;
+            }
+            let cwd = validate_persisted_executor_cwd(
+                session_key,
+                &executor,
+                &configured.machine_id,
+                binding.cwd,
+            )?;
+            restored.insert(
+                executor,
+                ExecutorBinding {
+                    protocol: binding.protocol,
+                    machine_id: binding.machine_id,
+                    external_session_id: binding.external_session_id,
+                    cwd,
+                    health: ExecutorHealth::Unknown,
+                    seen_context: binding.seen_context,
+                    metadata: BTreeMap::new(),
+                },
+            );
+        }
+        Ok(restored)
+    }
+}
+
+fn validate_persisted_executor_cwd(
+    session_key: &str,
+    executor: &str,
+    machine_id: &str,
+    cwd: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    if machine_id != LOCAL_MACHINE_ID {
+        return Ok(Some(cwd));
+    }
+    match existing_dir_path_without_symlinks(Path::new(&cwd))? {
+        true => Ok(Some(cwd)),
+        false => {
+            tracing::warn!(
+                session_key,
+                executor,
+                cwd,
+                "persisted local executor cwd no longer exists; clearing binding cwd"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -555,6 +599,50 @@ fn existing_file_path_without_symlinks(path: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+fn existing_dir_path_without_symlinks(path: &Path) -> anyhow::Result<bool> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                anyhow::bail!(
+                    "session executor cwd must not contain parent components: {}",
+                    path.display()
+                );
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata_is_symlink_or_reparse(&metadata) => {
+                        anyhow::bail!(
+                            "session executor cwd component is a symlink: {}",
+                            current.display()
+                        );
+                    }
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        anyhow::bail!(
+                            "session executor cwd component is not a directory: {}",
+                            current.display()
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "stat session executor cwd component {}: {}",
+                            current.display(),
+                            err
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn read_snapshot_text(path: &Path) -> std::io::Result<String> {
     let mut file = open_snapshot_file(path)?;
     let opened_metadata = file.metadata()?;
@@ -770,7 +858,24 @@ mod tests {
     }
 
     fn make_store(root: &Path) -> WorkspaceSessionStore {
-        WorkspaceSessionStore::new(root, "kimi", configured_executors(&["kimi", "codex"]))
+        WorkspaceSessionStore::new(
+            root,
+            "kimi",
+            configured_executors(&["kimi", "codex"]),
+            BTreeSet::new(),
+        )
+    }
+
+    fn make_store_with_reserved(root: &Path, reserved: &[&str]) -> WorkspaceSessionStore {
+        WorkspaceSessionStore::new(
+            root,
+            "kimi",
+            configured_executors(&["kimi", "codex"]),
+            reserved
+                .iter()
+                .map(|executor| (*executor).to_string())
+                .collect(),
+        )
     }
 
     #[tokio::test]
@@ -792,7 +897,7 @@ mod tests {
                 protocol: "app_server".to_string(),
                 machine_id: Some("local".to_string()),
                 external_session_id: Some("ext-1".to_string()),
-                cwd: Some("/tmp/session".to_string()),
+                cwd: Some(tmp.path().display().to_string()),
                 health: ExecutorHealth::Healthy,
                 seen_context: vec!["seen-1".to_string()],
                 metadata: BTreeMap::from([("secret".to_string(), json!("not persisted"))]),
@@ -810,6 +915,7 @@ mod tests {
         assert_eq!(reloaded.transcript[1].content, "done");
         let binding = reloaded.executor_bindings.get("codex").unwrap();
         assert_eq!(binding.external_session_id.as_deref(), Some("ext-1"));
+        assert_eq!(binding.cwd.as_deref(), Some(tmp.path().to_str().unwrap()));
         assert_eq!(binding.seen_context, ["seen-1"]);
         assert_eq!(binding.health, ExecutorHealth::Unknown);
         assert!(binding.metadata.is_empty());
@@ -995,6 +1101,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_active_executor_is_cleared_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store_with_reserved(tmp.path(), &["route-planner"]);
+        let path = store.snapshot_path("web:s1");
+        ensure_dir_path_without_symlinks(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "session_key": "web:s1",
+                "default_executor": "kimi",
+                "active_executor": "route-planner",
+                "created_at_ms": 1,
+                "updated_at_ms": 2,
+                "transcript": [],
+                "executor_bindings": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = store.load("web:s1").await.unwrap().unwrap();
+
+        assert_eq!(state.active_executor, None);
+    }
+
+    #[tokio::test]
     async fn incompatible_executor_binding_is_dropped_on_load() {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
@@ -1022,10 +1155,44 @@ mod tests {
                 ),
                 ("codex".to_string(), ConfiguredExecutor::new("acp", "local")),
             ]),
+            BTreeSet::new(),
         );
 
         let state = restarted.load("web:s1").await.unwrap().unwrap();
 
         assert!(!state.executor_bindings.contains_key("codex"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_local_executor_cwd_is_rejected_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let real_cwd = tmp.path().join("real-cwd");
+        let linked_cwd = tmp.path().join("linked-cwd");
+        std::fs::create_dir(&real_cwd).unwrap();
+        std::os::unix::fs::symlink(&real_cwd, &linked_cwd).unwrap();
+        let mut state = SessionState::new("web:s1", "kimi");
+        state.executor_bindings.insert(
+            "codex".to_string(),
+            ExecutorBinding {
+                protocol: "app_server".to_string(),
+                machine_id: Some("local".to_string()),
+                external_session_id: Some("ext-1".to_string()),
+                cwd: Some(linked_cwd.display().to_string()),
+                health: ExecutorHealth::Healthy,
+                seen_context: Vec::new(),
+                metadata: BTreeMap::new(),
+            },
+        );
+        store.save(state).await.unwrap();
+        let restarted = make_store(tmp.path());
+
+        let err = restarted.load("web:s1").await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("executor cwd component is a symlink")
+        );
     }
 }

@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use agent_router::{
     approval::ApprovalBroker,
@@ -56,15 +61,18 @@ async fn main() -> anyhow::Result<()> {
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let mut reserved_executors = BTreeSet::new();
     if let Some(orchestrator) = &config.router.orchestrator
         && orchestrator.enabled
     {
         session_executors.remove(&orchestrator.executor);
+        reserved_executors.insert(orchestrator.executor.clone());
     }
     let store = Arc::new(ProductionSessionStore::new(
         config.workspace.root.clone(),
         config.router.default_executor.clone(),
         session_executors,
+        reserved_executors,
     ));
     let mut approval_policy = SessionApprovalPolicy::new(
         config.router.default_executor.clone(),
