@@ -28,6 +28,9 @@ pub trait SessionStore: Send + Sync + 'static {
         default_executor: &str,
     ) -> anyhow::Result<SessionState>;
     async fn save(&self, state: SessionState) -> anyhow::Result<()>;
+    async fn save_runtime(&self, state: SessionState) -> anyhow::Result<()> {
+        self.save(state).await
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -110,6 +113,13 @@ impl SessionStore for ProductionSessionStore {
             Self::Workspace(store) => store.save(state).await,
         }
     }
+
+    async fn save_runtime(&self, state: SessionState) -> anyhow::Result<()> {
+        match self {
+            Self::InMemory(store) => store.save_runtime(state).await,
+            Self::Workspace(store) => store.save_runtime(state).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +159,9 @@ impl WorkspaceSessionStore {
 
     fn read_snapshot(&self, session_key: &str) -> anyhow::Result<Option<SessionSnapshot>> {
         let path = self.snapshot_path(session_key);
+        if !existing_file_path_without_symlinks(&path)? {
+            return Ok(None);
+        }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let snapshot: SessionSnapshot = serde_json::from_str(&text).map_err(|err| {
@@ -310,6 +323,14 @@ impl SessionStore for WorkspaceSessionStore {
             .insert(cache_state.session_key.clone(), cache_state);
         Ok(())
     }
+
+    async fn save_runtime(&self, state: SessionState) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .await
+            .insert(state.session_key.clone(), state);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -386,22 +407,101 @@ fn write_snapshot_atomically(path: &Path, snapshot: &SessionSnapshot) -> anyhow:
             anyhow::anyhow!("flush session snapshot {}: {err}", temp_path.display())
         })?;
     }
-    match std::fs::rename(&temp_path, path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(path).map_err(|remove_err| {
-                anyhow::anyhow!("replace session snapshot {}: {remove_err}", path.display())
-            })?;
-            std::fs::rename(&temp_path, path).map_err(|rename_err| {
-                anyhow::anyhow!("replace session snapshot {}: {rename_err}", path.display())
-            })
-        }
-        Err(err) => Err(anyhow::anyhow!(
-            "replace session snapshot {}: {}",
-            path.display(),
-            err
-        )),
+    replace_file_atomically(&temp_path, path)
+        .map_err(|err| anyhow::anyhow!("replace session snapshot {}: {err}", path.display()))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&temp_path);
+        })
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
     }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain([0]).collect()
+    }
+
+    let source = wide(source);
+    let destination = wide(destination);
+    let ok = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn existing_file_path_without_symlinks(path: &Path) -> anyhow::Result<bool> {
+    let mut current = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let is_final = components.peek().is_none();
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                anyhow::bail!(
+                    "session snapshot path must not contain parent components: {}",
+                    path.display()
+                );
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        anyhow::bail!(
+                            "session snapshot path component is a symlink: {}",
+                            current.display()
+                        );
+                    }
+                    Ok(metadata) if is_final && metadata.is_file() => {}
+                    Ok(metadata) if !is_final && metadata.is_dir() => {}
+                    Ok(_) if is_final => {
+                        anyhow::bail!("session snapshot path is not a file: {}", current.display());
+                    }
+                    Ok(_) => {
+                        anyhow::bail!(
+                            "session snapshot path component is not a directory: {}",
+                            current.display()
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "stat session snapshot path component {}: {}",
+                            current.display(),
+                            err
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
@@ -620,6 +720,37 @@ mod tests {
         let err = store.load("web:s1").await.unwrap_err();
 
         assert!(err.to_string().contains("belongs to `web:other`"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_metadata_path_is_rejected_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let session_dir = store.session_dir("web:s1");
+        ensure_dir_path_without_symlinks(&session_dir).unwrap();
+        let external = tmp.path().join("external-metadata");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            external.join(SESSION_SNAPSHOT_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "session_key": "web:s1",
+                "default_executor": "kimi",
+                "active_executor": "kimi",
+                "created_at_ms": 1,
+                "updated_at_ms": 2,
+                "transcript": [],
+                "executor_bindings": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&external, session_dir.join(ROUTER_METADATA_DIR)).unwrap();
+
+        let err = store.load("web:s1").await.unwrap_err();
+
+        assert!(err.to_string().contains("is a symlink"));
     }
 
     #[tokio::test]

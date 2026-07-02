@@ -787,7 +787,7 @@ impl PreparedContextSync {
     {
         let records = self.plan.commit()?;
         self.state.context_artifacts = records;
-        store.save(self.state).await?;
+        store.save_runtime(self.state).await?;
         tracing::info!(
             session_key = %self.session_key,
             source = %self.source,
@@ -830,11 +830,11 @@ impl PreparedContextSync {
         let old_state = self.state.clone();
         let records = installed.records().to_vec();
         self.state.context_artifacts = records;
-        store.save(self.state).await?;
+        store.save_runtime(self.state).await?;
         hook(ContextCommitCheckpoint::AfterStateSave).await;
         if !turn.is_context_commit_allowed().await {
             drop(installed);
-            store.save(old_state).await?;
+            store.save_runtime(old_state).await?;
             return Ok(false);
         }
         installed.finish();
@@ -2059,7 +2059,7 @@ Current user message:\n{}",
                 replaced = begun.interrupted;
                 begun.guard
             };
-            self.store.save(state.clone()).await?;
+            self.store.save_runtime(state.clone()).await?;
             if let Some(context) = context {
                 let prepared = match self.prepare_context_sync_locked(context).await {
                     Ok(prepared) => prepared,
@@ -2073,7 +2073,7 @@ Current user message:\n{}",
                             &route_selection.failure_active_executor,
                             superseded,
                         );
-                        self.store.save(state).await?;
+                        self.store.save_runtime(state).await?;
                         let _ = turn.abandon_if_current().await;
                         return Err(err);
                     }
@@ -2092,7 +2092,7 @@ Current user message:\n{}",
                                     &route_selection.failure_active_executor,
                                     superseded,
                                 );
-                                self.store.save(state).await?;
+                                self.store.save_runtime(state).await?;
                                 let _ = turn.abandon_if_current().await;
                                 return Err(err);
                             }
@@ -2105,7 +2105,7 @@ Current user message:\n{}",
                             &route_selection.failure_active_executor,
                             route_was_superseded_by_new_message(&turn.cancellation()).await,
                         );
-                        self.store.save(state).await?;
+                        self.store.save_runtime(state).await?;
                         tracing::debug!(
                             session_key = %session_key,
                             generation = turn.log_generation(),
@@ -4561,6 +4561,86 @@ mod tests {
                 .unwrap()
                 .seen_context
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_session_store_does_not_persist_handoff_before_turn_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_key = "slack:dm:D1:111.000";
+        let executors = BTreeSet::from([
+            "kimi".to_string(),
+            "codex".to_string(),
+            "route-planner".to_string(),
+        ]);
+        let store = Arc::new(WorkspaceSessionStore::new(
+            tmp.path(),
+            "kimi",
+            executors.clone(),
+        ));
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"codex","reason":"code work"}"#,
+        ));
+        let observed_active_executor = Arc::new(std::sync::Mutex::new(None));
+        let hook_observed_active_executor = observed_active_executor.clone();
+        let hook_root = tmp.path().to_path_buf();
+        let hook_executors = executors.clone();
+        let hook_session_key = session_key.to_string();
+        let router = AgentRouter::new("kimi", store.clone(), executor)
+            .with_orchestrator(Some(test_orchestrator_settings(write_orchestrator_policy(
+                &tmp,
+            ))))
+            .with_workspace_root(Some(tmp.path().to_path_buf()))
+            .with_before_handoff_notice_hook(Arc::new(move || {
+                let root = hook_root.clone();
+                let executors = hook_executors.clone();
+                let session_key = hook_session_key.clone();
+                let active_executor = std::thread::spawn(move || {
+                    let store = WorkspaceSessionStore::new(root, "kimi", executors);
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            store
+                                .load(&session_key)
+                                .await
+                                .unwrap()
+                                .and_then(|state| state.active_executor)
+                        })
+                })
+                .join()
+                .unwrap();
+                *hook_observed_active_executor.lock().unwrap() = Some(active_executor);
+            }));
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "please edit this repo".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            observed_active_executor.lock().unwrap().as_ref(),
+            Some(&None)
+        );
+        let restarted_store = WorkspaceSessionStore::new(tmp.path(), "kimi", executors);
+        assert_eq!(
+            restarted_store
+                .load(session_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .active_executor
+                .as_deref(),
+            Some("codex")
         );
     }
 
