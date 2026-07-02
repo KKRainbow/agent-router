@@ -429,33 +429,6 @@ fn validate_snapshot(
 
 fn write_snapshot_atomically(path: &Path, snapshot: &SessionSnapshot) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(snapshot)?;
-    let temp_path = unique_snapshot_temp_path(path)?;
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(|err| {
-                anyhow::anyhow!("create session snapshot {}: {err}", temp_path.display())
-            })?;
-        file.write_all(&bytes).map_err(|err| {
-            anyhow::anyhow!("write session snapshot {}: {err}", temp_path.display())
-        })?;
-        file.write_all(b"\n").map_err(|err| {
-            anyhow::anyhow!("write session snapshot {}: {err}", temp_path.display())
-        })?;
-        file.sync_all().map_err(|err| {
-            anyhow::anyhow!("flush session snapshot {}: {err}", temp_path.display())
-        })?;
-    }
-    replace_file_atomically(&temp_path, path)
-        .map_err(|err| anyhow::anyhow!("replace session snapshot {}: {err}", path.display()))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&temp_path);
-        })
-}
-
-fn unique_snapshot_temp_path(path: &Path) -> anyhow::Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!("session snapshot path has no parent: {}", path.display())
     })?;
@@ -463,56 +436,28 @@ fn unique_snapshot_temp_path(path: &Path) -> anyhow::Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(SESSION_SNAPSHOT_FILE);
-    for _ in 0..16 {
-        let candidate = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "create temporary session snapshot in {}: {err}",
+                parent.display()
+            )
+        })?;
+    {
+        let file = temp.as_file_mut();
+        file.write_all(&bytes)
+            .map_err(|err| anyhow::anyhow!("write session snapshot {}: {err}", path.display()))?;
+        file.write_all(b"\n")
+            .map_err(|err| anyhow::anyhow!("write session snapshot {}: {err}", path.display()))?;
+        file.sync_all()
+            .map_err(|err| anyhow::anyhow!("flush session snapshot {}: {err}", path.display()))?;
     }
-    anyhow::bail!(
-        "could not allocate unique session snapshot temp file in {}",
-        parent.display()
-    )
-}
-
-#[cfg(not(windows))]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(
-            lpExistingFileName: *const u16,
-            lpNewFileName: *const u16,
-            dwFlags: u32,
-        ) -> i32;
-    }
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain([0]).collect()
-    }
-
-    let source = wide(source);
-    let destination = wide(destination);
-    let ok = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    temp.persist(path)
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("replace session snapshot {}: {err}", path.display()))
 }
 
 fn existing_file_path_without_symlinks(path: &Path) -> anyhow::Result<bool> {
@@ -568,6 +513,12 @@ fn existing_file_path_without_symlinks(path: &Path) -> anyhow::Result<bool> {
 fn read_snapshot_text(path: &Path) -> std::io::Result<String> {
     let mut file = open_snapshot_file(path)?;
     let opened_metadata = file.metadata()?;
+    if metadata_is_symlink_or_reparse(&opened_metadata) {
+        return Err(std::io::Error::other(format!(
+            "session snapshot path component is a symlink: {}",
+            path.display()
+        )));
+    }
     let mut text = String::new();
     file.read_to_string(&mut text)?;
     match existing_file_path_without_symlinks(path) {
@@ -581,7 +532,7 @@ fn read_snapshot_text(path: &Path) -> std::io::Result<String> {
         Err(err) => return Err(std::io::Error::other(err)),
     }
     let current_metadata = std::fs::symlink_metadata(path)?;
-    ensure_same_snapshot_file(&opened_metadata, &current_metadata, path)?;
+    ensure_same_snapshot_file(file, &opened_metadata, &current_metadata, path)?;
     Ok(text)
 }
 
@@ -626,6 +577,7 @@ fn open_snapshot_file(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(unix)]
 fn ensure_same_snapshot_file(
+    _opened_file: std::fs::File,
     opened: &std::fs::Metadata,
     current: &std::fs::Metadata,
     path: &Path,
@@ -643,17 +595,12 @@ fn ensure_same_snapshot_file(
 
 #[cfg(windows)]
 fn ensure_same_snapshot_file(
-    opened: &std::fs::Metadata,
-    current: &std::fs::Metadata,
+    opened_file: std::fs::File,
+    _opened: &std::fs::Metadata,
+    _current: &std::fs::Metadata,
     path: &Path,
 ) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-
-    if opened.volume_serial_number() == current.volume_serial_number()
-        && opened.file_index_high() == current.file_index_high()
-        && opened.file_index_low() == current.file_index_low()
-        && opened.file_attributes() == current.file_attributes()
-    {
+    if same_file::Handle::from_file(opened_file)? == same_file::Handle::from_path(path)? {
         return Ok(());
     }
     Err(std::io::Error::other(format!(
@@ -664,6 +611,7 @@ fn ensure_same_snapshot_file(
 
 #[cfg(not(any(unix, windows)))]
 fn ensure_same_snapshot_file(
+    _opened_file: std::fs::File,
     opened: &std::fs::Metadata,
     current: &std::fs::Metadata,
     path: &Path,
