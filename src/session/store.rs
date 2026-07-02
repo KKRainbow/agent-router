@@ -429,15 +429,15 @@ fn validate_snapshot(
 
 fn write_snapshot_atomically(path: &Path, snapshot: &SessionSnapshot) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(snapshot)?;
-    let temp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        SESSION_SNAPSHOT_FILE,
-        std::process::id()
-    ));
+    let temp_path = unique_snapshot_temp_path(path)?;
     {
-        let mut file = std::fs::File::create(&temp_path).map_err(|err| {
-            anyhow::anyhow!("create session snapshot {}: {err}", temp_path.display())
-        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|err| {
+                anyhow::anyhow!("create session snapshot {}: {err}", temp_path.display())
+            })?;
         file.write_all(&bytes).map_err(|err| {
             anyhow::anyhow!("write session snapshot {}: {err}", temp_path.display())
         })?;
@@ -453,6 +453,26 @@ fn write_snapshot_atomically(path: &Path, snapshot: &SessionSnapshot) -> anyhow:
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&temp_path);
         })
+}
+
+fn unique_snapshot_temp_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("session snapshot path has no parent: {}", path.display())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(SESSION_SNAPSHOT_FILE);
+    for _ in 0..16 {
+        let candidate = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "could not allocate unique session snapshot temp file in {}",
+        parent.display()
+    )
 }
 
 #[cfg(not(windows))]
@@ -513,7 +533,7 @@ fn existing_file_path_without_symlinks(path: &Path) -> anyhow::Result<bool> {
             Component::Normal(segment) => {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                    Ok(metadata) if metadata_is_symlink_or_reparse(&metadata) => {
                         anyhow::bail!(
                             "session snapshot path component is a symlink: {}",
                             current.display()
@@ -587,9 +607,21 @@ fn open_snapshot_file(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn open_snapshot_file(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_snapshot_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(path)
 }
 
 #[cfg(unix)]
@@ -609,15 +641,18 @@ fn ensure_same_snapshot_file(
     )))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn ensure_same_snapshot_file(
     opened: &std::fs::Metadata,
     current: &std::fs::Metadata,
     path: &Path,
 ) -> std::io::Result<()> {
-    if opened.file_type() == current.file_type()
-        && opened.len() == current.len()
-        && opened.modified().ok() == current.modified().ok()
+    use std::os::windows::fs::MetadataExt;
+
+    if opened.volume_serial_number() == current.volume_serial_number()
+        && opened.file_index_high() == current.file_index_high()
+        && opened.file_index_low() == current.file_index_low()
+        && opened.file_attributes() == current.file_attributes()
     {
         return Ok(());
     }
@@ -625,6 +660,36 @@ fn ensure_same_snapshot_file(
         "session snapshot changed while reading: {}",
         path.display()
     )))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ensure_same_snapshot_file(
+    opened: &std::fs::Metadata,
+    current: &std::fs::Metadata,
+    path: &Path,
+) -> std::io::Result<()> {
+    if opened.file_type() == current.file_type() && opened.len() == current.len() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "session snapshot changed while reading: {}",
+        path.display()
+    )))
+}
+
+#[cfg(windows)]
+fn metadata_is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
@@ -643,7 +708,7 @@ fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
             Component::Normal(segment) => {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                    Ok(metadata) if metadata_is_symlink_or_reparse(&metadata) => {
                         anyhow::bail!(
                             "session workspace component is a symlink: {}",
                             current.display()
