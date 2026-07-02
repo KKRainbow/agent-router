@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, StatusCode, Url, header::CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -39,6 +39,8 @@ use crate::{
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const SLACK_MARKDOWN_BLOCK_CHAR_LIMIT: usize = 12_000;
+const SLACK_MARKDOWN_SNIPPET_FILENAME: &str = "agent-router-reply.md";
+const SLACK_MARKDOWN_SNIPPET_TYPE: &str = "markdown";
 
 mod context;
 use self::context::*;
@@ -461,9 +463,15 @@ impl SlackSocketModeChannel {
         target: &SlackReplyTarget,
         text: &str,
     ) -> anyhow::Result<Option<String>> {
-        let Some(body) = slack_markdown_message_body(target, text) else {
+        if slack_text_requires_markdown_snippet(text) {
+            self.upload_markdown_snippet(target, text).await?;
+            return Ok(None);
+        }
+        if text.trim().is_empty() {
             return self.post_message_with_ts(target, text).await;
         };
+        let body = slack_markdown_message_body(target, text)
+            .expect("non-empty short markdown text should produce Slack blocks");
         match self.post_message_body_with_ts(target, body).await {
             Ok(ts) => Ok(ts),
             Err(err) if slack_error_is_invalid_blocks(&err) => {
@@ -528,6 +536,108 @@ impl SlackSocketModeChannel {
         Ok(resp.ts)
     }
 
+    async fn upload_markdown_snippet(
+        &self,
+        target: &SlackReplyTarget,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct UploadUrlResponse {
+            ok: bool,
+            error: Option<String>,
+            upload_url: Option<String>,
+            file_id: Option<String>,
+        }
+
+        tracing::info!(
+            channel = %target.channel,
+            thread_ts = ?target.thread_ts,
+            text_len = text.len(),
+            "uploading Slack markdown snippet"
+        );
+
+        let upload_url_body = slack_markdown_snippet_upload_url_body(text);
+        let resp = self
+            .http
+            .post("https://slack.com/api/files.getUploadURLExternal")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&upload_url_body)
+            .send()
+            .await?
+            .json::<UploadUrlResponse>()
+            .await?;
+        if !resp.ok {
+            return Err(SlackApiError::new(
+                "files.getUploadURLExternal",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        let upload_url = resp.upload_url.ok_or_else(|| {
+            anyhow::anyhow!("Slack files.getUploadURLExternal response omitted upload_url")
+        })?;
+        let file_id = resp.file_id.ok_or_else(|| {
+            anyhow::anyhow!("Slack files.getUploadURLExternal response omitted file_id")
+        })?;
+
+        let upload_resp = self
+            .http
+            .post(upload_url)
+            .header(CONTENT_TYPE, "text/markdown; charset=utf-8")
+            .body(text.as_bytes().to_vec())
+            .send()
+            .await?;
+        if !upload_resp.status().is_success() {
+            anyhow::bail!(
+                "Slack file upload failed with status {}",
+                upload_resp.status()
+            );
+        }
+
+        self.complete_markdown_snippet_upload(target, &file_id)
+            .await
+            .map_err(SlackMarkdownSnippetDeliveryError::new)?;
+        tracing::info!(
+            channel = %target.channel,
+            thread_ts = ?target.thread_ts,
+            text_len = text.len(),
+            file_id,
+            "uploaded Slack markdown snippet"
+        );
+        Ok(())
+    }
+
+    async fn complete_markdown_snippet_upload(
+        &self,
+        target: &SlackReplyTarget,
+        file_id: &str,
+    ) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            error: Option<String>,
+        }
+
+        let body = slack_complete_markdown_snippet_upload_body(target, file_id);
+        let resp = self
+            .http
+            .post("https://slack.com/api/files.completeUploadExternal")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&body)
+            .send()
+            .await?
+            .json::<Response>()
+            .await?;
+        if !resp.ok {
+            return Err(SlackApiError::new(
+                "files.completeUploadExternal",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     async fn update_message(
         &self,
         target: &SlackReplyTarget,
@@ -581,9 +691,18 @@ impl SlackSocketModeChannel {
         ts: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        let Some(body) = slack_markdown_update_body(target, ts, text) else {
+        if slack_text_requires_markdown_snippet(text) {
+            self.upload_markdown_snippet(target, text).await?;
+            self.delete_message(target, ts)
+                .await
+                .map_err(SlackMarkdownSnippetDeliveryError::new)?;
+            return Ok(());
+        }
+        if text.trim().is_empty() {
             return self.update_message(target, ts, text).await;
         };
+        let body = slack_markdown_update_body(target, ts, text)
+            .expect("non-empty short markdown text should produce Slack blocks");
         match self.update_message_body(body).await {
             Ok(()) => Ok(()),
             Err(err) if slack_error_is_invalid_blocks(&err) => {
@@ -743,14 +862,11 @@ impl ChannelReplyPort for SlackReplyPort {
         target: &Self::Target,
         text: &str,
     ) -> anyhow::Result<PostedMessage> {
-        let Some(id) = self
+        Ok(self
             .channel
             .post_markdown_message_with_ts(target, text)
             .await?
-        else {
-            anyhow::bail!("Slack final reply message response omitted ts");
-        };
-        Ok(PostedMessage::with_id(id))
+            .map_or_else(PostedMessage::without_id, PostedMessage::with_id))
     }
 
     async fn update_text(&self, target: &Self::Target, id: &str, text: &str) -> anyhow::Result<()> {
@@ -764,6 +880,11 @@ impl ChannelReplyPort for SlackReplyPort {
         text: &str,
     ) -> anyhow::Result<()> {
         self.channel.update_markdown_message(target, id, text).await
+    }
+
+    fn should_post_markdown_after_update_error(&self, err: &anyhow::Error) -> bool {
+        err.downcast_ref::<SlackMarkdownSnippetDeliveryError>()
+            .is_none()
     }
 
     async fn delete(&self, target: &Self::Target, id: &str) -> anyhow::Result<()> {
@@ -783,7 +904,7 @@ fn slack_message_body(target: &SlackReplyTarget, text: &str) -> Value {
 }
 
 fn slack_markdown_message_body(target: &SlackReplyTarget, text: &str) -> Option<Value> {
-    if text.trim().is_empty() || text.chars().count() > SLACK_MARKDOWN_BLOCK_CHAR_LIMIT {
+    if text.trim().is_empty() || slack_text_requires_markdown_snippet(text) {
         return None;
     }
 
@@ -798,7 +919,7 @@ fn slack_markdown_message_body(target: &SlackReplyTarget, text: &str) -> Option<
 }
 
 fn slack_markdown_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -> Option<Value> {
-    if text.trim().is_empty() || text.chars().count() > SLACK_MARKDOWN_BLOCK_CHAR_LIMIT {
+    if text.trim().is_empty() || slack_text_requires_markdown_snippet(text) {
         return None;
     }
 
@@ -813,6 +934,35 @@ fn slack_markdown_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -
             }
         ],
     }))
+}
+
+fn slack_text_requires_markdown_snippet(text: &str) -> bool {
+    text.chars().count() > SLACK_MARKDOWN_BLOCK_CHAR_LIMIT
+}
+
+fn slack_markdown_snippet_upload_url_body(text: &str) -> Value {
+    json!({
+        "filename": SLACK_MARKDOWN_SNIPPET_FILENAME,
+        "length": text.len(),
+        "snippet_type": SLACK_MARKDOWN_SNIPPET_TYPE,
+    })
+}
+
+fn slack_complete_markdown_snippet_upload_body(target: &SlackReplyTarget, file_id: &str) -> Value {
+    let mut body = json!({
+        "files": [
+            {
+                "id": file_id,
+                "title": SLACK_MARKDOWN_SNIPPET_FILENAME,
+                "highlight_type": SLACK_MARKDOWN_SNIPPET_TYPE,
+            }
+        ],
+        "channel_id": target.channel,
+    });
+    if let Some(thread_ts) = &target.thread_ts {
+        body["thread_ts"] = Value::String(thread_ts.clone());
+    }
+    body
 }
 
 #[cfg(test)]
@@ -1049,6 +1199,31 @@ impl std::fmt::Display for SlackApiError {
 
 impl std::error::Error for SlackApiError {}
 
+#[derive(Debug)]
+struct SlackMarkdownSnippetDeliveryError {
+    details: String,
+}
+
+impl SlackMarkdownSnippetDeliveryError {
+    fn new(err: anyhow::Error) -> Self {
+        Self {
+            details: err.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for SlackMarkdownSnippetDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Slack markdown snippet delivery failed: {}",
+            self.details
+        )
+    }
+}
+
+impl std::error::Error for SlackMarkdownSnippetDeliveryError {}
+
 fn slack_error_is_access_denied(err: &anyhow::Error) -> bool {
     err.downcast_ref::<SlackApiError>()
         .is_some_and(SlackApiError::is_access_denied)
@@ -1258,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn slack_markdown_message_body_falls_back_for_invalid_block_text() {
+    fn slack_markdown_message_body_omits_blocks_for_invalid_block_text() {
         let target = SlackReplyTarget {
             channel: "C1".to_string(),
             thread_ts: None,
@@ -1268,6 +1443,74 @@ mod tests {
         assert!(slack_markdown_message_body(&target, "").is_none());
         assert!(slack_markdown_message_body(&target, "   ").is_none());
         assert!(slack_markdown_message_body(&target, &long_text).is_none());
+    }
+
+    #[test]
+    fn slack_markdown_snippet_threshold_starts_after_block_limit() {
+        assert!(!slack_text_requires_markdown_snippet(
+            &"x".repeat(SLACK_MARKDOWN_BLOCK_CHAR_LIMIT)
+        ));
+        assert!(slack_text_requires_markdown_snippet(
+            &"x".repeat(SLACK_MARKDOWN_BLOCK_CHAR_LIMIT + 1)
+        ));
+    }
+
+    #[test]
+    fn slack_markdown_snippet_upload_url_body_uses_markdown_snippet() {
+        let body = slack_markdown_snippet_upload_url_body("é");
+
+        assert_eq!(body["filename"], SLACK_MARKDOWN_SNIPPET_FILENAME);
+        assert_eq!(body["length"], 2);
+        assert_eq!(body["snippet_type"], SLACK_MARKDOWN_SNIPPET_TYPE);
+    }
+
+    #[test]
+    fn slack_complete_markdown_snippet_upload_body_targets_thread() {
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+
+        let body = slack_complete_markdown_snippet_upload_body(&target, "F1");
+
+        assert_eq!(body["channel_id"], "C1");
+        assert_eq!(body["thread_ts"], "111.000");
+        assert_eq!(body["files"][0]["id"], "F1");
+        assert_eq!(body["files"][0]["title"], SLACK_MARKDOWN_SNIPPET_FILENAME);
+        assert_eq!(
+            body["files"][0]["highlight_type"],
+            SLACK_MARKDOWN_SNIPPET_TYPE
+        );
+    }
+
+    #[test]
+    fn slack_complete_markdown_snippet_upload_body_omits_thread_for_channel_post() {
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: None,
+        };
+
+        let body = slack_complete_markdown_snippet_upload_body(&target, "F1");
+
+        assert_eq!(body["channel_id"], "C1");
+        assert!(body.get("thread_ts").is_none());
+    }
+
+    #[test]
+    fn slack_reply_port_suppresses_fallback_after_snippet_delivery_error() {
+        let port = SlackReplyPort {
+            channel: SlackSocketModeChannel::new(
+                test_slack_config(true),
+                Arc::new(ApprovalBroker::default()),
+            ),
+        };
+        let delivery_error = anyhow::Error::new(SlackMarkdownSnippetDeliveryError::new(
+            anyhow::anyhow!("delete failed"),
+        ));
+        let ordinary_error = anyhow::anyhow!("chat.update failed");
+
+        assert!(!port.should_post_markdown_after_update_error(&delivery_error));
+        assert!(port.should_post_markdown_after_update_error(&ordinary_error));
     }
 
     fn thread_reply(text: impl Into<String>) -> SlackMessageEvent {

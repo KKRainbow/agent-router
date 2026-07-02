@@ -118,6 +118,7 @@ im:history
 mpim:history
 users:read
 files:read
+files:write
 ```
 
 Then enable Event Subscriptions and subscribe to these bot events:

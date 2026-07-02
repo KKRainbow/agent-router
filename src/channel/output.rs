@@ -33,6 +33,9 @@ pub(crate) trait ChannelReplyPort: Clone + Send + Sync + 'static {
         id: &str,
         text: &str,
     ) -> anyhow::Result<()>;
+    fn should_post_markdown_after_update_error(&self, _err: &anyhow::Error) -> bool {
+        true
+    }
     async fn delete(&self, target: &Self::Target, id: &str) -> anyhow::Result<()>;
 }
 
@@ -800,6 +803,13 @@ where
 {
     if let Some(id) = message_id.as_deref() {
         if let Err(err) = port.update_markdown(target, id, text).await {
+            if !port.should_post_markdown_after_update_error(&err) {
+                tracing::warn!(
+                    error = %err,
+                    "failed to update channel reply draft as final reply; not posting fallback final reply"
+                );
+                return Err(err);
+            }
             tracing::warn!(
                 error = %err,
                 "failed to update channel reply draft as final reply; posting final reply instead"
@@ -931,12 +941,27 @@ mod tests {
         },
     }
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone)]
     struct RecordingPort {
         deliveries: Arc<Mutex<Vec<Delivery>>>,
         next_id: Arc<AtomicU64>,
         post_text_delay: Duration,
         markdown_without_id: bool,
+        update_markdown_error: Option<String>,
+        retry_update_markdown_errors: bool,
+    }
+
+    impl Default for RecordingPort {
+        fn default() -> Self {
+            Self {
+                deliveries: Arc::default(),
+                next_id: Arc::default(),
+                post_text_delay: Duration::ZERO,
+                markdown_without_id: false,
+                update_markdown_error: None,
+                retry_update_markdown_errors: true,
+            }
+        }
     }
 
     impl RecordingPort {
@@ -1008,12 +1033,19 @@ mod tests {
             id: &str,
             text: &str,
         ) -> anyhow::Result<()> {
+            if let Some(error) = &self.update_markdown_error {
+                anyhow::bail!("{error}");
+            }
             self.deliveries.lock().await.push(Delivery::UpdateMarkdown {
                 target: target.clone(),
                 id: id.to_string(),
                 text: text.to_string(),
             });
             Ok(())
+        }
+
+        fn should_post_markdown_after_update_error(&self, _err: &anyhow::Error) -> bool {
+            self.retry_update_markdown_errors
         }
 
         async fn delete(&self, target: &Self::Target, id: &str) -> anyhow::Result<()> {
@@ -1156,6 +1188,51 @@ mod tests {
         assert!(matches!(
             port.deliveries().await.as_slice(),
             [Delivery::PostMarkdown { text, .. }] if text == "final"
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_draft_update_error_posts_fallback_final_reply_by_default() {
+        let port = RecordingPort {
+            update_markdown_error: Some("update failed".to_string()),
+            ..Default::default()
+        };
+        let mut policy = ChannelOutputPolicy::streaming_draft(ChannelEventMode::Off);
+        policy.draft_initial_min_len = 4;
+        let mut sink = ChannelOutputSink::new(port.clone(), "target".to_string(), policy);
+
+        sink.send_reply_chunk("draft".to_string());
+        tokio::task::yield_now().await;
+        sink.send_final_reply("final".to_string()).await.unwrap();
+
+        let deliveries = port.deliveries().await;
+        assert!(deliveries.iter().any(
+            |delivery| matches!(delivery, Delivery::PostMarkdown { text, .. } if text == "final")
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_draft_update_error_can_suppress_fallback_final_reply() {
+        let port = RecordingPort {
+            update_markdown_error: Some("snippet completion failed".to_string()),
+            retry_update_markdown_errors: false,
+            ..Default::default()
+        };
+        let mut policy = ChannelOutputPolicy::streaming_draft(ChannelEventMode::Off);
+        policy.draft_initial_min_len = 4;
+        let mut sink = ChannelOutputSink::new(port.clone(), "target".to_string(), policy);
+
+        sink.send_reply_chunk("draft".to_string());
+        tokio::task::yield_now().await;
+        let err = sink
+            .send_final_reply("final".to_string())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("snippet completion failed"));
+        let deliveries = port.deliveries().await;
+        assert!(deliveries.iter().all(
+            |delivery| !matches!(delivery, Delivery::PostMarkdown { text, .. } if text == "final")
         ));
     }
 
