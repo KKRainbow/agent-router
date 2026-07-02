@@ -1450,19 +1450,28 @@ where
         }
         drop(idle_turn_start_guard);
 
-        let outcome = self
-            .executor
-            .slash_command(ExecutorSlashCommandRequest {
-                session_key: session_key.clone(),
-                executor: executor_name.clone(),
-                cwd: session_cwd,
-                turn: slash_turn,
-                cancel: slash_cancel,
-                previous_session_id,
-                command: command.clone(),
-                user_id: input.user_id,
-            })
-            .await;
+        let outcome = {
+            let mut executor_events = RouterExecutorEventSink::for_slash_command(
+                idle_turn.as_ref().cloned(),
+                &executor_name,
+                output,
+            );
+            self.executor
+                .slash_command(
+                    ExecutorSlashCommandRequest {
+                        session_key: session_key.clone(),
+                        executor: executor_name.clone(),
+                        cwd: session_cwd,
+                        turn: slash_turn,
+                        cancel: slash_cancel,
+                        previous_session_id,
+                        command: command.clone(),
+                        user_id: input.user_id,
+                    },
+                    &mut executor_events,
+                )
+                .await
+        };
         let mut idle_turn = idle_turn;
 
         match outcome {
@@ -1470,6 +1479,7 @@ where
                 if let Some(turn) = idle_turn.take()
                     && turn.commit_if_current(|| async {}).await.is_none()
                 {
+                    output.discard_reply_stream().await;
                     return Ok(());
                 }
                 output.send_final_reply(response.final_text).await
@@ -1529,6 +1539,7 @@ where
                     true
                 };
                 if !committed {
+                    output.discard_reply_stream().await;
                     return Ok(());
                 }
                 output.send_final_reply(response.final_text).await
@@ -1537,6 +1548,7 @@ where
                 if let Some(turn) = idle_turn.take()
                     && turn.commit_if_current(|| async {}).await.is_none()
                 {
+                    output.discard_reply_stream().await;
                     return Ok(());
                 }
                 output
@@ -1562,13 +1574,18 @@ where
                     match committed {
                         Some(Ok(())) => {}
                         Some(Err(discard_err)) => {
+                            output.discard_reply_stream().await;
                             return Err(anyhow::anyhow!(
                                 "slash command failed ({failure}); also failed to discard uncommitted executor session: {discard_err}"
                             ));
                         }
-                        None => return Ok(()),
+                        None => {
+                            output.discard_reply_stream().await;
+                            return Ok(());
+                        }
                     }
                 }
+                output.discard_reply_stream().await;
                 Err(err)
             }
         }
@@ -2951,7 +2968,7 @@ where
 }
 
 struct RouterExecutorEventSink<'a> {
-    turn: TurnGuard,
+    turn: Option<TurnGuard>,
     executor: &'a str,
     output: &'a mut dyn RouterOutputSink,
     updates: Vec<ExecutorUpdate>,
@@ -2966,6 +2983,20 @@ struct RouterReplyStreamState {
 
 impl<'a> RouterExecutorEventSink<'a> {
     fn new(turn: TurnGuard, executor: &'a str, output: &'a mut dyn RouterOutputSink) -> Self {
+        Self {
+            turn: Some(turn),
+            executor,
+            output,
+            updates: Vec::new(),
+            reply_stream: RouterReplyStreamState::default(),
+        }
+    }
+
+    fn for_slash_command(
+        turn: Option<TurnGuard>,
+        executor: &'a str,
+        output: &'a mut dyn RouterOutputSink,
+    ) -> Self {
         Self {
             turn,
             executor,
@@ -2983,7 +3014,11 @@ impl<'a> RouterExecutorEventSink<'a> {
 #[async_trait]
 impl ExecutorEventSink for RouterExecutorEventSink<'_> {
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
-        if self.turn.is_output_allowed().await {
+        let output_allowed = match &self.turn {
+            Some(turn) => turn.is_output_allowed().await,
+            None => true,
+        };
+        if output_allowed {
             if let Some(chunk) = reply_chunk_from_executor_update(&update) {
                 if self.reply_stream.should_break_before(&update) {
                     self.output.send_reply_break();
@@ -3295,6 +3330,7 @@ mod tests {
         async fn slash_command(
             &self,
             request: ExecutorSlashCommandRequest,
+            _events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             let name = request.command.name.clone();
             let args = request.command.args.clone();
@@ -3412,6 +3448,7 @@ mod tests {
         async fn slash_command(
             &self,
             _request: ExecutorSlashCommandRequest,
+            _events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             ExecutorSlashCommandOutcome::CompletedWithSession {
                 response: ExecutorResponse {
@@ -3475,6 +3512,7 @@ mod tests {
         async fn slash_command(
             &self,
             request: ExecutorSlashCommandRequest,
+            _events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             assert!(request.turn.is_some());
             ExecutorSlashCommandOutcome::Failed(anyhow::anyhow!("slash failed"))
@@ -3541,6 +3579,7 @@ mod tests {
         async fn slash_command(
             &self,
             request: ExecutorSlashCommandRequest,
+            _events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             assert!(request.turn.is_some());
             if let Some(started) = self.slash_started.lock().await.take() {
@@ -3633,6 +3672,7 @@ mod tests {
         async fn slash_command(
             &self,
             _request: ExecutorSlashCommandRequest,
+            _events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             if let Some(started) = self.slash_started.lock().await.take() {
                 let _ = started.send(());

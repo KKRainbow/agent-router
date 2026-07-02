@@ -128,12 +128,13 @@ impl ExecutorBackend for ExecutorRegistry {
     async fn slash_command(
         &self,
         request: ExecutorSlashCommandRequest,
+        events: &mut dyn ExecutorEventSink,
     ) -> ExecutorSlashCommandOutcome {
         let backend = match self.backend_for(&request.executor) {
             Ok(backend) => backend,
             Err(err) => return ExecutorSlashCommandOutcome::Failed(err),
         };
-        backend.slash_command(request).await
+        backend.slash_command(request, events).await
     }
 
     async fn interrupt(&self, request: ExecutorInterruptRequest) -> anyhow::Result<()> {

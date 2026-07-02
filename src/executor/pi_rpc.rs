@@ -543,6 +543,7 @@ impl ExecutorBackend for PiRpcExecutorManager {
     async fn slash_command(
         &self,
         request: ExecutorSlashCommandRequest,
+        events: &mut dyn ExecutorEventSink,
     ) -> ExecutorSlashCommandOutcome {
         let Some(cfg) = self.executors.get(&request.executor) else {
             return ExecutorSlashCommandOutcome::Unsupported;
@@ -564,7 +565,6 @@ impl ExecutorBackend for PiRpcExecutorManager {
         };
         let shared_session = published_session.shared();
         let mut session = shared_session.lock().await;
-        let mut events = DiscardingEventSink;
         let prompt_guard = if let Some(turn) = request.turn.as_ref() {
             PiPromptGuard::registered(
                 self.active_prompts.clone(),
@@ -580,7 +580,7 @@ impl ExecutorBackend for PiRpcExecutorManager {
             .run_prompt(
                 &request.command.raw,
                 request.user_id,
-                &mut events,
+                events,
                 cancel.clone(),
                 prompt_guard.active_prompt(),
             )
@@ -1469,15 +1469,6 @@ impl PiRpcSession {
 struct SelectOption {
     value: String,
     label: String,
-}
-
-struct DiscardingEventSink;
-
-#[async_trait]
-impl ExecutorEventSink for DiscardingEventSink {
-    async fn send(&mut self, _update: ExecutorUpdate) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 async fn set_active_pi_prompt(
@@ -3666,21 +3657,25 @@ while True:
         let fake = FakePi::new();
         let (manager, _) = fake.manager("stream");
 
+        let mut events = CollectingExecutorEventSink::default();
         let outcome = manager
-            .slash_command(ExecutorSlashCommandRequest {
-                session_key: "session-1".to_string(),
-                executor: "pi".to_string(),
-                cwd: None,
-                turn: None,
-                cancel: TurnCancellation::default(),
-                previous_session_id: None,
-                command: ExecutorSlashCommand {
-                    raw: "/status --json".to_string(),
-                    name: "status".to_string(),
-                    args: "--json".to_string(),
+            .slash_command(
+                ExecutorSlashCommandRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "pi".to_string(),
+                    cwd: None,
+                    turn: None,
+                    cancel: TurnCancellation::default(),
+                    previous_session_id: None,
+                    command: ExecutorSlashCommand {
+                        raw: "/status --json".to_string(),
+                        name: "status".to_string(),
+                        args: "--json".to_string(),
+                    },
+                    user_id: None,
                 },
-                user_id: None,
-            })
+                &mut events,
+            )
             .await;
 
         let response = match outcome {
@@ -3694,6 +3689,13 @@ while True:
             other => panic!("unexpected slash command outcome: {other:?}"),
         };
         assert_eq!(response.final_text, "hello world");
+        let chunks = events
+            .updates
+            .iter()
+            .filter(|update| update.kind == "agent_message_chunk")
+            .map(|update| update.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(chunks, ["hello ", "world"]);
         let entries = fake.log_entries();
         assert!(entries.iter().any(|entry| {
             entry.get("stdin").is_some_and(|stdin| {
@@ -3708,21 +3710,25 @@ while True:
         let fake = FakePi::new();
         let (manager, _) = fake.manager("stream");
 
+        let mut events = CollectingExecutorEventSink::default();
         let outcome = manager
-            .slash_command(ExecutorSlashCommandRequest {
-                session_key: "session-1".to_string(),
-                executor: "pi".to_string(),
-                cwd: None,
-                turn: None,
-                cancel: TurnCancellation::default(),
-                previous_session_id: Some(fake.session_file.clone()),
-                command: ExecutorSlashCommand {
-                    raw: "/status".to_string(),
-                    name: "status".to_string(),
-                    args: String::new(),
+            .slash_command(
+                ExecutorSlashCommandRequest {
+                    session_key: "session-1".to_string(),
+                    executor: "pi".to_string(),
+                    cwd: None,
+                    turn: None,
+                    cancel: TurnCancellation::default(),
+                    previous_session_id: Some(fake.session_file.clone()),
+                    command: ExecutorSlashCommand {
+                        raw: "/status".to_string(),
+                        name: "status".to_string(),
+                        args: String::new(),
+                    },
+                    user_id: None,
                 },
-                user_id: None,
-            })
+                &mut events,
+            )
             .await;
 
         assert!(matches!(

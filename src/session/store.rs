@@ -825,7 +825,7 @@ fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
                             )
                         })?;
                         anyhow::ensure!(
-                            metadata.is_dir() && !metadata.file_type().is_symlink(),
+                            metadata.is_dir() && !metadata_is_symlink_or_reparse(&metadata),
                             "session workspace component is invalid after create: {}",
                             current.display()
                         );
