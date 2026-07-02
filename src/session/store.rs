@@ -244,7 +244,7 @@ impl WorkspaceSessionStore {
                 );
                 (Some(default_executor.clone()), snapshot.routing_mode)
             }
-            None => (None, snapshot.routing_mode),
+            None => (None, AgentRoutingMode::Auto),
         };
 
         Ok(SessionState {
@@ -1063,6 +1063,36 @@ mod tests {
         let state = store.load("web:s1").await.unwrap().unwrap();
 
         assert_eq!(state.active_executor, None);
+        assert_eq!(state.routing_mode, AgentRoutingMode::Auto);
+    }
+
+    #[tokio::test]
+    async fn null_active_executor_loads_as_auto_even_if_snapshot_is_manual() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let path = store.snapshot_path("web:s1");
+        ensure_dir_path_without_symlinks(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "session_key": "web:s1",
+                "default_executor": "kimi",
+                "active_executor": null,
+                "routing_mode": "manual",
+                "created_at_ms": 1,
+                "updated_at_ms": 2,
+                "transcript": [],
+                "executor_bindings": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = store.load("web:s1").await.unwrap().unwrap();
+
+        assert_eq!(state.active_executor, None);
+        assert_eq!(state.routing_mode, AgentRoutingMode::Auto);
     }
 
     #[cfg(unix)]
