@@ -223,15 +223,17 @@ impl WorkspaceSessionStore {
             );
             self.default_executor.clone()
         };
-        let active_executor = match snapshot.active_executor {
-            Some(executor) if self.configured_executors.contains_key(&executor) => Some(executor),
+        let (active_executor, routing_mode) = match snapshot.active_executor {
+            Some(executor) if self.configured_executors.contains_key(&executor) => {
+                (Some(executor), snapshot.routing_mode)
+            }
             Some(executor) if self.reserved_executors.contains(&executor) => {
                 tracing::warn!(
                     session_key,
                     persisted_active_executor = %executor,
                     "persisted active executor is reserved for router control; clearing selection"
                 );
-                None
+                (None, AgentRoutingMode::Auto)
             }
             Some(executor) => {
                 tracing::warn!(
@@ -240,16 +242,16 @@ impl WorkspaceSessionStore {
                     fallback_executor = %default_executor,
                     "persisted active executor is no longer configured; using resolved default"
                 );
-                Some(default_executor.clone())
+                (Some(default_executor.clone()), snapshot.routing_mode)
             }
-            None => None,
+            None => (None, snapshot.routing_mode),
         };
 
         Ok(SessionState {
             session_key: snapshot.session_key,
             default_executor,
             active_executor,
-            routing_mode: snapshot.routing_mode,
+            routing_mode,
             active_executor_revision: 0,
             approval_mode_override: None,
             cwd: Some(session_dir),
@@ -1135,6 +1137,7 @@ mod tests {
                 "session_key": "web:s1",
                 "default_executor": "kimi",
                 "active_executor": "route-planner",
+                "routing_mode": "manual",
                 "created_at_ms": 1,
                 "updated_at_ms": 2,
                 "transcript": [],
@@ -1147,6 +1150,7 @@ mod tests {
         let state = store.load("web:s1").await.unwrap().unwrap();
 
         assert_eq!(state.active_executor, None);
+        assert_eq!(state.routing_mode, AgentRoutingMode::Auto);
     }
 
     #[tokio::test]
