@@ -938,7 +938,10 @@ where
     }
 
     async fn load_or_create_session_state(&self, session_key: &str) -> SessionState {
-        if let Some(state) = self.store.load(session_key).await {
+        if let Some(mut state) = self.store.load(session_key).await {
+            if self.normalize_reserved_active_executor(&mut state) {
+                self.store.save(state.clone()).await;
+            }
             return state;
         }
         let mut state = SessionState::new(session_key, &self.default_executor);
@@ -959,6 +962,23 @@ where
         self.orchestrator
             .as_ref()
             .is_some_and(|orchestrator| orchestrator.enabled && orchestrator.executor == executor)
+    }
+
+    fn normalize_reserved_active_executor(&self, state: &mut SessionState) -> bool {
+        let Some(executor) = state.active_executor.clone() else {
+            return false;
+        };
+        if !self.is_orchestrator_executor(&executor) {
+            return false;
+        }
+        tracing::warn!(
+            session_key = %state.session_key,
+            executor = %executor,
+            "cleared reserved orchestrator active executor from session state"
+        );
+        state.routing_mode = AgentRoutingMode::Auto;
+        state.set_active_executor(None);
+        true
     }
 
     async fn interrupt_turn(&self, turn: InterruptedTurn) {
@@ -4788,6 +4808,52 @@ mod tests {
         );
         drop(prompts);
         let saved = store.load("slack:dm:D1:111.000").await.unwrap();
+        assert_eq!(saved.routing_mode, AgentRoutingMode::Auto);
+        assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+    }
+
+    #[tokio::test]
+    async fn restored_orchestrator_active_executor_is_cleared_before_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let session_key = "slack:dm:D1:111.000";
+        let mut state = SessionState::new(session_key, "kimi");
+        state.routing_mode = AgentRoutingMode::Manual;
+        state.set_active_executor(Some("route-planner".to_string()));
+        store.save(state).await;
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"codex","reason":"code work"}"#,
+        ));
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone()).with_orchestrator(
+            Some(test_orchestrator_settings(write_orchestrator_policy(&tmp))),
+        );
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "please route this".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "codex response");
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].executor, "route-planner");
+        assert!(
+            prompts[0]
+                .session_key
+                .starts_with("__agent_router_orchestrator__:")
+        );
+        assert_eq!(prompts[1].executor, "codex");
+        assert_eq!(prompts[1].session_key, session_key);
+        drop(prompts);
+        let saved = store.load(session_key).await.unwrap();
         assert_eq!(saved.routing_mode, AgentRoutingMode::Auto);
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
     }

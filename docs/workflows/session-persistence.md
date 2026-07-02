@@ -294,8 +294,9 @@ Persistent load should reconstruct `SessionState` and then normalize it:
 - Fill missing optional collections with defaults.
 - Set `SessionState.cwd` to the session workspace path.
 - Reset all binding health to `Unknown`.
-- Validate `default_executor` and `active_executor` against configured
-  executors.
+- Validate `default_executor` and `active_executor` against configured task
+  executors; the reserved orchestrator executor is not a valid
+  `active_executor`.
 - Validate path fields with the same safety checks used for workspace
   materialization.
 - Preserve transcript order from the JSON array.
