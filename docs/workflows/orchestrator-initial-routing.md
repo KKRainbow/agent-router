@@ -26,11 +26,12 @@ Agent Router 仍然是真正的控制平面，负责校验 decision、设置 `ac
 - `/agent auto` 可以显式清空 `active_executor`，让下一条普通消息重新自动选择。
 - 不做任务完成自动回收，不做 target-to-target 自动路由。
 
-可选 `mode: per_turn` 会在每条普通用户消息前调用 orchestrator。此模式下
-`stay` 表示保持当前 active executor；如果当前仍是 auto-pending，则选择
-`default_executor`。`handoff` 可以切换到任意已配置的任务 executor，包括 default。
-Router 仍然负责校验目标 executor，并在 stale/cancel/failure 路径恢复本轮路由前的
-active executor。
+可选 `mode: per_turn` 会在 auto routing 下每条普通用户消息前调用 orchestrator。
+如果用户通过 `/agent <executor>` 进入 manual routing，则后续普通消息直接进入该
+executor，直到 `/agent auto` 恢复自动路由。此模式下 `stay` 表示保持当前 active
+executor；如果当前仍是 auto-pending，则选择 `default_executor`。`handoff` 可以切换
+到任意已配置的任务 executor，包括 default。Router 仍然负责校验目标 executor，并
+在 stale/cancel/failure 路径恢复本轮路由前的 active executor。
 
 ## 背景
 
@@ -489,7 +490,8 @@ reply。
   orchestrator。
 - `mode: initial` 下，`active_executor = Some(non_default)` 时不会调用
   orchestrator。
-- `mode: per_turn` 下，每条普通用户消息都会调用 orchestrator。
+- `mode: per_turn` 且 routing mode 为 auto 时，每条普通用户消息都会调用
+  orchestrator。
 - `/agent` 命令不会调用 orchestrator。
 - `mode: initial` 下，`stay` decision 会设置 `active_executor = default_executor`，
   并只把原始用户消息投递给 default executor 一次。

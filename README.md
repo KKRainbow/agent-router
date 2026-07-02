@@ -20,7 +20,7 @@ internal workflows, and early integrations.
 - Receives messages from supported IM channels.
 - Normalizes channel messages into a shared session model.
 - Starts each session with a configured default agent.
-- Routes a session to one active agent at a time.
+- Routes a session to at most one active agent at a time.
 - Lets users switch agents inside the same chat session.
 - Projects conversation context when a session switches agents.
 - Sends normalized replies back to the originating channel.
@@ -204,17 +204,18 @@ web:
   channel_events: compact
 ```
 
-Each chat session has one active agent. New sessions start with
-`router.default_executor`. Users can switch the active agent with
-`/agent <agent-name>`.
+Each chat session has at most one active agent. New sessions use
+`router.default_executor`, or start auto-pending when an orchestrator is enabled.
+Users can switch the active agent with `/agent <agent-name>`.
 
 Optional routing can be enabled with `router.orchestrator`. The default
 `mode: initial` starts new sessions as auto-pending, asks the routing executor
 for one strict JSON decision, and then keeps the selected real executor until
 the user switches it or runs `/agent auto`. `mode: per_turn` asks the routing
-executor before every normal user message. The routing prompt includes
-low-sensitivity session source metadata (`source` and `source_kind`), such as
-Slack DM or QQ group, without exposing the full channel session key.
+executor before every normal user message while routing mode is auto. The
+routing prompt includes low-sensitivity session source metadata (`source` and
+`source_kind`), such as Slack DM or QQ group, without exposing the full channel
+session key.
 
 ## Non-Goals
 
