@@ -32,6 +32,27 @@ impl ApprovalMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRoutingMode {
+    #[default]
+    Auto,
+    Manual,
+}
+
+impl AgentRoutingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -107,6 +128,8 @@ pub struct SessionState {
     pub default_executor: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_executor: Option<String>,
+    #[serde(default, skip_serializing_if = "AgentRoutingMode::is_auto")]
+    pub routing_mode: AgentRoutingMode,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub active_executor_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +150,7 @@ impl SessionState {
         Self {
             session_key: session_key.into(),
             active_executor: Some(default_executor.clone()),
+            routing_mode: AgentRoutingMode::Auto,
             active_executor_revision: 0,
             default_executor,
             approval_mode_override: None,
@@ -160,4 +184,24 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn deserializes_legacy_session_state_with_auto_routing_mode() {
+        let state: SessionState = serde_json::from_value(json!({
+            "session_key": "slack:C1:T1",
+            "default_executor": "kimi",
+            "active_executor": "kimi",
+            "transcript": [],
+            "executor_bindings": {}
+        }))
+        .unwrap();
+
+        assert_eq!(state.routing_mode, AgentRoutingMode::Auto);
+    }
 }

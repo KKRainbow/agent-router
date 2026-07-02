@@ -25,8 +25,8 @@ use crate::{
         ExecutorTurnRef, ExecutorUpdate, InterruptReason, TurnCancellation,
     },
     session::{
-        ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding, ExecutorHealth,
-        MessageRole, SessionState, TranscriptMessage,
+        AgentRoutingMode, ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding,
+        ExecutorHealth, MessageRole, SessionState, TranscriptMessage,
         context::{ContextSyncPlan, prepare_context_sync, read_context_artifacts_from_manifest},
         projection::{
             ProjectionInput, build_context_projection, merge_seen_context,
@@ -1189,29 +1189,19 @@ where
         }
         if args.split_whitespace().count() != 1 {
             return output
-                .send_final_reply("Usage: /agent [status|done|auto|<executor>]".to_string())
+                .send_final_reply("Usage: /agent [status|auto|<executor>]".to_string())
                 .await;
         }
 
         let target = args;
-        if target == "done" {
-            state.set_active_executor(Some(state.default_executor.clone()));
-            self.store.save(state.clone()).await;
-            return output
-                .send_final_reply(format!(
-                    "Agent handoff ended. Active executor: {}",
-                    state.default_executor
-                ))
-                .await;
-        }
         if target == "auto" {
+            state.routing_mode = AgentRoutingMode::Auto;
             state.set_active_executor(None);
             self.store.save(state).await;
             return output
-                .send_final_reply("Active executor: [auto pending]".to_string())
+                .send_final_reply("Routing: auto\nActive executor: [auto pending]".to_string())
                 .await;
         }
-
         if self.executor.get(target).is_none() {
             return output
                 .send_final_reply(format!("Executor `{target}` is not configured."))
@@ -1224,10 +1214,11 @@ where
                 ))
                 .await;
         }
+        state.routing_mode = AgentRoutingMode::Manual;
         state.set_active_executor(Some(target.to_string()));
         self.store.save(state).await;
         output
-            .send_final_reply(format!("Active executor: {target}"))
+            .send_final_reply(format!("Routing: manual\nActive executor: {target}"))
             .await
     }
 
@@ -2465,6 +2456,7 @@ Current user message:\n{}",
     fn render_status(&self, state: &SessionState) -> String {
         let active_executor = state.active_executor.as_deref().unwrap_or("[auto pending]");
         let mut lines = vec![
+            format!("Routing: {}", state.routing_mode.as_str()),
             format!("Default executor: {}", state.default_executor),
             format!("Active executor: {active_executor}"),
         ];
@@ -2585,6 +2577,7 @@ fn parse_route_decision(text: &str) -> anyhow::Result<RouteDecision> {
 
 fn orchestrator_should_route(orchestrator: &OrchestratorSettings, state: &SessionState) -> bool {
     orchestrator.enabled
+        && state.routing_mode == AgentRoutingMode::Auto
         && (state.active_executor.is_none() || orchestrator.mode == OrchestratorMode::PerTurn)
 }
 
@@ -4476,6 +4469,7 @@ mod tests {
 
         assert!(output.final_reply().contains("Default executor: kimi"));
         assert!(output.final_reply().contains("Active executor: kimi"));
+        assert!(output.final_reply().contains("Routing: auto"));
     }
 
     #[tokio::test]
@@ -4627,6 +4621,167 @@ mod tests {
         assert!(route_prompts[0].prompt.contains("- routing_mode: per_turn"));
         assert!(route_prompts[0].prompt.contains("- active_executor: none"));
         assert!(route_prompts[1].prompt.contains("- active_executor: codex"));
+    }
+
+    #[tokio::test]
+    async fn per_turn_manual_agent_switch_bypasses_orchestrator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"codex","reason":"code work"}"#,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_orchestrator(Some(settings));
+
+        let mut switch = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/agent kimi".to_string(),
+                    user_id: None,
+                },
+                &mut switch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            switch.final_reply(),
+            "Routing: manual\nActive executor: kimi"
+        );
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "manual task".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "kimi response");
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|request| request.executor == "route-planner")
+                .count(),
+            0
+        );
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|request| request.executor == "kimi")
+                .count(),
+            1
+        );
+        drop(prompts);
+        let saved = store.load("slack:dm:D1:111.000").await.unwrap();
+        assert_eq!(saved.routing_mode, AgentRoutingMode::Manual);
+        assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
+    }
+
+    #[tokio::test]
+    async fn agent_auto_restores_per_turn_orchestrator_after_manual_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"codex","reason":"code work"}"#,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_orchestrator(Some(settings));
+
+        let mut switch = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/agent kimi".to_string(),
+                    user_id: None,
+                },
+                &mut switch,
+            )
+            .await
+            .unwrap();
+
+        let mut manual = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "manual task".to_string(),
+                    user_id: None,
+                },
+                &mut manual,
+            )
+            .await
+            .unwrap();
+
+        let mut auto = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/agent auto".to_string(),
+                    user_id: None,
+                },
+                &mut auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            auto.final_reply(),
+            "Routing: auto\nActive executor: [auto pending]"
+        );
+
+        let mut routed = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "auto task".to_string(),
+                    user_id: None,
+                },
+                &mut routed,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(routed.final_reply(), "codex response");
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|request| request.executor == "route-planner")
+                .count(),
+            1
+        );
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|request| request.executor == "kimi")
+                .count(),
+            1
+        );
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|request| request.executor == "codex")
+                .count(),
+            1
+        );
+        drop(prompts);
+        let saved = store.load("slack:dm:D1:111.000").await.unwrap();
+        assert_eq!(saved.routing_mode, AgentRoutingMode::Auto);
+        assert_eq!(saved.active_executor.as_deref(), Some("codex"));
     }
 
     #[tokio::test]
@@ -5296,7 +5451,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(auto.final_reply(), "Active executor: [auto pending]");
+        assert_eq!(
+            auto.final_reply(),
+            "Routing: auto\nActive executor: [auto pending]"
+        );
+        assert_eq!(
+            store
+                .load_or_create("slack:dm:D1:111.000", "kimi")
+                .await
+                .routing_mode,
+            AgentRoutingMode::Auto
+        );
         assert_eq!(
             store
                 .load_or_create("slack:dm:D1:111.000", "kimi")
@@ -5369,6 +5534,7 @@ mod tests {
                 .final_reply()
                 .contains("Active executor: [auto pending]")
         );
+        assert!(status.final_reply().contains("Routing: auto"));
         assert!(
             status
                 .final_reply()
