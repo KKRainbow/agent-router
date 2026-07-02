@@ -1417,19 +1417,28 @@ where
         }
         drop(idle_turn_start_guard);
 
-        let outcome = self
-            .executor
-            .slash_command(ExecutorSlashCommandRequest {
-                session_key: session_key.clone(),
-                executor: executor_name.clone(),
-                cwd: session_cwd,
-                turn: slash_turn,
-                cancel: slash_cancel,
-                previous_session_id,
-                command: command.clone(),
-                user_id: input.user_id,
-            })
-            .await;
+        let outcome = {
+            let mut executor_events = RouterExecutorEventSink::for_slash_command(
+                idle_turn.as_ref().cloned(),
+                &executor_name,
+                output,
+            );
+            self.executor
+                .slash_command(
+                    ExecutorSlashCommandRequest {
+                        session_key: session_key.clone(),
+                        executor: executor_name.clone(),
+                        cwd: session_cwd,
+                        turn: slash_turn,
+                        cancel: slash_cancel,
+                        previous_session_id,
+                        command: command.clone(),
+                        user_id: input.user_id,
+                    },
+                    &mut executor_events,
+                )
+                .await
+        };
         let mut idle_turn = idle_turn;
 
         match outcome {
@@ -1437,6 +1446,7 @@ where
                 if let Some(turn) = idle_turn.take()
                     && turn.commit_if_current(|| async {}).await.is_none()
                 {
+                    output.discard_reply_stream().await;
                     return Ok(());
                 }
                 output.send_final_reply(response.final_text).await
@@ -1495,6 +1505,7 @@ where
                     true
                 };
                 if !committed {
+                    output.discard_reply_stream().await;
                     return Ok(());
                 }
                 output.send_final_reply(response.final_text).await
@@ -1503,6 +1514,7 @@ where
                 if let Some(turn) = idle_turn.take()
                     && turn.commit_if_current(|| async {}).await.is_none()
                 {
+                    output.discard_reply_stream().await;
                     return Ok(());
                 }
                 output
@@ -1528,13 +1540,18 @@ where
                     match committed {
                         Some(Ok(())) => {}
                         Some(Err(discard_err)) => {
+                            output.discard_reply_stream().await;
                             return Err(anyhow::anyhow!(
                                 "slash command failed ({failure}); also failed to discard uncommitted executor session: {discard_err}"
                             ));
                         }
-                        None => return Ok(()),
+                        None => {
+                            output.discard_reply_stream().await;
+                            return Ok(());
+                        }
                     }
                 }
+                output.discard_reply_stream().await;
                 Err(err)
             }
         }
@@ -2906,7 +2923,7 @@ where
 }
 
 struct RouterExecutorEventSink<'a> {
-    turn: TurnGuard,
+    turn: Option<TurnGuard>,
     executor: &'a str,
     output: &'a mut dyn RouterOutputSink,
     updates: Vec<ExecutorUpdate>,
@@ -2921,6 +2938,20 @@ struct RouterReplyStreamState {
 
 impl<'a> RouterExecutorEventSink<'a> {
     fn new(turn: TurnGuard, executor: &'a str, output: &'a mut dyn RouterOutputSink) -> Self {
+        Self {
+            turn: Some(turn),
+            executor,
+            output,
+            updates: Vec::new(),
+            reply_stream: RouterReplyStreamState::default(),
+        }
+    }
+
+    fn for_slash_command(
+        turn: Option<TurnGuard>,
+        executor: &'a str,
+        output: &'a mut dyn RouterOutputSink,
+    ) -> Self {
         Self {
             turn,
             executor,
@@ -2938,7 +2969,11 @@ impl<'a> RouterExecutorEventSink<'a> {
 #[async_trait]
 impl ExecutorEventSink for RouterExecutorEventSink<'_> {
     async fn send(&mut self, update: ExecutorUpdate) -> anyhow::Result<()> {
-        if self.turn.is_output_allowed().await {
+        let output_allowed = match &self.turn {
+            Some(turn) => turn.is_output_allowed().await,
+            None => true,
+        };
+        if output_allowed {
             if let Some(chunk) = reply_chunk_from_executor_update(&update) {
                 if self.reply_stream.should_break_before(&update) {
                     self.output.send_reply_break();
@@ -3224,6 +3259,7 @@ mod tests {
     struct SlashCommandExecutorBackend {
         commands: Arc<Mutex<Vec<ExecutorSlashCommandRequest>>>,
         prepared: Option<PreparedExecutor>,
+        emit_progress: bool,
     }
 
     #[async_trait::async_trait]
@@ -3274,10 +3310,23 @@ mod tests {
         async fn slash_command(
             &self,
             request: ExecutorSlashCommandRequest,
+            events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             let name = request.command.name.clone();
             let args = request.command.args.clone();
             self.commands.lock().await.push(request);
+            if self.emit_progress
+                && let Err(err) = events
+                    .send(
+                        ExecutorUpdate::new("agent_progress", "Slash", "slash progress", "running")
+                            .with_channel_event(ExecutorChannelEvent::agent_progress(
+                                "slash progress",
+                            )),
+                    )
+                    .await
+            {
+                return ExecutorSlashCommandOutcome::Failed(err);
+            }
             let response = ExecutorResponse {
                 final_text: format!("slash command: {name} {args}").trim().to_string(),
             };
@@ -3318,6 +3367,7 @@ mod tests {
         interrupts: Arc<Mutex<Vec<ExecutorInterruptRequest>>>,
         discarded: Arc<Mutex<Vec<ExecutorTurnRef>>>,
         events: Arc<Mutex<Vec<&'static str>>>,
+        emit_reply_chunk: bool,
     }
 
     impl BlockingIdleSlashExecutorBackend {
@@ -3327,6 +3377,14 @@ mod tests {
                 interrupts: Arc::new(Mutex::new(Vec::new())),
                 discarded: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
+                emit_reply_chunk: false,
+            }
+        }
+
+        fn new_emitting_reply_chunk(slash_started: tokio::sync::oneshot::Sender<()>) -> Self {
+            Self {
+                emit_reply_chunk: true,
+                ..Self::new(slash_started)
             }
         }
     }
@@ -3391,6 +3449,7 @@ mod tests {
         async fn slash_command(
             &self,
             _request: ExecutorSlashCommandRequest,
+            _events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             ExecutorSlashCommandOutcome::CompletedWithSession {
                 response: ExecutorResponse {
@@ -3454,8 +3513,20 @@ mod tests {
         async fn slash_command(
             &self,
             request: ExecutorSlashCommandRequest,
+            events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             assert!(request.turn.is_some());
+            if let Err(err) = events
+                .send(ExecutorUpdate::new(
+                    "agent_message_chunk",
+                    "",
+                    "failed draft",
+                    "",
+                ))
+                .await
+            {
+                return ExecutorSlashCommandOutcome::Failed(err);
+            }
             ExecutorSlashCommandOutcome::Failed(anyhow::anyhow!("slash failed"))
         }
 
@@ -3520,8 +3591,21 @@ mod tests {
         async fn slash_command(
             &self,
             request: ExecutorSlashCommandRequest,
+            events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             assert!(request.turn.is_some());
+            if self.emit_reply_chunk
+                && let Err(err) = events
+                    .send(ExecutorUpdate::new(
+                        "agent_message_chunk",
+                        "",
+                        "stale draft",
+                        "",
+                    ))
+                    .await
+            {
+                return ExecutorSlashCommandOutcome::Failed(err);
+            }
             if let Some(started) = self.slash_started.lock().await.take() {
                 let _ = started.send(());
             }
@@ -3612,6 +3696,7 @@ mod tests {
         async fn slash_command(
             &self,
             _request: ExecutorSlashCommandRequest,
+            _events: &mut dyn ExecutorEventSink,
         ) -> ExecutorSlashCommandOutcome {
             if let Some(started) = self.slash_started.lock().await.take() {
                 let _ = started.send(());
@@ -4293,6 +4378,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct CollectingRouterOutputSink {
         events: Vec<RouterOutputEvent>,
+        discarded_reply_stream: bool,
     }
 
     #[async_trait::async_trait]
@@ -4307,6 +4393,10 @@ mod tests {
 
         fn send_reply_chunk(&mut self, chunk: String) {
             self.events.push(RouterOutputEvent::ReplyChunk(chunk));
+        }
+
+        async fn discard_reply_stream(&mut self) {
+            self.discarded_reply_stream = true;
         }
 
         async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
@@ -6148,6 +6238,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_slash_command_emits_executor_events_before_final_reply() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(SlashCommandExecutorBackend {
+            emit_progress: true,
+            ..SlashCommandExecutorBackend::default()
+        });
+        let router = AgentRouter::new("kimi", store, executor);
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "//status".to_string(),
+                    user_id: Some("U1".to_string()),
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            output.events.first(),
+            Some(RouterOutputEvent::Channel(event))
+                if event.kind == RouterChannelEventKind::AgentProgress
+                    && event.executor == "kimi"
+                    && event.text == "slash progress"
+        ));
+        assert_eq!(output.final_reply(), "slash command: status");
+    }
+
+    #[tokio::test]
     async fn agent_slash_command_uses_session_workspace_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_root = tmp.path().join("workspaces");
@@ -6267,7 +6389,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.to_string(), "slash failed");
-        assert!(output.events.is_empty());
+        assert_eq!(
+            output.events.as_slice(),
+            &[RouterOutputEvent::ReplyChunk("failed draft".to_string())]
+        );
+        assert!(output.discarded_reply_stream);
         let discarded = executor.discarded.lock().await;
         assert_eq!(discarded.len(), 1);
         assert_eq!(discarded[0].session_key, "slack:dm:D1:111.000");
@@ -6321,6 +6447,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(slash_output.events.is_empty());
+        assert!(slash_output.discarded_reply_stream);
         let interrupts = executor.interrupts.lock().await;
         assert_eq!(interrupts.len(), 1);
         assert_eq!(interrupts[0].turn.session_key, "slack:dm:D1:111.000");
@@ -6336,7 +6463,9 @@ mod tests {
     async fn idle_agent_slash_command_can_be_replaced_by_message() {
         let store = Arc::new(InMemorySessionStore::default());
         let (slash_started_tx, slash_started_rx) = tokio::sync::oneshot::channel();
-        let executor = Arc::new(BlockingIdleSlashExecutorBackend::new(slash_started_tx));
+        let executor = Arc::new(BlockingIdleSlashExecutorBackend::new_emitting_reply_chunk(
+            slash_started_tx,
+        ));
         let router = Arc::new(AgentRouter::new("kimi", store, executor.clone()));
 
         let slash_router = router.clone();
@@ -6378,7 +6507,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(slash_output.events.is_empty());
+        assert_eq!(
+            slash_output.events.as_slice(),
+            &[RouterOutputEvent::ReplyChunk("stale draft".to_string())]
+        );
+        assert!(slash_output.discarded_reply_stream);
         let interrupts = executor.interrupts.lock().await;
         assert_eq!(interrupts.len(), 1);
         assert_eq!(interrupts[0].turn.session_key, "slack:dm:D1:111.000");

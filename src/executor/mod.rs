@@ -378,6 +378,7 @@ pub trait ExecutorBackend: Send + Sync + 'static {
     async fn slash_command(
         &self,
         _request: ExecutorSlashCommandRequest,
+        _events: &mut dyn ExecutorEventSink,
     ) -> ExecutorSlashCommandOutcome {
         ExecutorSlashCommandOutcome::Unsupported
     }
