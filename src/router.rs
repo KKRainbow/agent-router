@@ -5097,7 +5097,7 @@ mod tests {
         let mut state = SessionState::new(session_key, "kimi");
         state.routing_mode = AgentRoutingMode::Manual;
         state.set_active_executor(Some("route-planner".to_string()));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let executor = Arc::new(OrchestratorTestBackend::new(
             r#"{"action":"handoff","executor":"codex","reason":"code work"}"#,
         ));
@@ -5130,7 +5130,7 @@ mod tests {
         assert_eq!(prompts[1].executor, "codex");
         assert_eq!(prompts[1].session_key, session_key);
         drop(prompts);
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.routing_mode, AgentRoutingMode::Auto);
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
     }
