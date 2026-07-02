@@ -82,14 +82,14 @@ The first command surface is explicit executor switching:
 /agent codex
 /agent kimi
 /agent status
-/agent done
+/agent auto
 ```
 
-`/agent <name>` creates or resumes the executor's private backend session for
-the current user-visible session.
+`/agent <name>` enters manual routing for the current user-visible session and
+creates or resumes the executor's private backend session.
 
-`/agent done` ends the current external takeover and returns to the configured
-default executor.
+`/agent auto` exits manual routing so the router can select the executor
+automatically again.
 
 Natural-language completion, such as "这个事情做完了", can be added after the
 explicit command path is stable.

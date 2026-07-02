@@ -370,14 +370,17 @@ orchestrator 可能产生副作用。
 
 手动命令优先级高于 orchestrator：
 
-- `/agent status` 显示 default、active、orchestrator 状态和普通 task executors。
-- `/agent <executor>` 显式切换 `active_executor`。
-- `/agent done` 回到 `default_executor`，不会重新触发 orchestrator。
-- `/agent auto` 清空 `active_executor`，让下一条普通消息重新走 orchestrator。
+- `/agent status` 显示 routing、default、active、orchestrator 状态和普通 task
+  executors。
+- `/agent <executor>` 进入 manual routing，显式切换 `active_executor`，后续普通
+  消息不再被 per-turn orchestrator 接管。
+- `/agent auto` 退出 manual routing，清空 `active_executor`，让下一条普通消息重新走
+  orchestrator。
 
 建议 `/agent status` 输出类似：
 
 ```text
+Routing: manual
 Default executor: kimi
 Active executor: codex
 Orchestrator: route-planner enabled
@@ -389,6 +392,7 @@ Executors:
 如果 `active_executor` 为空，`/agent status` 可以显示：
 
 ```text
+Routing: auto
 Default executor: kimi
 Active executor: [auto pending]
 Orchestrator: route-planner enabled
@@ -505,17 +509,16 @@ reply。
 - target prepare failure 回滚 `active_executor`；如果本轮 handoff 前仍是 auto-pending，
   则回退到 `default_executor`。
 - target prompt failure 保留 seen-context cursor。
-- `/agent auto` 清空 `active_executor`。
-- `/agent done` 设置 `active_executor = default_executor`，不清空 active executor。
+- `/agent <executor>` 设置 manual routing 并写入 `active_executor`。
+- `/agent auto` 设置 auto routing 并清空 `active_executor`。
 
 集成测试：
 
 - `policy_file` 路径解析和 size limit 生效。
 - 修改 policy 文件后下一次路由判断可生效。
 - orchestrator channel events 被抑制。
-- `/agent <executor>` 手动切换优先。
-- `/agent done` 回到 default 后不会重新启用初始路由。
-- `/agent auto` 后下一条普通消息重新启用初始路由。
+- `/agent <executor>` 手动切换优先，并在 per-turn mode 下绕过 orchestrator。
+- `/agent auto` 后下一条普通消息重新启用 orchestrator 路由。
 - `/agent status` 显示 orchestrator 状态但不把它列为普通 handoff target。
 
 回归测试：
