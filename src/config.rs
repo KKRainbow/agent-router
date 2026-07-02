@@ -116,6 +116,17 @@ pub enum ExecutorProtocol {
     PiRpc,
 }
 
+impl ExecutorProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Acp => "acp",
+            Self::AppServer => "app_server",
+            Self::ClaudeStreamJson => "claude_stream_json",
+            Self::PiRpc => "pi_rpc",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub name: String,

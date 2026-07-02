@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_router::{
     approval::ApprovalBroker,
@@ -7,7 +7,7 @@ use agent_router::{
     executor::registry::ExecutorRegistry,
     machine::MachineRegistry,
     router::{AgentRouter, RouterService, SessionApprovalPolicy},
-    session::store::InMemorySessionStore,
+    session::store::{ConfiguredExecutor, ProductionSessionStore},
 };
 use clap::Parser;
 use tokio::task::JoinSet;
@@ -41,7 +41,26 @@ async fn main() -> anyhow::Result<()> {
     }
     let config = AppConfig::load(config_path.as_deref())?;
 
-    let store = Arc::new(InMemorySessionStore::default());
+    if let Some(root) = &config.workspace.root {
+        tracing::info!(workspace_root = %root.display(), "using workspace session persistence");
+    } else {
+        tracing::info!("workspace.root is not configured; using in-memory session store");
+    }
+    let session_executors = config
+        .executors
+        .iter()
+        .map(|(name, executor)| {
+            (
+                name.clone(),
+                ConfiguredExecutor::new(executor.protocol.as_str(), executor.machine.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let store = Arc::new(ProductionSessionStore::new(
+        config.workspace.root.clone(),
+        config.router.default_executor.clone(),
+        session_executors,
+    ));
     let mut approval_policy = SessionApprovalPolicy::new(
         config.router.default_executor.clone(),
         config.approval.default_mode,
