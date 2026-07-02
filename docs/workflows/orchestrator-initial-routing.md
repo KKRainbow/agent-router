@@ -259,6 +259,9 @@ Orchestrator 必须只输出一个 JSON object，不能包含额外解释文本�
   `stay`。
 - `mode: per_turn` 下，`executor == active_executor` 的 `handoff` 归一化为
   `stay`。
+- orchestrator 使用独立的临时 routing session；即使 route decision 选择了
+  orchestrator 配置的同名 executor，后续 task turn 也必须切回用户 session key
+  执行。
 - `reason` 仅用于诊断，不作为命令执行。
 - 忽略未知字段。
 - JSON 解析失败或 schema 不合法时按 `stay` 处理。
@@ -278,6 +281,7 @@ Return only one JSON object matching the route decision schema.
 Configured task executors:
 - kimi
 - codex
+- route-planner
 
 Current session:
 - source: slack
@@ -418,8 +422,9 @@ Executors:
 - codex: app_server
 ```
 
-Orchestrator 不应该作为普通 `/agent route-planner` 目标出现。如果用户手动请求切
-到 orchestrator，router 应拒绝并说明它是控制组件，不承接用户任务。
+Orchestrator executor 可以作为普通 `/agent route-planner` 目标出现。控制面的
+route decision turn 仍然使用 `__agent_router_orchestrator__:` 前缀的临时 session，
+普通任务 turn 使用用户原始 session key，避免两种上下文混用。
 
 ## 失败处理
 
@@ -518,7 +523,8 @@ reply。
 - 合法 `handoff` decision 更新 `active_executor` 并投递给 target 一次。
 - `mode: initial` 下，target 为 default 时归一化为 `stay`。
 - `mode: per_turn` 下，target 为当前 active executor 时归一化为 `stay`。
-- target 为 orchestrator executor 时拒绝。
+- target 为 orchestrator executor 时按普通 task executor 接受，但 task turn 使用
+  用户原始 session key。
 - target 未配置时按 `stay`。
 - malformed JSON 按 `stay`。
 - `mode: initial` 下，orchestrator failure/timeout 按 `stay`，并设置

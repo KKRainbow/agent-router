@@ -2,7 +2,8 @@ router:
   default_executor: kimi
   # Optional routing executor. In initial mode it decides the first real executor
   # for an auto-pending session; in per_turn mode it decides each normal turn.
-  # It never handles user tasks directly.
+  # Router decisions use an isolated transient session. The same executor name
+  # may still be selected later as the normal task executor for a user session.
   # orchestrator:
   #   enabled: true
   #   mode: initial

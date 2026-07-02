@@ -938,10 +938,7 @@ where
     }
 
     async fn load_or_create_session_state(&self, session_key: &str) -> SessionState {
-        if let Some(mut state) = self.store.load(session_key).await {
-            if self.normalize_reserved_active_executor(&mut state) {
-                self.store.save(state.clone()).await;
-            }
+        if let Some(state) = self.store.load(session_key).await {
             return state;
         }
         let mut state = SessionState::new(session_key, &self.default_executor);
@@ -956,29 +953,6 @@ where
         self.orchestrator
             .as_ref()
             .is_some_and(|orchestrator| orchestrator.enabled)
-    }
-
-    fn is_orchestrator_executor(&self, executor: &str) -> bool {
-        self.orchestrator
-            .as_ref()
-            .is_some_and(|orchestrator| orchestrator.enabled && orchestrator.executor == executor)
-    }
-
-    fn normalize_reserved_active_executor(&self, state: &mut SessionState) -> bool {
-        let Some(executor) = state.active_executor.clone() else {
-            return false;
-        };
-        if !self.is_orchestrator_executor(&executor) {
-            return false;
-        }
-        tracing::warn!(
-            session_key = %state.session_key,
-            executor = %executor,
-            "cleared reserved orchestrator active executor from session state"
-        );
-        state.routing_mode = AgentRoutingMode::Auto;
-        state.set_active_executor(None);
-        true
     }
 
     async fn interrupt_turn(&self, turn: InterruptedTurn) {
@@ -1225,13 +1199,6 @@ where
         if self.executor.get(target).is_none() {
             return output
                 .send_final_reply(format!("Executor `{target}` is not configured."))
-                .await;
-        }
-        if self.is_orchestrator_executor(target) {
-            return output
-                .send_final_reply(format!(
-                    "Executor `{target}` is reserved for routing decisions and cannot handle user tasks."
-                ))
                 .await;
         }
         state.routing_mode = AgentRoutingMode::Manual;
@@ -1785,14 +1752,6 @@ where
     ) -> RouteDecision {
         match decision {
             RouteDecision::Stay { reason } => RouteDecision::Stay { reason },
-            RouteDecision::Handoff { executor, reason } if executor == orchestrator.executor => {
-                tracing::warn!(
-                    orchestrator = %orchestrator.executor,
-                    target = %executor,
-                    "rejected orchestrator route decision to control executor"
-                );
-                RouteDecision::Stay { reason }
-            }
             RouteDecision::Handoff { executor, reason }
                 if orchestrator.mode == OrchestratorMode::Initial
                     && executor == state.default_executor =>
@@ -1832,7 +1791,6 @@ where
             .executor
             .list()
             .into_iter()
-            .filter(|descriptor| descriptor.name != orchestrator.executor)
             .map(|descriptor| format!("- {}", descriptor.name))
             .collect::<Vec<_>>()
             .join("\n");
@@ -2508,12 +2466,7 @@ Current user message:\n{}",
             lines.push(format!("Session cwd: {}", cwd.display()));
         }
         lines.push("Executors:".to_string());
-        for descriptor in self
-            .executor
-            .list()
-            .into_iter()
-            .filter(|descriptor| !self.is_orchestrator_executor(&descriptor.name))
-        {
+        for descriptor in self.executor.list() {
             let binding = state.executor_bindings.get(&descriptor.name);
             let suffix = binding
                 .and_then(|binding| binding.external_session_id.as_ref())
@@ -3774,11 +3727,12 @@ mod tests {
                 return ExecutorPromptOutcome::Cancelled;
             }
             let executor = request.turn.executor.clone();
+            let session_key = request.turn.session_key.clone();
             self.prompts
                 .lock()
                 .await
                 .push(crate::executor::test_support::ExecutorRequest {
-                    session_key: request.turn.session_key,
+                    session_key: session_key.clone(),
                     executor: executor.clone(),
                     generation: request.turn.generation,
                     prompt: request.prompt,
@@ -3787,7 +3741,9 @@ mod tests {
             let _ = events
                 .send(ExecutorUpdate::new("progress", "Progress", "working", ""))
                 .await;
-            let final_text = if executor == "route-planner" {
+            let final_text = if executor == "route-planner"
+                && session_key.starts_with("__agent_router_orchestrator__:")
+            {
                 self.decision_text.clone()
             } else {
                 format!("{executor} response")
@@ -4626,6 +4582,7 @@ mod tests {
         assert!(prompts[0].prompt.contains("- orchestrator_mode: initial"));
         assert!(prompts[0].prompt.contains("- routing_mode: auto"));
         assert!(prompts[0].prompt.contains("- active_executor: none"));
+        assert!(prompts[0].prompt.contains("- route-planner"));
         assert!(!prompts[0].prompt.contains("slack:dm:D1:111.000"));
         assert!(prompts[0].prompt.contains("Routing policy markdown:"));
         assert!(prompts[0].prompt.contains("please edit this repo"));
@@ -4652,6 +4609,48 @@ mod tests {
         assert_eq!(saved.transcript[0].content, "please edit this repo");
         assert!(saved.executor_bindings.contains_key("codex"));
         assert!(!saved.executor_bindings.contains_key("route-planner"));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_can_route_to_its_executor_as_task_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(OrchestratorTestBackend::new(
+            r#"{"action":"handoff","executor":"route-planner","reason":"pi task"}"#,
+        ));
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone()).with_orchestrator(
+            Some(test_orchestrator_settings(write_orchestrator_policy(&tmp))),
+        );
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "web:user:local:pi-task".to_string(),
+                    text: "use the pi executor".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "route-planner response");
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].executor, "route-planner");
+        assert!(
+            prompts[0]
+                .session_key
+                .starts_with("__agent_router_orchestrator__:")
+        );
+        assert_eq!(prompts[1].executor, "route-planner");
+        assert_eq!(prompts[1].session_key, "web:user:local:pi-task");
+        drop(prompts);
+
+        let saved = store.load_or_create("web:user:local:pi-task", "kimi").await;
+        assert_eq!(saved.active_executor.as_deref(), Some("route-planner"));
+        assert!(saved.executor_bindings.contains_key("route-planner"));
     }
 
     #[tokio::test]
@@ -4903,7 +4902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_orchestrator_active_executor_is_cleared_before_routing() {
+    async fn restored_orchestrator_executor_active_executor_is_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySessionStore::default());
         let session_key = "slack:dm:D1:111.000";
@@ -4931,21 +4930,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(output.final_reply(), "codex response");
+        assert_eq!(output.final_reply(), "route-planner response");
         let prompts = executor.prompts.lock().await;
-        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].executor, "route-planner");
-        assert!(
-            prompts[0]
-                .session_key
-                .starts_with("__agent_router_orchestrator__:")
-        );
-        assert_eq!(prompts[1].executor, "codex");
-        assert_eq!(prompts[1].session_key, session_key);
+        assert_eq!(prompts[0].session_key, session_key);
         drop(prompts);
         let saved = store.load(session_key).await.unwrap();
-        assert_eq!(saved.routing_mode, AgentRoutingMode::Auto);
-        assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+        assert_eq!(saved.routing_mode, AgentRoutingMode::Manual);
+        assert_eq!(saved.active_executor.as_deref(), Some("route-planner"));
     }
 
     #[tokio::test]
@@ -5671,7 +5664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestrator_executor_is_hidden_from_agent_targets() {
+    async fn orchestrator_executor_is_available_as_agent_target() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySessionStore::default());
         let executor = Arc::new(OrchestratorTestBackend::new(
@@ -5704,7 +5697,7 @@ mod tests {
                 .final_reply()
                 .contains("Orchestrator: route-planner enabled")
         );
-        assert!(!status.final_reply().contains("- route-planner:"));
+        assert!(status.final_reply().contains("- route-planner:"));
 
         let mut switch = CollectingRouterOutputSink::default();
         router
@@ -5718,10 +5711,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            switch
-                .final_reply()
-                .contains("reserved for routing decisions")
+        assert_eq!(
+            switch.final_reply(),
+            "Routing: manual\nActive executor: route-planner"
         );
     }
 
