@@ -22,7 +22,8 @@ Agent Router 仍然是真正的控制平面，负责校验 decision、设置 `ac
 - Orchestrator 选择 default backend 时，router 设置
   `active_executor = default_executor`。
 - Orchestrator 选择其他 target 时，router 设置 `active_executor = target`。
-- 一旦 `active_executor` 被设置，后续消息直接进入该 executor。
+- 一旦 `active_executor` 被设置，`mode: initial` 下后续消息直接进入该 executor。
+- `mode: per_turn` 下，auto routing 仍会在后续普通消息前调用 orchestrator。
 - `/agent auto` 可以显式清空 `active_executor`，让下一条普通消息重新自动选择。
 - 不做任务完成自动回收，不做 target-to-target 自动路由。
 
@@ -324,18 +325,24 @@ orchestrator 可能产生副作用。
 2. 获取 per-session router lock。
 3. 加载或创建 `SessionState`。
 4. 如果消息是 `/agent` 命令，按现有手动命令处理。
-5. 如果 `active_executor` 已存在，跳过 orchestrator，直接投递到当前 active
+5. 如果 routing mode 为 manual，跳过 orchestrator，直接投递到当前 active
    executor。
-6. 如果 `active_executor` 为空且 orchestrator 未启用，设置
+6. 如果 routing mode 为 auto 且 orchestrator mode 为 per-turn，读取并校验
+   `policy_file`，为本轮普通消息请求 orchestrator decision。
+7. 如果 routing mode 为 auto、orchestrator mode 为 initial，且 `active_executor`
+   已存在，跳过 orchestrator，直接投递到当前 active executor。
+8. 如果 `active_executor` 为空且 orchestrator 未启用，设置
    `active_executor = default_executor`，然后投递原始用户消息。
-7. 如果 `active_executor` 为空且 orchestrator 启用，读取并校验 `policy_file`。
-8. 构造短 transcript projection 和 orchestrator prompt。
-9. 使用独立 routing session 调用 orchestrator executor。
-10. 解析并校验 JSON decision。
-11. `stay`：保存 `active_executor = default_executor`。
-12. `handoff`：保存 `active_executor = target`。
-13. 原始用户消息投递给选定的 active executor。
-14. 选定 executor 成功后，按现有逻辑追加 user 和 assistant transcript，并更新
+9. 如果 routing mode 为 auto、orchestrator mode 为 initial，且 `active_executor`
+   为空，读取并校验 `policy_file`。
+10. 构造短 transcript projection 和 orchestrator prompt。
+11. 使用独立 routing session 调用 orchestrator executor。
+12. 解析并校验 JSON decision。
+13. `stay`：保存当前 active executor；如果仍是 auto-pending，则保存
+    `active_executor = default_executor`。
+14. `handoff`：保存 `active_executor = target`。
+15. 原始用户消息投递给选定的 active executor。
+16. 选定 executor 成功后，按现有逻辑追加 user 和 assistant transcript，并更新
     对应 executor binding。
 
 注意：orchestrator 只是选择真实承接者。用户消息不能先由 orchestrator 当作真实
@@ -554,12 +561,14 @@ Slice 3：受限 orchestrator 调用
 - 设置 timeout。
 - 不写 transcript 和普通 binding。
 
-Slice 4：初始路由状态切换
+Slice 4：自动路由状态切换
 
-- 只在 `active_executor = None` 时调用 orchestrator。
+- `mode: initial` 只在 `active_executor = None` 时调用 orchestrator。
+- `mode: per_turn` 在 routing mode 为 auto 时，每条普通消息前调用 orchestrator。
+- routing mode 为 manual 时直接使用当前 `active_executor`。
 - `stay` 复用现有 default executor flow。
 - `handoff` 保存 active executor，再复用现有 target executor flow。
-- `/agent auto` 清空 active executor。
+- `/agent auto` 设置 auto routing 并清空 active executor。
 
 Slice 5：失败路径与可观测性
 
