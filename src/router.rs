@@ -24,6 +24,7 @@ use crate::{
         ExecutorSlashCommandOutcome, ExecutorSlashCommandRequest, ExecutorSlashCommandSupport,
         ExecutorTurnRef, ExecutorUpdate, InterruptReason, TurnCancellation,
     },
+    machine::session_workspace_dir_name,
     session::{
         AgentRoutingMode, ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding,
         ExecutorHealth, MessageRole, SessionState, TranscriptMessage,
@@ -583,7 +584,6 @@ pub struct SessionApprovalPolicy<S>
 where
     S: SessionStore,
 {
-    default_executor: String,
     default_mode: ApprovalMode,
     denied_approval_executors: BTreeSet<String>,
     store: Arc<S>,
@@ -594,12 +594,11 @@ where
     S: SessionStore,
 {
     pub fn new(
-        default_executor: impl Into<String>,
+        _default_executor: impl Into<String>,
         default_mode: ApprovalMode,
         store: Arc<S>,
     ) -> Self {
         Self {
-            default_executor: default_executor.into(),
             default_mode,
             denied_approval_executors: BTreeSet::new(),
             store,
@@ -627,12 +626,19 @@ where
             );
             return Some(ApprovalSelection::Cancelled);
         }
-        let effective_mode = self
-            .store
-            .load(&request.session_key)
-            .await
-            .and_then(|state| state.approval_mode_override)
-            .unwrap_or(self.default_mode);
+        let effective_mode = match self.store.load(&request.session_key).await {
+            Ok(state) => state
+                .and_then(|state| state.approval_mode_override)
+                .unwrap_or(self.default_mode),
+            Err(err) => {
+                tracing::warn!(
+                    session_key = %request.session_key,
+                    error = %err,
+                    "could not load session approval override"
+                );
+                self.default_mode
+            }
+        };
         if effective_mode != ApprovalMode::Yolo {
             return None;
         }
@@ -781,7 +787,7 @@ impl PreparedContextSync {
     {
         let records = self.plan.commit()?;
         self.state.context_artifacts = records;
-        store.save(self.state).await;
+        store.save(self.state).await?;
         tracing::info!(
             session_key = %self.session_key,
             source = %self.source,
@@ -824,11 +830,11 @@ impl PreparedContextSync {
         let old_state = self.state.clone();
         let records = installed.records().to_vec();
         self.state.context_artifacts = records;
-        store.save(self.state).await;
+        store.save(self.state).await?;
         hook(ContextCommitCheckpoint::AfterStateSave).await;
         if !turn.is_context_commit_allowed().await {
             drop(installed);
-            store.save(old_state).await;
+            store.save(old_state).await?;
             return Ok(false);
         }
         installed.finish();
@@ -937,19 +943,22 @@ where
             .clone()
     }
 
-    async fn load_or_create_session_state(&self, session_key: &str) -> SessionState {
-        if let Some(mut state) = self.store.load(session_key).await {
+    async fn load_or_create_session_state(
+        &self,
+        session_key: &str,
+    ) -> anyhow::Result<SessionState> {
+        if let Some(mut state) = self.store.load(session_key).await? {
             if self.normalize_reserved_active_executor(&mut state) {
-                self.store.save(state.clone()).await;
+                self.store.save(state.clone()).await?;
             }
-            return state;
+            return Ok(state);
         }
         let mut state = SessionState::new(session_key, &self.default_executor);
         if self.orchestrator_enabled() {
             state.set_active_executor(None);
         }
-        self.store.save(state.clone()).await;
-        state
+        self.store.save(state.clone()).await?;
+        Ok(state)
     }
 
     fn orchestrator_enabled(&self) -> bool {
@@ -1041,7 +1050,17 @@ where
             );
             return;
         }
-        let Some(mut state) = self.store.load(session_key).await else {
+        let Some(mut state) = (match self.store.load(session_key).await {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!(
+                    session_key,
+                    error = %err,
+                    "could not load session for route failure rollback"
+                );
+                return;
+            }
+        }) else {
             return;
         };
         if state.active_executor_revision != route_active_executor_revision {
@@ -1054,7 +1073,13 @@ where
             return;
         }
         state.set_active_executor(failure_active_executor.clone());
-        self.store.save(state).await;
+        if let Err(err) = self.store.save(state).await {
+            tracing::warn!(
+                session_key,
+                error = %err,
+                "could not persist route failure rollback"
+            );
+        }
     }
 
     async fn route_rollback_was_superseded(
@@ -1123,7 +1148,7 @@ where
             return Ok(());
         }
         let text_len = text.len();
-        let Some(mut state) = self.store.load(&input.session_key).await else {
+        let Some(mut state) = self.store.load(&input.session_key).await? else {
             tracing::debug!(
                 session_key = %input.session_key,
                 text_len,
@@ -1132,7 +1157,7 @@ where
             return Ok(());
         };
         state.transcript.push(TranscriptMessage::user(input.text));
-        self.store.save(state).await;
+        self.store.save(state).await?;
         tracing::info!(
             session_key = %input.session_key,
             text_len,
@@ -1147,7 +1172,7 @@ where
     ) -> anyhow::Result<Option<PreparedContextSync>> {
         let mut state = self
             .load_or_create_session_state(&request.session_key)
-            .await;
+            .await?;
         let Some(session_cwd) = self.ensure_session_cwd(&mut state)? else {
             tracing::warn!(
                 session_key = %request.session_key,
@@ -1203,7 +1228,7 @@ where
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
         let args = text.trim_start_matches("/agent").trim();
-        let mut state = self.load_or_create_session_state(session_key).await;
+        let mut state = self.load_or_create_session_state(session_key).await?;
         if args.is_empty() || args == "status" {
             return output.send_final_reply(self.render_status(&state)).await;
         }
@@ -1217,7 +1242,7 @@ where
         if target == "auto" {
             state.routing_mode = AgentRoutingMode::Auto;
             state.set_active_executor(None);
-            self.store.save(state).await;
+            self.store.save(state).await?;
             return output
                 .send_final_reply("Routing: auto\nActive executor: [auto pending]".to_string())
                 .await;
@@ -1236,7 +1261,7 @@ where
         }
         state.routing_mode = AgentRoutingMode::Manual;
         state.set_active_executor(Some(target.to_string()));
-        self.store.save(state).await;
+        self.store.save(state).await?;
         output
             .send_final_reply(format!("Routing: manual\nActive executor: {target}"))
             .await
@@ -1249,7 +1274,7 @@ where
         output: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
         let args = text.trim_start_matches("/yolo").trim();
-        let mut state = self.load_or_create_session_state(session_key).await;
+        let mut state = self.load_or_create_session_state(session_key).await?;
         if args.is_empty() || args == "status" {
             return output
                 .send_final_reply(self.render_yolo_status(&state))
@@ -1264,7 +1289,7 @@ where
         match args {
             "on" => {
                 state.approval_mode_override = Some(ApprovalMode::Yolo);
-                self.store.save(state.clone()).await;
+                self.store.save(state.clone()).await?;
                 output
                     .send_final_reply(self.render_yolo_status_with_prefix(
                         "YOLO mode enabled for this session.",
@@ -1274,7 +1299,7 @@ where
             }
             "off" => {
                 state.approval_mode_override = Some(ApprovalMode::Normal);
-                self.store.save(state.clone()).await;
+                self.store.save(state.clone()).await?;
                 output
                     .send_final_reply(self.render_yolo_status_with_prefix(
                         "YOLO mode disabled for this session.",
@@ -1284,7 +1309,7 @@ where
             }
             "inherit" => {
                 state.approval_mode_override = None;
-                self.store.save(state.clone()).await;
+                self.store.save(state.clone()).await?;
                 output
                     .send_final_reply(self.render_yolo_status_with_prefix(
                         "YOLO mode now inherits the global default.",
@@ -1330,13 +1355,13 @@ where
         let (executor_name, descriptor, support, previous_session_id, early_reply) = {
             let lock = self.session_lock(&session_key).await;
             let _guard = lock.lock().await;
-            let mut state = self.load_or_create_session_state(&session_key).await;
+            let mut state = self.load_or_create_session_state(&session_key).await?;
             let executor_name = match state.active_executor.clone() {
                 Some(executor_name) => executor_name,
                 None => {
                     let executor_name = state.default_executor.clone();
                     state.set_active_executor(Some(executor_name.clone()));
-                    self.store.save(state.clone()).await;
+                    self.store.save(state.clone()).await?;
                     executor_name
                 }
             };
@@ -1386,9 +1411,9 @@ where
             if let Some(context) = context {
                 self.sync_context_locked(context).await?;
             }
-            let mut state = self.load_or_create_session_state(&session_key).await;
+            let mut state = self.load_or_create_session_state(&session_key).await?;
             let session_cwd = self.ensure_session_cwd(&mut state)?;
-            self.store.save(state).await;
+            self.store.save(state).await?;
             session_cwd
         };
 
@@ -1458,7 +1483,7 @@ where
                             let mut latest = self
                                 .store
                                 .load_or_create(&session_key, &self.default_executor)
-                                .await;
+                                .await?;
                             let latest_binding = latest.binding_for(&executor_name);
                             if let Some(machine_workspace) = prepared_machine_workspace {
                                 latest.machine_workspaces.insert(
@@ -1476,9 +1501,10 @@ where
                                     prepared_cwd.as_deref(),
                                 ),
                             );
-                            self.store.save(latest).await;
+                            self.store.save(latest).await
                         })
                         .await
+                        .transpose()?
                         .is_some();
                     drop(_guard);
                     if !committed && !discard_session_on_interrupt {
@@ -1591,7 +1617,7 @@ where
         {
             self.sync_context_locked(context).await?;
         }
-        let state = self.load_or_create_session_state(session_key).await;
+        let state = self.load_or_create_session_state(session_key).await?;
         let Some(orchestrator) = self
             .orchestrator
             .as_ref()
@@ -1956,7 +1982,7 @@ Current user message:\n{}",
             if needs_turn_start_gate && let Some(context) = context.take() {
                 self.sync_context_locked(context).await?;
             }
-            let mut state = self.load_or_create_session_state(&session_key).await;
+            let mut state = self.load_or_create_session_state(&session_key).await?;
             if turn_reservation.is_none()
                 && state.active_executor.is_none()
                 && self.orchestrator_enabled()
@@ -2033,7 +2059,7 @@ Current user message:\n{}",
                 replaced = begun.interrupted;
                 begun.guard
             };
-            self.store.save(state.clone()).await;
+            self.store.save(state.clone()).await?;
             if let Some(context) = context {
                 let prepared = match self.prepare_context_sync_locked(context).await {
                     Ok(prepared) => prepared,
@@ -2047,7 +2073,7 @@ Current user message:\n{}",
                             &route_selection.failure_active_executor,
                             superseded,
                         );
-                        self.store.save(state).await;
+                        self.store.save(state).await?;
                         let _ = turn.abandon_if_current().await;
                         return Err(err);
                     }
@@ -2066,7 +2092,7 @@ Current user message:\n{}",
                                     &route_selection.failure_active_executor,
                                     superseded,
                                 );
-                                self.store.save(state).await;
+                                self.store.save(state).await?;
                                 let _ = turn.abandon_if_current().await;
                                 return Err(err);
                             }
@@ -2079,7 +2105,7 @@ Current user message:\n{}",
                             &route_selection.failure_active_executor,
                             route_was_superseded_by_new_message(&turn.cancellation()).await,
                         );
-                        self.store.save(state).await;
+                        self.store.save(state).await?;
                         tracing::debug!(
                             session_key = %session_key,
                             generation = turn.log_generation(),
@@ -2090,7 +2116,7 @@ Current user message:\n{}",
                     state = self
                         .store
                         .load_or_create(&session_key, &self.default_executor)
-                        .await;
+                        .await?;
                 }
             }
             let binding = state.binding_for(&executor_name);
@@ -2196,7 +2222,7 @@ Current user message:\n{}",
                         let mut latest = self
                             .store
                             .load_or_create(&session_key, &self.default_executor)
-                            .await;
+                            .await?;
                         restore_active_executor_after_route_failure(
                             &mut latest,
                             route_source,
@@ -2217,9 +2243,10 @@ Current user message:\n{}",
                                 )
                             },
                         );
-                        self.store.save(latest).await;
+                        self.store.save(latest).await
                     })
                     .await
+                    .transpose()?
                     .is_some()
                 };
                 if !committed_failure {
@@ -2330,7 +2357,7 @@ Current user message:\n{}",
                         let mut latest = self
                             .store
                             .load_or_create(&session_key, &self.default_executor)
-                            .await;
+                            .await?;
                         let latest_binding = latest.binding_for(&executor_name);
                         latest.transcript.push(user_entry);
                         latest.transcript.push(assistant_entry);
@@ -2351,9 +2378,10 @@ Current user message:\n{}",
                                 new_fingerprints,
                             ),
                         );
-                        self.store.save(latest).await;
+                        self.store.save(latest).await
                     })
                     .await
+                    .transpose()?
                     .is_some()
                 };
                 if !committed {
@@ -2413,7 +2441,7 @@ Current user message:\n{}",
                         let mut latest = self
                             .store
                             .load_or_create(&session_key, &self.default_executor)
-                            .await;
+                            .await?;
                         restore_active_executor_after_route_failure(
                             &mut latest,
                             route_source,
@@ -2437,9 +2465,10 @@ Current user message:\n{}",
                                 prepared_cwd.as_deref(),
                             ),
                         );
-                        self.store.save(latest).await;
+                        self.store.save(latest).await
                     })
                     .await
+                    .transpose()?
                     .is_some()
                 };
                 if !committed_failure {
@@ -2802,7 +2831,7 @@ where
         let (state_context, state_cwd) = self
             .store
             .load(session_key)
-            .await
+            .await?
             .map(|state| (state.context_artifacts, state.cwd))
             .unwrap_or_default();
         let recovery_cwd = state_cwd.or_else(|| {
@@ -2831,7 +2860,7 @@ where
     async fn session_state(&self, session_key: &str) -> anyhow::Result<Option<SessionState>> {
         let lock = self.session_lock(session_key).await;
         let _guard = lock.lock().await;
-        Ok(self.store.load(session_key).await)
+        self.store.load(session_key).await
     }
 
     async fn sync_context(&self, request: ContextSyncRequest) -> anyhow::Result<()> {
@@ -3095,40 +3124,6 @@ fn binding_with_executor_cwd_or_clear(
     binding
 }
 
-fn session_workspace_dir_name(session_key: &str) -> String {
-    let raw_prefix = session_key
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let mut prefix = raw_prefix
-        .split('-')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    if prefix.is_empty() {
-        prefix = "session".to_string();
-    }
-    if prefix.len() > 48 {
-        prefix.truncate(48);
-        prefix = prefix.trim_end_matches('-').to_string();
-        if prefix.is_empty() {
-            prefix = "session".to_string();
-        }
-    }
-    let digest = Sha256::digest(session_key.as_bytes());
-    let hash = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{prefix}-{hash}")
-}
-
 fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -3211,7 +3206,7 @@ mod tests {
                 ContextFileInput, ContextSyncIssueInput,
             },
             projection::message_fingerprint,
-            store::InMemorySessionStore,
+            store::{InMemorySessionStore, WorkspaceSessionStore},
         },
     };
     use serde_json::json;
@@ -4495,6 +4490,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_session_store_restores_transcript_binding_and_seen_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_key = "slack:C1:T1";
+        let executors = BTreeSet::from(["kimi".to_string()]);
+        let store = Arc::new(WorkspaceSessionStore::new(
+            tmp.path(),
+            "kimi",
+            executors.clone(),
+        ));
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store, executor)
+            .with_workspace_root(Some(tmp.path().to_path_buf()));
+
+        let mut first_output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "first".to_string(),
+                    user_id: None,
+                },
+                &mut first_output,
+            )
+            .await
+            .unwrap();
+
+        let restarted_store = Arc::new(WorkspaceSessionStore::new(tmp.path(), "kimi", executors));
+        let restarted_executor = Arc::new(FakeExecutorBackend::default());
+        let restarted_router =
+            AgentRouter::new("kimi", restarted_store.clone(), restarted_executor.clone())
+                .with_workspace_root(Some(tmp.path().to_path_buf()));
+
+        let mut second_output = CollectingRouterOutputSink::default();
+        restarted_router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "second".to_string(),
+                    user_id: None,
+                },
+                &mut second_output,
+            )
+            .await
+            .unwrap();
+
+        let prepared = restarted_executor.prepared.lock().await;
+        assert_eq!(
+            prepared[0].previous_session_id.as_deref(),
+            Some("fake-session")
+        );
+        drop(prepared);
+
+        let prompts = restarted_executor.prompts.lock().await;
+        assert_eq!(prompts[0].prompt, "second");
+        drop(prompts);
+
+        let saved = restarted_store
+            .load_or_create(session_key, "kimi")
+            .await
+            .unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
+        assert_eq!(saved.transcript.len(), 4);
+        assert_eq!(saved.transcript[0].content, "first");
+        assert_eq!(saved.transcript[2].content, "second");
+        assert!(
+            !saved
+                .executor_bindings
+                .get("kimi")
+                .unwrap()
+                .seen_context
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn orchestrator_handoff_routes_initial_message_to_target_once() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySessionStore::default());
@@ -4556,7 +4626,10 @@ mod tests {
         assert!(!prepared[0].turn.session_key.contains("111.000"));
         drop(prepared);
 
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[0].content, "please edit this repo");
@@ -4710,7 +4783,7 @@ mod tests {
             1
         );
         drop(prompts);
-        let saved = store.load("slack:dm:D1:111.000").await.unwrap();
+        let saved = store.load("slack:dm:D1:111.000").await.unwrap().unwrap();
         assert_eq!(saved.routing_mode, AgentRoutingMode::Manual);
         assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
     }
@@ -4807,7 +4880,7 @@ mod tests {
             1
         );
         drop(prompts);
-        let saved = store.load("slack:dm:D1:111.000").await.unwrap();
+        let saved = store.load("slack:dm:D1:111.000").await.unwrap().unwrap();
         assert_eq!(saved.routing_mode, AgentRoutingMode::Auto);
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
     }
@@ -4864,7 +4937,7 @@ mod tests {
         let store = Arc::new(InMemorySessionStore::default());
         let mut state = SessionState::new("slack:dm:D1:111.000", "kimi");
         state.set_active_executor(Some("codex".to_string()));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let executor = Arc::new(OrchestratorTestBackend::new(
             r#"{"action":"stay","reason":"same task"}"#,
         ));
@@ -4892,6 +4965,7 @@ mod tests {
                 .load("slack:dm:D1:111.000")
                 .await
                 .unwrap()
+                .unwrap()
                 .active_executor
                 .as_deref(),
             Some("codex")
@@ -4908,7 +4982,7 @@ mod tests {
         let store = Arc::new(InMemorySessionStore::default());
         let mut state = SessionState::new("slack:dm:D1:111.000", "kimi");
         state.set_active_executor(Some("codex".to_string()));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let executor = Arc::new(OrchestratorTestBackend::new(
             r#"{"action":"handoff","executor":"kimi","reason":"conversation"}"#,
         ));
@@ -4936,6 +5010,7 @@ mod tests {
                 .load("slack:dm:D1:111.000")
                 .await
                 .unwrap()
+                .unwrap()
                 .active_executor
                 .as_deref(),
             Some("kimi")
@@ -4954,7 +5029,7 @@ mod tests {
             let mut state = SessionState::new(&session_key, "kimi");
             state.set_active_executor(Some("codex".to_string()));
             let initial_revision = state.active_executor_revision;
-            store.save(state).await;
+            store.save(state).await.unwrap();
             let executor = Arc::new(PerTurnHandoffFailureBackend::new(phase));
             let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
             settings.mode = OrchestratorMode::PerTurn;
@@ -4978,7 +5053,7 @@ mod tests {
                 HandoffFailurePhase::Prepare => assert_eq!(err.to_string(), "prepare failed"),
                 HandoffFailurePhase::Prompt => assert_eq!(err.to_string(), "prompt failed"),
             }
-            let saved = store.load(&session_key).await.unwrap();
+            let saved = store.load(&session_key).await.unwrap().unwrap();
             assert_eq!(saved.active_executor.as_deref(), Some("codex"));
             assert!(saved.active_executor_revision > initial_revision);
             assert!(saved.transcript.is_empty());
@@ -5027,7 +5102,7 @@ mod tests {
                     HandoffFailurePhase::Prepare => assert_eq!(err.to_string(), "prepare failed"),
                     HandoffFailurePhase::Prompt => assert_eq!(err.to_string(), "prompt failed"),
                 }
-                let saved = store.load(&session_key).await.unwrap();
+                let saved = store.load(&session_key).await.unwrap().unwrap();
                 assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
                 assert!(saved.transcript.is_empty());
             }
@@ -5041,7 +5116,7 @@ mod tests {
         let session_key = "slack:dm:D1:manual-during-failure";
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let executor = Arc::new(ReleasablePromptFailureBackend::new(started_tx, release_rx));
@@ -5093,7 +5168,7 @@ mod tests {
                 .unwrap(),
             "prompt failed"
         );
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
         assert!(saved.transcript.is_empty());
     }
@@ -5109,7 +5184,7 @@ mod tests {
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));
         let initial_revision = state.active_executor_revision;
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let executor = Arc::new(OrchestratorTestBackend::new(
             r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#,
         ));
@@ -5158,7 +5233,7 @@ mod tests {
 
         assert!(err.to_string().contains("context path is not a file"));
         assert!(!router.turns.has_current(session_key).await);
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
         assert!(saved.active_executor_revision > initial_revision);
         assert!(saved.transcript.is_empty());
@@ -5174,7 +5249,7 @@ mod tests {
         let session_key = "slack:dm:D1:stale-same-executor";
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
         let executor = Arc::new(PerTurnStaleRollbackBackend::new(started_tx, cancelled_tx));
@@ -5228,7 +5303,7 @@ mod tests {
 
         assert!(first_output.events.is_empty());
         assert_eq!(second.final_reply(), "fresh response");
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[0].content, "newer stay");
@@ -5241,7 +5316,7 @@ mod tests {
         let session_key = "slack:dm:D1:superseded-rollback";
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
         let (first_cancelled_tx, first_cancelled_rx) = tokio::sync::oneshot::channel();
         let (second_route_started_tx, second_route_started_rx) = tokio::sync::oneshot::channel();
@@ -5316,7 +5391,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(second_output.final_reply(), "fresh response");
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[0].content, "newer stay");
@@ -5330,7 +5405,7 @@ mod tests {
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));
         let initial_revision = state.active_executor_revision;
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let executor = Arc::new(OrchestratorTestBackend::new(
             r#"{"action":"handoff","executor":"kimi","reason":"switch"}"#,
         ));
@@ -5370,7 +5445,7 @@ mod tests {
             .unwrap();
 
         assert!(output.events.is_empty());
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
         assert!(saved.active_executor_revision > initial_revision);
         assert!(saved.transcript.is_empty());
@@ -5387,7 +5462,7 @@ mod tests {
         let mut state = SessionState::new(session_key, "kimi");
         state.set_active_executor(Some("codex".to_string()));
         let initial_revision = state.active_executor_revision;
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let executor = Arc::new(ReleasableOrchestratorBackend::new(
@@ -5454,7 +5529,7 @@ mod tests {
             .unwrap();
 
         assert!(route_output.events.is_empty());
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
         assert!(saved.active_executor_revision > initial_revision);
         assert!(saved.transcript.is_empty());
@@ -5483,7 +5558,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.final_reply(), "kimi response");
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
         assert!(saved.executor_bindings.contains_key("kimi"));
         assert!(!saved.executor_bindings.contains_key("route-planner"));
@@ -5533,6 +5611,7 @@ mod tests {
             store
                 .load_or_create("slack:dm:D1:111.000", "kimi")
                 .await
+                .unwrap()
                 .routing_mode,
             AgentRoutingMode::Auto
         );
@@ -5540,6 +5619,7 @@ mod tests {
             store
                 .load_or_create("slack:dm:D1:111.000", "kimi")
                 .await
+                .unwrap()
                 .active_executor,
             None
         );
@@ -5670,7 +5750,7 @@ mod tests {
         assert_eq!(prompts[0].executor, "route-planner");
         assert_eq!(prompts[1].executor, "codex");
         drop(prompts);
-        let saved = store.load("slack:dm:D1:111.000").await.unwrap();
+        let saved = store.load("slack:dm:D1:111.000").await.unwrap().unwrap();
         assert_eq!(saved.active_executor.as_deref(), Some("codex"));
         assert!(!saved.context_artifacts.is_empty());
     }
@@ -5862,7 +5942,7 @@ mod tests {
             .unwrap();
 
         assert!(output.events.is_empty());
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_eq!(saved.active_executor, None);
         assert!(saved.transcript.is_empty());
         let prompts = executor.prompts.lock().await;
@@ -5939,7 +6019,7 @@ mod tests {
             .await;
 
         assert_eq!(selection, Some(ApprovalSelection::Cancelled));
-        assert!(store.load("slack:dm:D1:111.000").await.is_none());
+        assert!(store.load("slack:dm:D1:111.000").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -5967,7 +6047,10 @@ mod tests {
             .await
             .unwrap();
         assert!(output.final_reply().contains("Session override: yolo"));
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.approval_mode_override, Some(ApprovalMode::Yolo));
 
         router
@@ -5982,7 +6065,10 @@ mod tests {
             .await
             .unwrap();
         assert!(output.final_reply().contains("Session override: inherit"));
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.approval_mode_override, None);
 
         router
@@ -5997,7 +6083,10 @@ mod tests {
             .await
             .unwrap();
         assert!(output.final_reply().contains("Session override: normal"));
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.approval_mode_override, Some(ApprovalMode::Normal));
     }
 
@@ -6024,7 +6113,10 @@ mod tests {
             output.final_reply(),
             "Unknown router slash command `/yoloon`. Use `//yoloon` to send `/yoloon` to the active agent."
         );
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.approval_mode_override, None);
         assert!(executor.prompts.lock().await.is_empty());
         assert!(saved.transcript.is_empty());
@@ -6055,7 +6147,10 @@ mod tests {
         );
         assert!(executor.prepared.lock().await.is_empty());
         assert!(executor.prompts.lock().await.is_empty());
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert!(saved.transcript.is_empty());
         assert!(saved.executor_bindings.is_empty());
     }
@@ -6085,7 +6180,10 @@ mod tests {
         );
         assert!(executor.prepared.lock().await.is_empty());
         assert!(executor.prompts.lock().await.is_empty());
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert!(saved.transcript.is_empty());
     }
 
@@ -6102,7 +6200,7 @@ mod tests {
                 ..ExecutorBinding::default()
             },
         );
-        store.save(state).await;
+        store.save(state).await.unwrap();
 
         let mut output = CollectingRouterOutputSink::default();
         router
@@ -6137,7 +6235,10 @@ mod tests {
         assert_eq!(commands[0].command.args, "--json");
         drop(commands);
 
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert!(saved.transcript.is_empty());
         assert_eq!(
             saved.executor_bindings["kimi"]
@@ -6174,7 +6275,10 @@ mod tests {
         let cwd = commands[0].cwd.clone().expect("slash command cwd");
         assert!(cwd.starts_with(workspace_root.canonicalize().unwrap()));
         drop(commands);
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.cwd.as_ref(), Some(&cwd));
     }
 
@@ -6207,7 +6311,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.final_reply(), "slash command: status");
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         let binding = saved.executor_bindings.get("kimi").unwrap();
         assert_eq!(
             binding.external_session_id.as_deref(),
@@ -6460,7 +6567,10 @@ mod tests {
             .unwrap();
         assert_eq!(prompt_output.final_reply(), "prompt done");
 
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[0].content, "work");
         assert!(saved.transcript[1].content.contains("prompt done"));
@@ -6498,7 +6608,10 @@ mod tests {
         );
         assert!(executor.prepared.lock().await.is_empty());
         assert!(executor.prompts.lock().await.is_empty());
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         assert!(saved.transcript.is_empty());
     }
 
@@ -6598,7 +6711,7 @@ mod tests {
         let policy = SessionApprovalPolicy::new("kimi", ApprovalMode::Normal, store.clone());
         let mut yolo_session = SessionState::new("slack:dm:D1:111.000", "kimi");
         yolo_session.approval_mode_override = Some(ApprovalMode::Yolo);
-        store.save(yolo_session).await;
+        store.save(yolo_session).await.unwrap();
 
         let yolo_request = ApprovalRequest {
             session_key: "slack:dm:D1:111.000".to_string(),
@@ -6639,7 +6752,7 @@ mod tests {
         let policy = SessionApprovalPolicy::new("kimi", ApprovalMode::Yolo, store.clone());
         let mut state = SessionState::new("slack:channel:C1:111.000", "kimi");
         state.approval_mode_override = Some(ApprovalMode::Normal);
-        store.save(state).await;
+        store.save(state).await.unwrap();
 
         let request = ApprovalRequest {
             session_key: "slack:channel:C1:111.000".to_string(),
@@ -6730,7 +6843,7 @@ mod tests {
         let executor = Arc::new(FakeExecutorBackend::default());
         let mut state = SessionState::new("slack:C1:T1", "kimi");
         state.transcript.push(TranscriptMessage::user("prior"));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let router = AgentRouter::new("kimi", store.clone(), executor.clone());
 
         let mut output = CollectingRouterOutputSink::default();
@@ -6754,7 +6867,7 @@ mod tests {
         let prepared = executor.prepared.lock().await;
         assert_eq!(prepared[0].previous_session_id, None);
         drop(prepared);
-        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await.unwrap();
         assert_eq!(saved.transcript.len(), 3);
         assert!(
             saved.executor_bindings["kimi"]
@@ -6770,7 +6883,7 @@ mod tests {
         let executor = Arc::new(FakeExecutorBackend::default());
         let mut state = SessionState::new("slack:channel:C1:111.000", "kimi");
         state.transcript.push(TranscriptMessage::user("root"));
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let router = AgentRouter::new("kimi", store.clone(), executor.clone());
 
         router
@@ -6784,7 +6897,11 @@ mod tests {
 
         assert!(executor.prepared.lock().await.is_empty());
         assert!(executor.prompts.lock().await.is_empty());
-        let saved = store.load("slack:channel:C1:111.000").await.unwrap();
+        let saved = store
+            .load("slack:channel:C1:111.000")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[1].content, "middle context");
 
@@ -6823,7 +6940,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.load("slack:channel:C1:111.000").await.is_none());
+        assert!(
+            store
+                .load("slack:channel:C1:111.000")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(executor.prepared.lock().await.is_empty());
         assert!(executor.prompts.lock().await.is_empty());
     }
@@ -6874,7 +6997,10 @@ mod tests {
                 .contains(':')
         );
 
-        let saved = store.load_or_create("slack:dm:D1:111.000", "kimi").await;
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
         let first_cwd_text = first_cwd.display().to_string();
         assert_eq!(
             saved.cwd.as_ref().unwrap().canonicalize().unwrap(),
@@ -6953,7 +7079,7 @@ mod tests {
             .await
             .unwrap();
 
-        let saved = store.load_or_create("session-a", "kimi").await;
+        let saved = store.load_or_create("session-a", "kimi").await.unwrap();
         let binding = &saved.executor_bindings["kimi"];
         assert_eq!(binding.machine_id.as_deref(), Some("remote-dev"));
         assert_eq!(binding.cwd.as_deref(), Some("/remote/work/session-a"));
@@ -7024,7 +7150,7 @@ mod tests {
                 ..ExecutorBinding::default()
             },
         );
-        store.save(stale_state).await;
+        store.save(stale_state).await.unwrap();
         let router = AgentRouter::new("kimi", store.clone(), Arc::new(FailingRemoteBackend))
             .with_workspace_root(Some(tmp.path().join("router-workspaces")));
         let mut output = CollectingRouterOutputSink::default();
@@ -7042,7 +7168,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.to_string(), "remote prepare failed");
-        let saved = store.load_or_create("session-a", "kimi").await;
+        let saved = store.load_or_create("session-a", "kimi").await.unwrap();
         let binding = &saved.executor_bindings["kimi"];
         assert_eq!(binding.machine_id.as_deref(), Some("remote-dev"));
         assert_eq!(binding.cwd, None);
@@ -7387,7 +7513,11 @@ mod tests {
             .await
             .unwrap();
 
-        let saved = store.load("slack:channel:C1:111.000").await.unwrap();
+        let saved = store
+            .load("slack:channel:C1:111.000")
+            .await
+            .unwrap()
+            .unwrap();
         let cwd = saved.cwd.clone().unwrap();
         assert!(cwd.join("slack/current-thread.md").is_file());
         assert!(cwd.join("slack/manifest.json").is_file());
@@ -7399,7 +7529,11 @@ mod tests {
         assert!(prompts[0].prompt.contains("slack/current-thread.md"));
         drop(prompts);
 
-        let saved = store.load("slack:channel:C1:111.000").await.unwrap();
+        let saved = store
+            .load("slack:channel:C1:111.000")
+            .await
+            .unwrap()
+            .unwrap();
         let seen = &saved.executor_bindings["kimi"].seen_context;
         assert!(seen.iter().any(|item| item.starts_with("artifact:")));
 
@@ -7469,7 +7603,7 @@ mod tests {
                 updated_at_ms: 1,
                 metadata: BTreeMap::new(),
             });
-        restarted_store.save(restarted_state).await;
+        restarted_store.save(restarted_state).await.unwrap();
         let restarted_router = AgentRouter::new("kimi", restarted_store.clone(), executor)
             .with_workspace_root(Some(workspace_root));
         restarted_router
@@ -7493,7 +7627,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let saved = restarted_store.load(session_key).await.unwrap();
+        let saved = restarted_store.load(session_key).await.unwrap().unwrap();
         let artifacts = saved.context_artifacts;
 
         assert!(artifacts.iter().any(|record| record.kind == "slack_file"));
@@ -7576,7 +7710,7 @@ mod tests {
                 metadata: BTreeMap::from([("file_id".to_string(), json!("F0"))]),
             },
         ];
-        restarted_store.save(stale_state).await;
+        restarted_store.save(stale_state).await.unwrap();
 
         let restarted_router = AgentRouter::new("kimi", restarted_store.clone(), executor)
             .with_workspace_root(Some(workspace_root));
@@ -7605,6 +7739,7 @@ mod tests {
         let artifacts = restarted_store
             .load(session_key)
             .await
+            .unwrap()
             .unwrap()
             .context_artifacts;
         assert!(artifacts.iter().any(|record| record.id == "slack:file:F1"));
@@ -7687,7 +7822,7 @@ mod tests {
                 metadata: BTreeMap::from([("file_id".to_string(), json!("F0"))]),
             },
         ];
-        restarted_store.save(stale_state).await;
+        restarted_store.save(stale_state).await.unwrap();
 
         let restarted_router = AgentRouter::new("kimi", restarted_store.clone(), executor)
             .with_workspace_root(Some(workspace_root));
@@ -7716,6 +7851,7 @@ mod tests {
         let artifacts = restarted_store
             .load(session_key)
             .await
+            .unwrap()
             .unwrap()
             .context_artifacts;
         assert!(artifacts.iter().any(|record| record.id == "slack:file:F1"));
@@ -7758,7 +7894,7 @@ mod tests {
             updated_at_ms: 1,
             metadata: BTreeMap::new(),
         });
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let executor = Arc::new(FakeExecutorBackend::default());
         let router = AgentRouter::new("kimi", store.clone(), executor)
             .with_workspace_root(Some(workspace_root));
@@ -7785,7 +7921,12 @@ mod tests {
             .await
             .unwrap();
 
-        let artifacts = store.load(session_key).await.unwrap().context_artifacts;
+        let artifacts = store
+            .load(session_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .context_artifacts;
         assert!(
             artifacts
                 .iter()
@@ -7830,7 +7971,7 @@ mod tests {
         let store = Arc::new(InMemorySessionStore::default());
         let mut state = SessionState::new(session_key, "kimi");
         state.cwd = Some(persisted_cwd);
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let executor = Arc::new(FakeExecutorBackend::default());
         let router =
             AgentRouter::new("kimi", store, executor).with_workspace_root(Some(workspace_root));
@@ -8397,7 +8538,7 @@ mod tests {
 
         assert_eq!(output.channel_event_count, 1);
         assert_eq!(output.final_replies, ["done".to_string()]);
-        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await.unwrap();
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(
             saved.executor_bindings["kimi"].health,
@@ -8591,7 +8732,7 @@ mod tests {
         assert!(prompts[0].contains("Current user message:\nsecond"));
         drop(prompts);
 
-        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await.unwrap();
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[0].content, "second");
         let binding = saved.executor_bindings.get("kimi").unwrap();
@@ -8747,7 +8888,10 @@ mod tests {
     ) {
         let session_key = "slack:C1:T1";
         let store = Arc::new(InMemorySessionStore::default());
-        store.save(session_with_healthy_binding(session_key)).await;
+        store
+            .save(session_with_healthy_binding(session_key))
+            .await
+            .unwrap();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
         let executor = Arc::new(PromptCancellationExecutorBackend::new(
@@ -8799,7 +8943,7 @@ mod tests {
 
         assert_eq!(turn_output.events, expected_turn_events);
         assert_eq!(stop_output.final_reply(), "Stopped the active turn.");
-        let saved = store.load_or_create(session_key, "kimi").await;
+        let saved = store.load_or_create(session_key, "kimi").await.unwrap();
         assert_eq!(saved.transcript.len(), 1);
         assert_eq!(saved.transcript[0].content, "prior");
         let binding = saved.executor_bindings.get("kimi").unwrap();
@@ -8972,7 +9116,7 @@ mod tests {
         assert_eq!(interrupts[0].reason, InterruptReason::ReplacedByNewMessage);
         drop(interrupts);
 
-        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await.unwrap();
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[0].content, "second");
         assert!(saved.transcript[1].content.contains("response 2"));
@@ -9128,7 +9272,7 @@ mod tests {
 
         assert!(first_output.events.is_empty());
         assert_eq!(second_output.final_reply(), "fresh response");
-        store.load_or_create("slack:C1:T1", "kimi").await
+        store.load_or_create("slack:C1:T1", "kimi").await.unwrap()
     }
 
     #[tokio::test]
@@ -9426,7 +9570,7 @@ mod tests {
         assert_eq!(interrupts[0].reason, InterruptReason::UserStop);
         drop(interrupts);
 
-        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await.unwrap();
         assert!(saved.transcript.is_empty());
     }
 
@@ -9470,7 +9614,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.final_reply(), "No active turn for this session.");
-        assert!(store.load("slack:C1:T1").await.is_none());
+        assert!(store.load("slack:C1:T1").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -9603,7 +9747,7 @@ mod tests {
 
         assert!(first.await.unwrap().events.is_empty());
         assert_eq!(second_output.final_reply(), "response 2");
-        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await.unwrap();
         assert_eq!(saved.transcript.len(), 2);
         assert_eq!(saved.transcript[0].content, "second");
     }
@@ -9716,7 +9860,7 @@ mod tests {
             .unwrap();
 
         assert!(stale_output.events.is_empty());
-        assert!(store.load(session_key).await.is_none());
+        assert!(store.load(session_key).await.unwrap().is_none());
         assert!(executor.prompts.lock().await.is_empty());
 
         let mut current_output = CollectingRouterOutputSink::default();
@@ -9735,7 +9879,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(current_output.final_reply(), "fake response");
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert!(saved.context_artifacts.is_empty());
         assert_eq!(saved.transcript[0].content, "newer");
     }
@@ -9759,7 +9903,7 @@ mod tests {
         let mut state = SessionState::new(session_key, "kimi");
         state.cwd = Some(cwd.clone());
         state.context_artifacts = old_records;
-        store.save(state.clone()).await;
+        store.save(state.clone()).await.unwrap();
         let turn = router
             .turns
             .begin(session_key, "kimi".to_string())
@@ -9796,7 +9940,7 @@ mod tests {
             std::fs::read_to_string(cwd.join("slack/old-extra.md")).unwrap(),
             "old extra context"
         );
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_context_record_restored(&saved, "thread", "slack/current-thread.md");
         assert_context_record_restored(&saved, "old-extra", "slack/old-extra.md");
     }
@@ -9820,7 +9964,7 @@ mod tests {
         let mut state = SessionState::new(session_key, "kimi");
         state.cwd = Some(cwd.clone());
         state.context_artifacts = old_records;
-        store.save(state.clone()).await;
+        store.save(state.clone()).await.unwrap();
         let turn = router
             .turns
             .begin(session_key, "kimi".to_string())
@@ -9857,7 +10001,7 @@ mod tests {
             std::fs::read_to_string(cwd.join("slack/old-extra.md")).unwrap(),
             "old extra context"
         );
-        let saved = store.load(session_key).await.unwrap();
+        let saved = store.load(session_key).await.unwrap().unwrap();
         assert_context_record_restored(&saved, "thread", "slack/current-thread.md");
         assert_context_record_restored(&saved, "old-extra", "slack/old-extra.md");
     }
@@ -9879,7 +10023,7 @@ mod tests {
                 ..ExecutorBinding::default()
             },
         );
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let router = AgentRouter::new("kimi", store, executor.clone());
 
         let mut output = CollectingRouterOutputSink::default();
@@ -9921,7 +10065,7 @@ mod tests {
                 ..ExecutorBinding::default()
             },
         );
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let router = AgentRouter::new("kimi", store.clone(), executor.clone());
 
         let mut slash_output = CollectingRouterOutputSink::default();
@@ -9938,7 +10082,12 @@ mod tests {
             .unwrap();
         assert_eq!(slash_output.final_reply(), "slash done");
         assert!(
-            store.load(session_key).await.unwrap().executor_bindings["kimi"]
+            store
+                .load(session_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .executor_bindings["kimi"]
                 .seen_context
                 .is_empty()
         );
@@ -9981,7 +10130,7 @@ mod tests {
                 ..ExecutorBinding::default()
             },
         );
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let router = AgentRouter::new("kimi", store, executor.clone());
 
         let mut output = CollectingRouterOutputSink::default();
@@ -10062,7 +10211,7 @@ mod tests {
                 ..ExecutorBinding::default()
             },
         );
-        store.save(state).await;
+        store.save(state).await.unwrap();
         let router = AgentRouter::new("kimi", store.clone(), executor);
 
         let mut output = CollectingRouterOutputSink::default();
@@ -10079,7 +10228,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("prompt failed"));
-        let saved = store.load_or_create("slack:C1:T1", "kimi").await;
+        let saved = store.load_or_create("slack:C1:T1", "kimi").await.unwrap();
         let binding = saved.executor_bindings.get("kimi").unwrap();
         assert_eq!(
             binding.external_session_id.as_deref(),

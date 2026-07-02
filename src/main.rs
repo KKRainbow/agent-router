@@ -7,7 +7,7 @@ use agent_router::{
     executor::registry::ExecutorRegistry,
     machine::MachineRegistry,
     router::{AgentRouter, RouterService, SessionApprovalPolicy},
-    session::store::InMemorySessionStore,
+    session::store::ProductionSessionStore,
 };
 use clap::Parser;
 use tokio::task::JoinSet;
@@ -41,7 +41,16 @@ async fn main() -> anyhow::Result<()> {
     }
     let config = AppConfig::load(config_path.as_deref())?;
 
-    let store = Arc::new(InMemorySessionStore::default());
+    if let Some(root) = &config.workspace.root {
+        tracing::info!(workspace_root = %root.display(), "using workspace session persistence");
+    } else {
+        tracing::info!("workspace.root is not configured; using in-memory session store");
+    }
+    let store = Arc::new(ProductionSessionStore::new(
+        config.workspace.root.clone(),
+        config.router.default_executor.clone(),
+        config.executors.keys().cloned().collect(),
+    ));
     let mut approval_policy = SessionApprovalPolicy::new(
         config.router.default_executor.clone(),
         config.approval.default_mode,
