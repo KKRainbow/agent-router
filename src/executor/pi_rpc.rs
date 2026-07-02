@@ -1799,30 +1799,38 @@ fn project_pi_tool_event(message: &Value, status: &str) -> ExecutorUpdate {
 
 fn tool_event_text(message: &Value, status: &str) -> String {
     let mut lines = Vec::new();
-    if let Some(args) = message.get("args") {
-        lines.push(format!("args: {}", compact_json(args)));
-    }
-    if let Some(partial) = message
-        .get("partialResult")
-        .or_else(|| message.get("partial_result"))
-    {
-        lines.push(format!(
-            "partial: {}",
-            extract_textish(Some(partial)).unwrap_or_else(|| compact_json(partial))
-        ));
-    }
-    if let Some(result) = message.get("result") {
-        lines.push(format!(
-            "result: {}",
-            extract_textish(Some(result)).unwrap_or_else(|| compact_json(result))
-        ));
+    if let Some(summary) = tool_args_summary(message.get("args")) {
+        lines.push(summary);
     }
     lines.push(format!("status: {status}"));
     lines.join("\n")
 }
 
-fn compact_json(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+fn tool_args_summary(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => nonempty_one_line(text),
+        Value::Object(map) => {
+            for key in ["command", "cmd", "script"] {
+                if let Some(command) = map.get(key).and_then(Value::as_str) {
+                    return nonempty_one_line(command).map(|command| format!("$ {command}"));
+                }
+            }
+            for key in ["path", "file", "query", "pattern"] {
+                if let Some(value) = map.get(key).and_then(Value::as_str)
+                    && let Some(value) = nonempty_one_line(value)
+                {
+                    return Some(value);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn nonempty_one_line(text: &str) -> Option<String> {
+    let line = one_line(text);
+    (!line.is_empty()).then_some(line)
 }
 
 fn extract_textish(value: Option<&Value>) -> Option<String> {
@@ -2603,6 +2611,52 @@ while True:
                 .iter()
                 .any(|update| { update.kind == "tool_call" && update.channel_event.is_some() })
         );
+        let tool_channel_texts = events
+            .updates
+            .iter()
+            .filter(|update| update.kind == "tool_call")
+            .map(|update| {
+                update
+                    .channel_event
+                    .as_ref()
+                    .map(|event| event.text.as_str())
+                    .unwrap_or("")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_channel_texts,
+            [
+                "$ echo hi\nstatus: running",
+                "$ echo hi\nstatus: running",
+                "status: completed",
+            ]
+        );
+        assert!(tool_channel_texts.iter().all(|text| {
+            !text.contains("args:") && !text.contains("partial:") && !text.contains("result:")
+        }));
+    }
+
+    #[test]
+    fn pi_tool_event_summarizes_args_without_raw_json() {
+        let update = project_pi_tool_event(
+            &json!({
+                "type": "tool_start",
+                "toolName": "search",
+                "args": {
+                    "nested": {
+                        "query": "hidden"
+                    }
+                }
+            }),
+            "running",
+        );
+
+        assert_eq!(update.text, "status: running");
+        let event = update.channel_event.as_ref().unwrap();
+        assert_eq!(event.title, "search");
+        assert_eq!(event.text, "status: running");
+        assert!(!event.text.contains('{'));
+        assert!(!event.text.contains("args:"));
     }
 
     #[tokio::test]
