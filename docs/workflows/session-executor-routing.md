@@ -89,7 +89,8 @@ The first command surface is explicit executor switching:
 ```
 
 `/agent <name>` enters manual routing for the current user-visible session and
-creates or resumes the executor's private backend session.
+sets `active_executor`. The executor's private backend session is created or
+resumed on the next routed turn.
 
 `/agent auto` exits manual routing so the router can select the executor
 automatically again.
@@ -243,9 +244,9 @@ internal reasoning into another executor's context.
 1. A channel adapter receives an inbound platform event.
 2. The adapter normalizes it into a router event and resolves a `session_key`.
 3. The router checks whether the message is a router command.
-4. If the message switches executor, the router updates `active_executor`,
-   creates or resumes that executor's backend binding, records the switch in the
-   transcript, and emits a short user-visible status event.
+4. If the message switches executor, the router updates `routing_mode` and
+   `active_executor`, then sends a short status reply. Backend prepare/resume and
+   transcript updates happen on the next routed turn for that executor.
 5. If the message is an agent-owned slash command, the router forwards it as a
    structured executor command only when the active backend can preserve command
    semantics; otherwise it returns an explicit unsupported-command reply.
