@@ -2251,6 +2251,7 @@ Current user message:\n{}",
                                 )
                             },
                         );
+                        self.store.save_runtime(latest.clone()).await?;
                         self.store.save(latest).await
                     })
                     .await
@@ -2473,6 +2474,7 @@ Current user message:\n{}",
                                 prepared_cwd.as_deref(),
                             ),
                         );
+                        self.store.save_runtime(latest.clone()).await?;
                         self.store.save(latest).await
                     })
                     .await
@@ -4701,6 +4703,68 @@ mod tests {
                 .unwrap()
                 .active_executor,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn current_turn_failure_rollback_updates_runtime_cache_when_durable_save_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_key = "slack:dm:D1:current-turn-rollback";
+        let store = Arc::new(WorkspaceSessionStore::new(
+            tmp.path(),
+            "kimi",
+            BTreeSet::from([
+                "kimi".to_string(),
+                "codex".to_string(),
+                "route-planner".to_string(),
+            ]),
+        ));
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("codex".to_string()));
+        store.save(state).await.unwrap();
+        let snapshot_path = tmp
+            .path()
+            .join(session_workspace_dir_name(session_key))
+            .join(".agent-router")
+            .join("session.json");
+        std::fs::remove_file(&snapshot_path).unwrap();
+        std::fs::create_dir(&snapshot_path).unwrap();
+
+        let executor = Arc::new(PerTurnHandoffFailureBackend::new(
+            HandoffFailurePhase::Prepare,
+        ));
+        let mut settings = test_orchestrator_settings(write_orchestrator_policy(&tmp));
+        settings.mode = OrchestratorMode::PerTurn;
+        let router = AgentRouter::new("kimi", store.clone(), executor)
+            .with_orchestrator(Some(settings))
+            .with_workspace_root(Some(tmp.path().to_path_buf()));
+
+        let mut output = CollectingRouterOutputSink::default();
+        let err = router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "switch".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("session snapshot path is not a file")
+        );
+        assert_eq!(
+            store
+                .load(session_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .active_executor
+                .as_deref(),
+            Some("codex")
         );
     }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -162,7 +162,7 @@ impl WorkspaceSessionStore {
         if !existing_file_path_without_symlinks(&path)? {
             return Ok(None);
         }
-        match std::fs::read_to_string(&path) {
+        match read_snapshot_text(&path) {
             Ok(text) => {
                 let raw_snapshot: RawSessionSnapshot =
                     serde_json::from_str(&text).map_err(|err| {
@@ -543,6 +543,88 @@ fn existing_file_path_without_symlinks(path: &Path) -> anyhow::Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn read_snapshot_text(path: &Path) -> std::io::Result<String> {
+    let mut file = open_snapshot_file(path)?;
+    let opened_metadata = file.metadata()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    match existing_file_path_without_symlinks(path) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session snapshot disappeared while reading",
+            ));
+        }
+        Err(err) => return Err(std::io::Error::other(err)),
+    }
+    let current_metadata = std::fs::symlink_metadata(path)?;
+    ensure_same_snapshot_file(&opened_metadata, &current_metadata, path)?;
+    Ok(text)
+}
+
+#[cfg(unix)]
+fn open_snapshot_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const O_NOFOLLOW_FLAG: i32 = 0x20000;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    const O_NOFOLLOW_FLAG: i32 = 0x100;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_snapshot_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn ensure_same_snapshot_file(
+    opened: &std::fs::Metadata,
+    current: &std::fs::Metadata,
+    path: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if opened.dev() == current.dev() && opened.ino() == current.ino() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "session snapshot changed while reading: {}",
+        path.display()
+    )))
+}
+
+#[cfg(not(unix))]
+fn ensure_same_snapshot_file(
+    opened: &std::fs::Metadata,
+    current: &std::fs::Metadata,
+    path: &Path,
+) -> std::io::Result<()> {
+    if opened.file_type() == current.file_type()
+        && opened.len() == current.len()
+        && opened.modified().ok() == current.modified().ok()
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "session snapshot changed while reading: {}",
+        path.display()
+    )))
 }
 
 fn ensure_dir_path_without_symlinks(path: &Path) -> anyhow::Result<()> {
