@@ -45,6 +45,8 @@ type StdoutMessageReceiver = mpsc::UnboundedReceiver<anyhow::Result<Value>>;
 
 const PI_RPC_PROTOCOL: &str = "pi_rpc";
 const DEFAULT_APPROVAL_FLAG: &str = "--approve";
+const PI_THINKING_PROGRESS_BUFFER_CHARS: usize = 2_000;
+const PI_THINKING_PROGRESS_EVENT_CHARS: usize = 240;
 
 #[derive(Debug)]
 pub struct PiRpcExecutorManager {
@@ -999,6 +1001,7 @@ impl PiRpcSession {
         let mut cancelled = false;
         let mut final_text = String::new();
         let mut fallback_final_text = None;
+        let mut pending_thinking = PiThinkingProgress::default();
         let (extension_response_tx, mut extension_response_rx) = mpsc::unbounded_channel();
         let result: anyhow::Result<()> = async {
             loop {
@@ -1036,6 +1039,7 @@ impl PiRpcSession {
                                 user_id.clone(),
                                 &mut final_text,
                                 &mut fallback_final_text,
+                                &mut pending_thinking,
                                 cancelled,
                                 Some(extension_response_tx.clone()),
                             )
@@ -1105,6 +1109,7 @@ impl PiRpcSession {
         user_id: Option<String>,
         final_text: &mut String,
         fallback_final_text: &mut Option<String>,
+        pending_thinking: &mut PiThinkingProgress,
         cancelled: bool,
         response_tx: Option<ExtensionResponseSender>,
     ) -> anyhow::Result<bool> {
@@ -1112,36 +1117,36 @@ impl PiRpcSession {
         match message_type {
             "message_update" => {
                 if let Some(delta) = pi_text_delta(message) {
+                    pending_thinking.flush(events).await?;
                     final_text.push_str(&delta);
                     events
                         .send(ExecutorUpdate::new("agent_message_chunk", "", delta, ""))
                         .await?;
                 } else if let Some(delta) = pi_thinking_delta(message) {
-                    if let Some(update) = project_pi_thinking_progress(delta) {
-                        events.send(update).await?;
-                    }
+                    pending_thinking.push(delta);
                 }
             }
             "thinking_delta" => {
                 if let Some(delta) = extract_textish(message.get("delta"))
                     .or_else(|| extract_textish(message.get("thinking")))
                 {
-                    if let Some(update) = project_pi_thinking_progress(delta) {
-                        events.send(update).await?;
-                    }
+                    pending_thinking.push(delta);
                 }
             }
             "tool_execution_start" | "tool_start" => {
+                pending_thinking.flush(events).await?;
                 events
                     .send(project_pi_tool_event(message, "running"))
                     .await?;
             }
             "tool_execution_update" | "tool_update" => {
+                pending_thinking.flush(events).await?;
                 events
                     .send(project_pi_tool_event(message, "running"))
                     .await?;
             }
             "tool_execution_end" | "tool_end" => {
+                pending_thinking.flush(events).await?;
                 let status = if message.get("isError").and_then(Value::as_bool) == Some(true)
                     || message.get("is_error").and_then(Value::as_bool) == Some(true)
                 {
@@ -1152,6 +1157,7 @@ impl PiRpcSession {
                 events.send(project_pi_tool_event(message, status)).await?;
             }
             "compaction_start" => {
+                pending_thinking.flush(events).await?;
                 let reason = message
                     .get("reason")
                     .and_then(Value::as_str)
@@ -1165,6 +1171,7 @@ impl PiRpcSession {
                     .await?;
             }
             "compaction_end" => {
+                pending_thinking.flush(events).await?;
                 let text = if message.get("aborted").and_then(Value::as_bool) == Some(true) {
                     "Pi context compaction cancelled".to_string()
                 } else if let Some(error) = message.get("errorMessage").and_then(Value::as_str) {
@@ -1180,6 +1187,7 @@ impl PiRpcSession {
                     .await?;
             }
             "auto_retry_start" => {
+                pending_thinking.flush(events).await?;
                 let attempt = message.get("attempt").and_then(Value::as_u64).unwrap_or(0);
                 let max_attempts = message
                     .get("maxAttempts")
@@ -1195,6 +1203,7 @@ impl PiRpcSession {
                     .await?;
             }
             "auto_retry_end" => {
+                pending_thinking.flush(events).await?;
                 if message.get("success").and_then(Value::as_bool) == Some(false) {
                     let text = message
                         .get("finalError")
@@ -1211,6 +1220,7 @@ impl PiRpcSession {
                 }
             }
             "extension_error" => {
+                pending_thinking.flush(events).await?;
                 let text = extension_error_text(message);
                 events
                     .send(
@@ -1220,6 +1230,7 @@ impl PiRpcSession {
                     .await?;
             }
             "extension_ui_request" => {
+                pending_thinking.flush(events).await?;
                 self.handle_extension_ui_request(
                     message,
                     Some(events),
@@ -1230,6 +1241,7 @@ impl PiRpcSession {
                 .await?;
             }
             "agent_end" => {
+                pending_thinking.flush(events).await?;
                 if agent_end_will_retry(message) {
                     final_text.clear();
                     *fallback_final_text = None;
@@ -1735,16 +1747,30 @@ fn pi_thinking_delta(message: &Value) -> Option<String> {
         .or_else(|| extract_textish(message.get("thinking_delta")))
 }
 
-fn project_pi_thinking_progress(delta: String) -> Option<ExecutorUpdate> {
-    let text = one_line(&delta);
-    if text.is_empty() {
-        return None;
+#[derive(Debug, Default)]
+struct PiThinkingProgress {
+    text: String,
+}
+
+impl PiThinkingProgress {
+    fn push(&mut self, delta: String) {
+        self.text.push_str(&delta);
+        self.text = truncate_chars(&self.text, PI_THINKING_PROGRESS_BUFFER_CHARS);
     }
-    let text = truncate_chars(&text, 240);
-    Some(
-        ExecutorUpdate::new("agent_thought_chunk", "Progress", text.clone(), "")
-            .with_channel_event(ExecutorChannelEvent::agent_progress(text)),
-    )
+
+    async fn flush(&mut self, events: &mut dyn ExecutorEventSink) -> anyhow::Result<()> {
+        let text = truncate_chars(&one_line(&self.text), PI_THINKING_PROGRESS_EVENT_CHARS);
+        self.text.clear();
+        if text.is_empty() {
+            return Ok(());
+        }
+        events
+            .send(
+                ExecutorUpdate::new("agent_thought_chunk", "Progress", text.clone(), "")
+                    .with_channel_event(ExecutorChannelEvent::agent_progress(text)),
+            )
+            .await
+    }
 }
 
 fn one_line(text: &str) -> String {
@@ -2161,6 +2187,14 @@ while True:
             send({"type": "auto_retry_end", "success": True, "attempt": 1})
             text_delta("new")
             agent_end("new")
+        elif scenario == "thinking_then_text":
+            response(cmd, "prompt")
+            thinking_delta("investig")
+            standalone_thinking_delta("ating")
+            standalone_thinking_delta(" ")
+            standalone_thinking_delta("answer")
+            text_delta("done")
+            agent_end("done")
         elif scenario == "approval_confirm":
             response(cmd, "prompt")
             send({
@@ -2222,7 +2256,7 @@ while True:
             response(cmd, "prompt")
             text_delta("hello ")
             thinking_delta("thinking")
-            standalone_thinking_delta("standalone thinking")
+            standalone_thinking_delta(" standalone thinking")
             send({"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "bash", "args": {"command": "echo hi"}})
             send({"type": "tool_execution_update", "toolCallId": "tool-1", "toolName": "bash", "args": {"command": "echo hi"}, "partialResult": {"content": [{"type": "text", "text": "hi"}]}})
             send({"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "bash", "result": {"content": [{"type": "text", "text": "hi"}]}, "isError": False})
@@ -2533,7 +2567,7 @@ while True:
             .iter()
             .filter(|update| update.kind == "agent_thought_chunk")
             .collect::<Vec<_>>();
-        assert_eq!(thinking_events.len(), 2);
+        assert_eq!(thinking_events.len(), 1);
         assert_eq!(
             thinking_events
                 .iter()
@@ -2544,19 +2578,75 @@ while True:
                         .map(|event| (event.kind, event.text.as_str()))
                 })
                 .collect::<Vec<_>>(),
-            [
-                Some((ExecutorChannelEventKind::AgentProgress, "thinking")),
-                Some((
-                    ExecutorChannelEventKind::AgentProgress,
-                    "standalone thinking"
-                )),
-            ]
+            [Some((
+                ExecutorChannelEventKind::AgentProgress,
+                "thinking standalone thinking"
+            ))]
+        );
+        let thinking_index = events
+            .updates
+            .iter()
+            .position(|update| update.kind == "agent_thought_chunk")
+            .unwrap();
+        let tool_index = events
+            .updates
+            .iter()
+            .position(|update| update.kind == "tool_call")
+            .unwrap();
+        assert!(
+            thinking_index < tool_index,
+            "pending thinking should flush before tool activity"
         );
         assert!(
             events
                 .updates
                 .iter()
                 .any(|update| { update.kind == "tool_call" && update.channel_event.is_some() })
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_flushes_pending_thinking_before_final_text() {
+        let fake = FakePi::new();
+        let (manager, _) = fake.manager("thinking_then_text");
+        prepare(&manager, None).await;
+
+        let mut events = CollectingExecutorEventSink::default();
+        let response = manager
+            .prompt(
+                ExecutorPromptRequest {
+                    turn: turn(1),
+                    prompt: "hello".to_string(),
+                    user_id: None,
+                },
+                &mut events,
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.final_text, "done");
+        let event_kinds = events
+            .updates
+            .iter()
+            .map(|update| (update.kind.as_str(), update.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_kinds,
+            [
+                ("agent_thought_chunk", "investigating answer"),
+                ("agent_message_chunk", "done"),
+            ]
+        );
+        assert_eq!(
+            events.updates[0]
+                .channel_event
+                .as_ref()
+                .map(|event| (event.kind, event.text.as_str())),
+            Some((
+                ExecutorChannelEventKind::AgentProgress,
+                "investigating answer"
+            ))
         );
     }
 
