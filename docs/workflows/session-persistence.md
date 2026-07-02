@@ -108,18 +108,25 @@ Required fields:
 schema_version
 session_key
 default_executor
-active_executor
 created_at_ms
 updated_at_ms
 transcript
 executor_bindings
 ```
 
+Defaulted fields:
+
+```text
+active_executor
+routing_mode
+```
+
 Rules:
 
 - `session_key` is the primary identity and must match the requested session.
 - `default_executor` records the session's original default executor.
-- `active_executor` records the executor currently selected for the session.
+- `active_executor` records the executor currently selected for the session. It
+  can be missing or null while automatic routing is pending.
 - `routing_mode` records whether `active_executor` is a manual override or an
   automatic router selection. Missing values default to `auto` when loading
   older snapshots.
@@ -132,8 +139,8 @@ Loading rules:
 
 - If `default_executor` is no longer configured, use the router configured
   default and log a warning.
-- If `active_executor` is no longer configured, fall back to the resolved
-  `default_executor` and log a warning.
+- If a non-empty `active_executor` is no longer configured, fall back to the
+  resolved `default_executor` and log a warning.
 - If the snapshot `session_key` does not match the requested key, treat the file
   as corrupt and do not overwrite it.
 - Malformed required state should return a clear error instead of silently

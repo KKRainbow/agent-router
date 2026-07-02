@@ -52,9 +52,9 @@ a Slack thread, a QQ user openid, a QQ group openid, or a webhook conversation
 key.
 
 Each session starts with a configured `default_executor`. The `active_executor`
-is initialized to the default executor and can change later through explicit
-commands or routing policy. There is exactly one active executor per session at
-any time.
+records the currently selected executor, can be empty while automatic routing is
+pending, and can change later through explicit commands or routing policy. There
+is at most one active executor per session at any time.
 
 The session is the unit of shared handoff context. Shared context is owned by
 the router and projected into backend-specific prompts or resume calls; executor

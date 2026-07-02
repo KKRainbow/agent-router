@@ -17,11 +17,13 @@ state objects.
 
 ## Decision
 
-Each session has a `default_executor` and exactly one `active_executor`.
+Each session has a `default_executor` and at most one `active_executor`.
+`active_executor` can be empty while automatic routing is pending.
 
-When a session is created, `active_executor` is initialized from
-`default_executor`. Switching executors updates only `active_executor`; it does
-not create a new user-visible session.
+Without automatic routing, a new session initializes `active_executor` from
+`default_executor`. Automatic routing may leave `active_executor` empty until a
+normal message is routed. Switching executors updates only `active_executor`; it
+does not create a new user-visible session.
 
 Multiple executor bindings may exist for one session, but only one binding is
 active. Idle bindings preserve backend-private state such as ACP session id,
@@ -39,7 +41,7 @@ Context sharing is implemented through router-owned projection:
 ## Consequences
 
 The router can hand a session between executors while keeping one user-visible
-conversation and one active executor invariant.
+conversation and a single selected executor when the session is not auto-pending.
 
 Backends remain isolated. They do not need to share caches, tool state, model
 reasoning items, approval internals, or raw protocol events.

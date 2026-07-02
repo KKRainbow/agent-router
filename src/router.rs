@@ -1820,6 +1820,7 @@ Configured task executors:\n{task_executors}\n\n\
 Current session:\n\
 - source: {}\n\
 - source_kind: {}\n\
+- orchestrator_mode: {}\n\
 - routing_mode: {}\n\
 - default_executor: {}\n\
 - active_executor: {}\n\n\
@@ -1829,6 +1830,7 @@ Current user message:\n{}",
             session_source.source,
             session_source.source_kind,
             orchestrator.mode.as_str(),
+            state.routing_mode.as_str(),
             state.default_executor,
             state.active_executor.as_deref().unwrap_or("none"),
             input.text
@@ -4511,7 +4513,8 @@ mod tests {
         assert_eq!(prompts[0].user_id, None);
         assert!(prompts[0].prompt.contains("- source: slack"));
         assert!(prompts[0].prompt.contains("- source_kind: dm"));
-        assert!(prompts[0].prompt.contains("- routing_mode: initial"));
+        assert!(prompts[0].prompt.contains("- orchestrator_mode: initial"));
+        assert!(prompts[0].prompt.contains("- routing_mode: auto"));
         assert!(prompts[0].prompt.contains("- active_executor: none"));
         assert!(!prompts[0].prompt.contains("slack:dm:D1:111.000"));
         assert!(prompts[0].prompt.contains("Routing policy markdown:"));
@@ -4618,7 +4621,12 @@ mod tests {
             .count();
         assert_eq!(route_prompts.len(), 2);
         assert_eq!(codex_prompts, 2);
-        assert!(route_prompts[0].prompt.contains("- routing_mode: per_turn"));
+        assert!(
+            route_prompts[0]
+                .prompt
+                .contains("- orchestrator_mode: per_turn")
+        );
+        assert!(route_prompts[0].prompt.contains("- routing_mode: auto"));
         assert!(route_prompts[0].prompt.contains("- active_executor: none"));
         assert!(route_prompts[1].prompt.contains("- active_executor: codex"));
     }

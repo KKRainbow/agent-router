@@ -7,9 +7,10 @@ from Hermes into Agent Router.
 ## Goal
 
 The user sees one continuous session. When the session starts, the router
-chooses a `default_executor`. The session then has exactly one
-`active_executor`, initialized from that default. The active executor can switch
-between configured agents such as Hermes, Codex, Kimi, or future backends.
+chooses a `default_executor`. The session records an `active_executor` once an
+executor is selected; it can be empty while automatic routing is pending. The
+active executor can switch between configured agents such as Hermes, Codex,
+Kimi, or future backends.
 
 Agent Router owns the session routing state and the user-visible transcript.
 Each executor backend keeps its own private state.
@@ -18,8 +19,10 @@ Each executor backend keeps its own private state.
 
 - The user-visible session key is stable.
 - Each session has a `default_executor`.
-- Each session has exactly one `active_executor`.
-- `active_executor` is initialized to `default_executor`.
+- `active_executor` records the currently selected executor and can be empty in
+  auto-pending state.
+- `routing_mode` records whether routing is automatic or a manual user
+  override.
 - Executor switching changes `active_executor`; it does not create a new
   user-visible session.
 - The canonical transcript is unified and safe to show to the user.
