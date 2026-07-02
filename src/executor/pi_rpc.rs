@@ -30,6 +30,7 @@ use crate::{
         TurnCancellation,
     },
     machine::{MachinePrepareRequest, MachineRegistry, MachineWorkspaceRecord, StdioCommand},
+    text::truncate_chars,
 };
 
 type SessionKey = (String, String);
@@ -1116,24 +1117,18 @@ impl PiRpcSession {
                         .send(ExecutorUpdate::new("agent_message_chunk", "", delta, ""))
                         .await?;
                 } else if let Some(delta) = pi_thinking_delta(message) {
-                    events
-                        .send(
-                            ExecutorUpdate::new("agent_thought_chunk", "Reasoning", &delta, "")
-                                .with_channel_event(ExecutorChannelEvent::reasoning_summary(delta)),
-                        )
-                        .await?;
+                    if let Some(update) = project_pi_thinking_progress(delta) {
+                        events.send(update).await?;
+                    }
                 }
             }
             "thinking_delta" => {
                 if let Some(delta) = extract_textish(message.get("delta"))
                     .or_else(|| extract_textish(message.get("thinking")))
                 {
-                    events
-                        .send(
-                            ExecutorUpdate::new("agent_thought_chunk", "Reasoning", &delta, "")
-                                .with_channel_event(ExecutorChannelEvent::reasoning_summary(delta)),
-                        )
-                        .await?;
+                    if let Some(update) = project_pi_thinking_progress(delta) {
+                        events.send(update).await?;
+                    }
                 }
             }
             "tool_execution_start" | "tool_start" => {
@@ -1740,6 +1735,22 @@ fn pi_thinking_delta(message: &Value) -> Option<String> {
         .or_else(|| extract_textish(message.get("thinking_delta")))
 }
 
+fn project_pi_thinking_progress(delta: String) -> Option<ExecutorUpdate> {
+    let text = one_line(&delta);
+    if text.is_empty() {
+        return None;
+    }
+    let text = truncate_chars(&text, 240);
+    Some(
+        ExecutorUpdate::new("agent_thought_chunk", "Progress", text.clone(), "")
+            .with_channel_event(ExecutorChannelEvent::agent_progress(text)),
+    )
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn assistant_event<'a>(message: &'a Value, event_type: &str) -> Option<&'a Value> {
     let event = message
         .get("assistantMessageEvent")
@@ -1920,7 +1931,8 @@ mod tests {
     use super::*;
     use crate::{
         executor::{
-            ExecutorPrepareRequest, InterruptReason, test_support::CollectingExecutorEventSink,
+            ExecutorChannelEventKind, ExecutorPrepareRequest, InterruptReason,
+            test_support::CollectingExecutorEventSink,
         },
         machine::LOCAL_MACHINE_ID,
     };
@@ -1978,6 +1990,9 @@ def thinking_delta(text):
         "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": text}]},
         "assistantMessageEvent": {"type": "thinking_delta", "delta": text},
     })
+
+def standalone_thinking_delta(text):
+    send({"type": "thinking_delta", "delta": text})
 
 def partial_text_delta(text):
     line = json.dumps({
@@ -2207,6 +2222,7 @@ while True:
             response(cmd, "prompt")
             text_delta("hello ")
             thinking_delta("thinking")
+            standalone_thinking_delta("standalone thinking")
             send({"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "bash", "args": {"command": "echo hi"}})
             send({"type": "tool_execution_update", "toolCallId": "tool-1", "toolName": "bash", "args": {"command": "echo hi"}, "partialResult": {"content": [{"type": "text", "text": "hi"}]}})
             send({"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "bash", "result": {"content": [{"type": "text", "text": "hi"}]}, "isError": False})
@@ -2512,9 +2528,30 @@ while True:
             .map(|update| update.text.as_str())
             .collect::<Vec<_>>();
         assert_eq!(chunks, ["hello ", "world"]);
-        assert!(events.updates.iter().any(|update| {
-            update.kind == "agent_thought_chunk" && update.channel_event.is_some()
-        }));
+        let thinking_events = events
+            .updates
+            .iter()
+            .filter(|update| update.kind == "agent_thought_chunk")
+            .collect::<Vec<_>>();
+        assert_eq!(thinking_events.len(), 2);
+        assert_eq!(
+            thinking_events
+                .iter()
+                .map(|update| {
+                    update
+                        .channel_event
+                        .as_ref()
+                        .map(|event| (event.kind, event.text.as_str()))
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some((ExecutorChannelEventKind::AgentProgress, "thinking")),
+                Some((
+                    ExecutorChannelEventKind::AgentProgress,
+                    "standalone thinking"
+                )),
+            ]
+        );
         assert!(
             events
                 .updates

@@ -264,7 +264,11 @@ fn compact_channel_activity_inner(
         }
     }
 
-    let has_activity_detail = latest_reasoning.is_some() || tool_total > 0 || !attention.is_empty();
+    let has_progress = !progress_items.is_empty();
+    let has_activity_detail = latest_reasoning.is_some()
+        || tool_total > 0
+        || !attention.is_empty()
+        || (!suppress_single_successful_tool && has_progress);
     if !has_activity_detail {
         return None;
     }
@@ -7734,7 +7738,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_channel_events_suppress_progress_only() {
+    fn compact_channel_events_suppress_final_progress_only_but_show_live() {
         let events = vec![
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
@@ -7751,7 +7755,12 @@ mod tests {
         ];
 
         assert_eq!(render_compact_channel_events(&events).as_deref(), None);
-        assert_eq!(render_live_compact_channel_events(&events).as_deref(), None);
+        assert_eq!(
+            render_live_compact_channel_events(&events).as_deref(),
+            Some(
+                "[codex] Activity\nProgress:\n- I will inspect the config first.\n- Now I will add the focused test."
+            )
+        );
     }
 
     #[test]

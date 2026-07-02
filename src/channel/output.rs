@@ -226,6 +226,13 @@ where
     }
 
     async fn discard_reply_stream(&mut self) {
+        if self.policy.activity_mode == ChannelEventMode::Compact
+            && self.policy.compact_activity_style == CompactActivityStyle::LiveUpdate
+            && let Some(id) = self.activity.compact.discard_live().await
+            && let Err(err) = self.port.delete(&self.target, &id).await
+        {
+            tracing::warn!(error = %err, "failed to delete discarded channel activity message");
+        }
         match self.policy.reply_style {
             ChannelReplyStyle::StreamingDraft => self.reply.draft.discard().await,
             ChannelReplyStyle::CheckpointMessages => {
@@ -389,6 +396,12 @@ where
             return await_option_worker(updater.handle, "compact_activity").await;
         }
         None
+    }
+
+    async fn discard_live(&mut self) -> Option<String> {
+        let id = self.flush_live().await;
+        self.events.clear();
+        id
     }
 
     async fn flush_final(&mut self, port: P, target: P::Target) -> Option<String> {
@@ -1021,6 +1034,15 @@ mod tests {
         }
     }
 
+    fn progress_event(text: &str) -> RouterChannelEvent {
+        RouterChannelEvent {
+            kind: RouterChannelEventKind::AgentProgress,
+            executor: "pi".to_string(),
+            title: "Progress".to_string(),
+            text: text.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn compact_activity_accumulates_and_flushes_before_final_reply() {
         let port = RecordingPort::default();
@@ -1039,6 +1061,29 @@ mod tests {
         assert!(deliveries.iter().any(
             |delivery| matches!(delivery, Delivery::PostMarkdown { text, .. } if text == "done")
                 || matches!(delivery, Delivery::UpdateMarkdown { text, .. } if text == "done")
+        ));
+        assert!(
+            deliveries
+                .iter()
+                .any(|delivery| matches!(delivery, Delivery::Delete { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn discarded_streaming_draft_deletes_live_compact_activity() {
+        let port = RecordingPort::default();
+        let mut sink = ChannelOutputSink::new(
+            port.clone(),
+            "target".to_string(),
+            ChannelOutputPolicy::streaming_draft(ChannelEventMode::Compact),
+        );
+
+        sink.send_channel_event(progress_event("thinking"));
+        sink.discard_reply_stream().await;
+
+        let deliveries = port.deliveries().await;
+        assert!(deliveries.iter().any(
+            |delivery| matches!(delivery, Delivery::PostText { text, .. } if text == "[pi] Activity\nProgress:\n- thinking")
         ));
         assert!(
             deliveries
