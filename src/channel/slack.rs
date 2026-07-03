@@ -45,7 +45,7 @@ const SLACK_MARKDOWN_BLOCK_CHAR_LIMIT: usize = 12_000;
 const SLACK_MARKDOWN_SNIPPET_FILENAME: &str = "agent-router-reply.md";
 const SLACK_MARKDOWN_SNIPPET_TYPE: &str = "markdown";
 const SLACK_ACTIONS_BLOCK_MAX_ELEMENTS: usize = 25;
-const SLACK_APPROVAL_APPROVE_ACTION_ID: &str = "agent_router_approval_approve";
+const SLACK_APPROVAL_APPROVE_ACTION_ID_PREFIX: &str = "agent_router_approval_approve";
 const SLACK_APPROVAL_DENY_ACTION_ID: &str = "agent_router_approval_deny";
 
 mod context;
@@ -1304,7 +1304,8 @@ fn slack_approval_message_body(
     let mut body = slack_message_body(target, text);
     let mut elements = selectable_options
         .iter()
-        .map(|option| {
+        .enumerate()
+        .map(|(index, option)| {
             let mut button = json!({
                 "type": "button",
                 "text": {
@@ -1312,7 +1313,7 @@ fn slack_approval_message_body(
                     "text": approval_button_label(prompt, option),
                     "emoji": true,
                 },
-                "action_id": SLACK_APPROVAL_APPROVE_ACTION_ID,
+                "action_id": slack_approval_approve_action_id(index),
                 "value": slack_approval_button_value(
                     &prompt.session_key,
                     &prompt.id,
@@ -1379,6 +1380,10 @@ fn slack_approval_button_value(
         "option_id": option_id,
     })
     .to_string()
+}
+
+fn slack_approval_approve_action_id(index: usize) -> String {
+    format!("{SLACK_APPROVAL_APPROVE_ACTION_ID_PREFIX}_{index}")
 }
 
 fn slack_approval_resolved_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -> Value {
@@ -1671,12 +1676,14 @@ fn parse_approval_interaction_action(
     let action_id = action.get("action_id").and_then(Value::as_str)?;
     let value: SlackApprovalButtonValue =
         serde_json::from_str(action.get("value").and_then(Value::as_str)?).ok()?;
-    let resolve_action = match action_id {
-        SLACK_APPROVAL_APPROVE_ACTION_ID => ApprovalResolveAction::Approve {
+    let resolve_action = if action_id.starts_with(SLACK_APPROVAL_APPROVE_ACTION_ID_PREFIX) {
+        ApprovalResolveAction::Approve {
             option_id: value.option_id.clone(),
-        },
-        SLACK_APPROVAL_DENY_ACTION_ID => ApprovalResolveAction::Deny,
-        _ => return None,
+        }
+    } else if action_id == SLACK_APPROVAL_DENY_ACTION_ID {
+        ApprovalResolveAction::Deny
+    } else {
+        return None;
     };
     Some((value, resolve_action))
 }
@@ -2411,7 +2418,10 @@ mod tests {
         assert_eq!(body["blocks"][1]["type"], "actions");
         let elements = body["blocks"][1]["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 2);
-        assert_eq!(elements[0]["action_id"], SLACK_APPROVAL_APPROVE_ACTION_ID);
+        assert_eq!(
+            elements[0]["action_id"],
+            slack_approval_approve_action_id(0)
+        );
         assert_eq!(elements[0]["style"], "primary");
         assert_eq!(elements[0]["text"]["text"], "Approve");
         let approve_value: Value =
@@ -2451,8 +2461,17 @@ mod tests {
         let elements = body["blocks"][1]["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[0]["text"]["text"], "First");
+        assert_eq!(
+            elements[0]["action_id"],
+            slack_approval_approve_action_id(0)
+        );
         assert!(elements[0].get("style").is_none());
         assert_eq!(elements[1]["text"]["text"], "Second");
+        assert_eq!(
+            elements[1]["action_id"],
+            slack_approval_approve_action_id(1)
+        );
+        assert_ne!(elements[0]["action_id"], elements[1]["action_id"]);
         assert_eq!(elements[2]["text"]["text"], "Deny");
         let second_value: Value =
             serde_json::from_str(elements[1]["value"].as_str().unwrap()).unwrap();
