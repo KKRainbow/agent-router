@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             approvals.clone(),
         )
         .with_workspace_root(config.workspace.root.clone())
+        .with_owner_user_ids("slack", config.slack.owner_user_ids.clone())
         .with_orchestrator(orchestrator),
     );
 

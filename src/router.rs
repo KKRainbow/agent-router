@@ -665,6 +665,7 @@ where
     executor: Arc<E>,
     approvals: SharedApprovalBroker,
     workspace_root: Option<PathBuf>,
+    owner_user_ids_by_source: HashMap<String, BTreeSet<String>>,
     #[cfg(test)]
     before_task_adopt_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -746,6 +747,16 @@ struct PendingOrchestratorDecision {
 struct SessionSourceMetadata {
     source: &'static str,
     source_kind: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestRoutingMetadata {
+    source: &'static str,
+    source_kind: &'static str,
+    user_id: Option<String>,
+    user_is_owner: bool,
+    channel_id: Option<String>,
+    conversation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -895,6 +906,7 @@ where
             executor,
             approvals,
             workspace_root: None,
+            owner_user_ids_by_source: HashMap::new(),
             #[cfg(test)]
             before_task_adopt_hook: None,
             #[cfg(test)]
@@ -907,6 +919,20 @@ where
 
     pub fn with_workspace_root(mut self, workspace_root: Option<PathBuf>) -> Self {
         self.workspace_root = workspace_root;
+        self
+    }
+
+    pub fn with_owner_user_ids(
+        mut self,
+        source: impl Into<String>,
+        owner_user_ids: BTreeSet<String>,
+    ) -> Self {
+        let source = source.into();
+        if owner_user_ids.is_empty() {
+            self.owner_user_ids_by_source.remove(&source);
+        } else {
+            self.owner_user_ids_by_source.insert(source, owner_user_ids);
+        }
         self
     }
 
@@ -1835,7 +1861,8 @@ where
         };
         let transcript =
             render_orchestrator_transcript(&state.transcript, orchestrator.max_transcript_messages);
-        let session_source = session_source_metadata(&input.session_key);
+        let request_metadata = self.request_routing_metadata(input);
+        let request_metadata = render_request_routing_metadata(&request_metadata);
         format!(
             "You are the route decision executor for Agent Router.\n\
 You do not execute the user's task.\n\
@@ -1846,9 +1873,8 @@ Decision schema:\n\
 {{\"action\":\"handoff\",\"executor\":\"executor-name\",\"reason\":\"short reason\"}}\n\n\
 Use `stay` to keep the current active executor. If active_executor is none, `stay` selects default_executor.\n\n\
 Configured task executors:\n{task_executors}\n\n\
+Current request:\n{request_metadata}\n\n\
 Current session:\n\
-- source: {}\n\
-- source_kind: {}\n\
 - orchestrator_mode: {}\n\
 - routing_mode: {}\n\
 - default_executor: {}\n\
@@ -1856,14 +1882,29 @@ Current session:\n\
 Routing policy markdown:\n{policy}\n\n\
 Recent user-visible transcript:\n{transcript}\n\n\
 Current user message:\n{}",
-            session_source.source,
-            session_source.source_kind,
             orchestrator.mode.as_str(),
             state.routing_mode.as_str(),
             state.default_executor,
             state.active_executor.as_deref().unwrap_or("none"),
             input.text
         )
+    }
+
+    fn request_routing_metadata(&self, input: &RouterInput) -> RequestRoutingMetadata {
+        let session_source = session_source_metadata(&input.session_key);
+        let user_is_owner = input.user_id.as_deref().is_some_and(|user_id| {
+            self.owner_user_ids_by_source
+                .get(session_source.source)
+                .is_some_and(|owner_user_ids| owner_user_ids.contains(user_id))
+        });
+        RequestRoutingMetadata {
+            source: session_source.source,
+            source_kind: session_source.source_kind,
+            user_id: input.user_id.clone(),
+            user_is_owner,
+            channel_id: request_channel_id(&input.session_key),
+            conversation_id: stable_conversation_id(&input.session_key),
+        }
     }
 
     async fn route_to_active_executor(
@@ -2659,11 +2700,76 @@ fn session_source_metadata(session_key: &str) -> SessionSourceMetadata {
                 source_kind,
             }
         }
+        Some("web") => {
+            let source_kind = match parts.next() {
+                Some("user") => "user",
+                _ => "unknown",
+            };
+            SessionSourceMetadata {
+                source: "web",
+                source_kind,
+            }
+        }
         _ => SessionSourceMetadata {
             source: "unknown",
             source_kind: "unknown",
         },
     }
+}
+
+fn request_channel_id(session_key: &str) -> Option<String> {
+    let mut parts = session_key.split(':');
+    match parts.next() {
+        Some("slack") => match parts.collect::<Vec<_>>().as_slice() {
+            ["channel", channel_id, ..]
+            | ["dm", channel_id, ..]
+            | ["user-dm", channel_id, ..]
+            | [channel_id, "slash", ..] => Some((*channel_id).to_string()),
+            _ => None,
+        },
+        Some("qq") => match parts.collect::<Vec<_>>().as_slice() {
+            ["group", group_id, ..] => Some((*group_id).to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn stable_conversation_id(session_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session_key.as_bytes());
+    let digest = hasher.finalize();
+    let hash = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("conv_{hash}")
+}
+
+fn render_request_routing_metadata(metadata: &RequestRoutingMetadata) -> String {
+    let user_id = metadata.user_id.as_deref().unwrap_or("none");
+    let roles = if metadata.user_is_owner {
+        "owner"
+    } else {
+        "none"
+    };
+    let channel_id = metadata.channel_id.as_deref().unwrap_or("none");
+    format!(
+        "- source: {}\n\
+- source_kind: {}\n\
+- user_id: {}\n\
+- user_is_owner: {}\n\
+- roles: {}\n\
+- channel_id: {}\n\
+- conversation_id: {}",
+        metadata.source,
+        metadata.source_kind,
+        user_id,
+        metadata.user_is_owner,
+        roles,
+        channel_id,
+        metadata.conversation_id
+    )
 }
 
 fn render_orchestrator_transcript(transcript: &[TranscriptMessage], max_messages: usize) -> String {
@@ -4472,6 +4578,13 @@ mod tests {
                 },
             ),
             (
+                "web:user:local:session-id",
+                SessionSourceMetadata {
+                    source: "web",
+                    source_kind: "user",
+                },
+            ),
+            (
                 "local-session",
                 SessionSourceMetadata {
                     source: "unknown",
@@ -4483,6 +4596,53 @@ mod tests {
         for (session_key, expected) in cases {
             assert_eq!(session_source_metadata(session_key), expected);
         }
+    }
+
+    #[test]
+    fn orchestrator_prompt_includes_trusted_request_identity_metadata() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store, executor)
+            .with_owner_user_ids("slack", BTreeSet::from(["U_OWNER".to_string()]));
+        let settings = test_orchestrator_settings(PathBuf::from("policy.md"));
+        let state = SessionState::new("slack:channel:C1:111.000", "kimi");
+        let input = RouterInput {
+            session_key: "slack:channel:C1:111.000".to_string(),
+            text: "please route this".to_string(),
+            user_id: Some("U_OWNER".to_string()),
+        };
+
+        let prompt = router.build_orchestrator_prompt(&settings, &state, &input, "Policy");
+
+        assert!(prompt.contains("Current request:\n- source: slack"));
+        assert!(prompt.contains("- source_kind: channel"));
+        assert!(prompt.contains("- user_id: U_OWNER"));
+        assert!(prompt.contains("- user_is_owner: true"));
+        assert!(prompt.contains("- roles: owner"));
+        assert!(prompt.contains("- channel_id: C1"));
+        assert!(prompt.contains("- conversation_id: conv_"));
+        assert!(!prompt.contains("slack:channel:C1:111.000"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_marks_non_owner_request_identity() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store, executor)
+            .with_owner_user_ids("slack", BTreeSet::from(["U_OWNER".to_string()]));
+        let settings = test_orchestrator_settings(PathBuf::from("policy.md"));
+        let state = SessionState::new("slack:channel:C1:111.000", "kimi");
+        let input = RouterInput {
+            session_key: "slack:channel:C1:111.000".to_string(),
+            text: "please route this".to_string(),
+            user_id: Some("U_OTHER".to_string()),
+        };
+
+        let prompt = router.build_orchestrator_prompt(&settings, &state, &input, "Policy");
+
+        assert!(prompt.contains("- user_id: U_OTHER"));
+        assert!(prompt.contains("- user_is_owner: false"));
+        assert!(prompt.contains("- roles: none"));
     }
 
     fn slack_thread_and_extra_context_request(
