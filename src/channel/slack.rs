@@ -7,7 +7,7 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url, header::CONTENT_TYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -836,6 +836,7 @@ impl SlackSocketModeChannel {
             error: Option<String>,
             upload_url: Option<String>,
             file_id: Option<String>,
+            response_metadata: Option<SlackResponseMetadata>,
         }
 
         tracing::info!(
@@ -850,15 +851,18 @@ impl SlackSocketModeChannel {
             .http
             .post("https://slack.com/api/files.getUploadURLExternal")
             .bearer_auth(&self.cfg.bot_token)
-            .json(&upload_url_body)
+            .form(&upload_url_body)
             .send()
             .await?
             .json::<UploadUrlResponse>()
             .await?;
         if !resp.ok {
-            return Err(SlackApiError::new(
+            return Err(SlackApiError::with_messages(
                 "files.getUploadURLExternal",
                 resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+                resp.response_metadata
+                    .map(|metadata| metadata.messages)
+                    .unwrap_or_default(),
             )
             .into());
         }
@@ -1434,12 +1438,19 @@ fn slack_text_requires_markdown_snippet(text: &str) -> bool {
     text.chars().count() > SLACK_MARKDOWN_BLOCK_CHAR_LIMIT
 }
 
-fn slack_markdown_snippet_upload_url_body(text: &str) -> Value {
-    json!({
-        "filename": SLACK_MARKDOWN_SNIPPET_FILENAME,
-        "length": text.len(),
-        "snippet_type": SLACK_MARKDOWN_SNIPPET_TYPE,
-    })
+#[derive(Debug, Serialize)]
+struct SlackMarkdownSnippetUploadUrlBody {
+    filename: &'static str,
+    length: usize,
+    snippet_type: &'static str,
+}
+
+fn slack_markdown_snippet_upload_url_body(text: &str) -> SlackMarkdownSnippetUploadUrlBody {
+    SlackMarkdownSnippetUploadUrlBody {
+        filename: SLACK_MARKDOWN_SNIPPET_FILENAME,
+        length: text.len(),
+        snippet_type: SLACK_MARKDOWN_SNIPPET_TYPE,
+    }
 }
 
 fn slack_complete_markdown_snippet_upload_body(target: &SlackReplyTarget, file_id: &str) -> Value {
@@ -1718,17 +1729,29 @@ fn normalize_slack_slash_command_text(command: &SlackSlashCommand) -> String {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SlackResponseMetadata {
+    #[serde(default)]
+    messages: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct SlackApiError {
     method: &'static str,
     code: String,
+    messages: Vec<String>,
 }
 
 impl SlackApiError {
     fn new(method: &'static str, code: impl Into<String>) -> Self {
+        Self::with_messages(method, code, Vec::new())
+    }
+
+    fn with_messages(method: &'static str, code: impl Into<String>, messages: Vec<String>) -> Self {
         Self {
             method,
             code: code.into(),
+            messages,
         }
     }
 
@@ -1766,7 +1789,11 @@ impl SlackApiError {
 
 impl std::fmt::Display for SlackApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Slack {} failed: {}", self.method, self.code)
+        write!(f, "Slack {} failed: {}", self.method, self.code)?;
+        if !self.messages.is_empty() {
+            write!(f, " ({})", self.messages.join("; "))?;
+        }
+        Ok(())
     }
 }
 
@@ -2100,9 +2127,44 @@ mod tests {
     fn slack_markdown_snippet_upload_url_body_uses_markdown_snippet() {
         let body = slack_markdown_snippet_upload_url_body("é");
 
-        assert_eq!(body["filename"], SLACK_MARKDOWN_SNIPPET_FILENAME);
-        assert_eq!(body["length"], 2);
-        assert_eq!(body["snippet_type"], SLACK_MARKDOWN_SNIPPET_TYPE);
+        assert_eq!(body.filename, SLACK_MARKDOWN_SNIPPET_FILENAME);
+        assert_eq!(body.length, 2);
+        assert_eq!(body.snippet_type, SLACK_MARKDOWN_SNIPPET_TYPE);
+    }
+
+    #[test]
+    fn slack_markdown_snippet_upload_url_request_uses_form_encoding() {
+        let body = slack_markdown_snippet_upload_url_body("é");
+        let request = Client::new()
+            .post("https://slack.com/api/files.getUploadURLExternal")
+            .form(&body)
+            .build()
+            .unwrap();
+        let content_type = request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let encoded = request.body().and_then(|body| body.as_bytes()).unwrap();
+
+        assert_eq!(content_type, Some("application/x-www-form-urlencoded"));
+        assert_eq!(
+            std::str::from_utf8(encoded).unwrap(),
+            "filename=agent-router-reply.md&length=2&snippet_type=markdown"
+        );
+    }
+
+    #[test]
+    fn slack_api_error_display_includes_response_metadata_messages() {
+        let err = SlackApiError::with_messages(
+            "files.getUploadURLExternal",
+            "invalid_arguments",
+            vec!["[ERROR] missing required field: length".to_string()],
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "Slack files.getUploadURLExternal failed: invalid_arguments ([ERROR] missing required field: length)"
+        );
     }
 
     #[test]
