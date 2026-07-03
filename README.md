@@ -109,6 +109,10 @@ In the Slack app settings, enable Socket Mode and create an app-level token for
 connections:write
 ```
 
+Enable Interactivity & Shortcuts so approval prompts can use Approve/Deny
+buttons. With Socket Mode enabled, Slack delivers interaction payloads over the
+WebSocket connection, so no public Request URL is required.
+
 In OAuth & Permissions, add these Bot Token Scopes:
 
 ```text
@@ -135,6 +139,9 @@ message.mpim
 ```
 
 Reinstall the Slack app after changing scopes or event subscriptions.
+
+Approval prompts include `/approve` and `/deny` text commands as fallback and
+audit text. Use those commands if Block Kit buttons are unavailable.
 
 QQ:
 

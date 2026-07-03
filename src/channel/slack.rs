@@ -21,8 +21,8 @@ const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 use crate::{
     approval::{
-        ApprovalPrompt, ApprovalRequest, ApprovalResolverPolicy, ApprovalScope, ApprovalSelection,
-        SharedApprovalBroker, is_approval_command,
+        ApprovalPrompt, ApprovalRequest, ApprovalResolveAction, ApprovalResolverPolicy,
+        ApprovalScope, ApprovalSelection, SharedApprovalBroker, is_approval_command,
     },
     channel::{
         EventDeduper,
@@ -44,6 +44,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const SLACK_MARKDOWN_BLOCK_CHAR_LIMIT: usize = 12_000;
 const SLACK_MARKDOWN_SNIPPET_FILENAME: &str = "agent-router-reply.md";
 const SLACK_MARKDOWN_SNIPPET_TYPE: &str = "markdown";
+const SLACK_ACTIONS_BLOCK_MAX_ELEMENTS: usize = 25;
+const SLACK_APPROVAL_APPROVE_ACTION_ID: &str = "agent_router_approval_approve";
+const SLACK_APPROVAL_DENY_ACTION_ID: &str = "agent_router_approval_deny";
 
 mod context;
 use self::context::*;
@@ -196,7 +199,9 @@ impl SlackSocketModeChannel {
         text: &str,
     ) -> anyhow::Result<()> {
         if prompt.scope != ApprovalScope::ChannelInput {
-            return self.post_message(fallback_target, text).await;
+            return self
+                .post_approval_message(fallback_target, prompt, text)
+                .await;
         }
 
         let Some(owner_user_ids) = prompt.resolver_policy.explicit_allowed_user_ids() else {
@@ -206,11 +211,12 @@ impl SlackSocketModeChannel {
         for owner_user_id in owner_user_ids {
             let result = async {
                 let dm_channel = self.open_direct_message(owner_user_id).await?;
-                self.post_message(
+                self.post_approval_message(
                     &SlackReplyTarget {
                         channel: dm_channel,
                         thread_ts: None,
                     },
+                    prompt,
                     text,
                 )
                 .await
@@ -231,6 +237,28 @@ impl SlackSocketModeChannel {
         Ok(())
     }
 
+    async fn post_approval_message(
+        &self,
+        target: &SlackReplyTarget,
+        prompt: &ApprovalPrompt,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let Some(body) = slack_approval_message_body(target, prompt, text) else {
+            return self.post_message(target, text).await;
+        };
+        match self.post_message_body_with_ts(target, body).await {
+            Ok(_) => Ok(()),
+            Err(err) if slack_error_is_invalid_blocks(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Slack approval blocks were rejected; retrying approval prompt as plain text"
+                );
+                self.post_message(target, text).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn handle_envelope(
         &self,
         envelope: SlackEnvelope,
@@ -249,7 +277,68 @@ impl SlackSocketModeChannel {
                     self.handle_slash_command(command, router).await?;
                 }
             }
+            "interactive" => {
+                if let Some(interaction) = parse_approval_interaction(&envelope.payload) {
+                    self.handle_approval_interaction(interaction).await?;
+                }
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_approval_interaction(
+        &self,
+        interaction: SlackApprovalInteraction,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .approvals
+            .resolve_action(
+                &interaction.session_key,
+                &interaction.approval_id,
+                interaction.action.clone(),
+                Some(&interaction.user_id),
+            )
+            .await;
+        if approval_reply_resolved_for_action(&reply.text, &interaction.action) {
+            let status = match interaction.action {
+                ApprovalResolveAction::Approve { .. } => "Approved",
+                ApprovalResolveAction::Deny => "Denied",
+            };
+            let resolved_text = slack_approval_resolved_text(
+                &interaction.message_text,
+                status,
+                &interaction.user_id,
+            );
+            if let Err(err) = self
+                .update_approval_message(
+                    &interaction.message_target,
+                    &interaction.message_ts,
+                    &resolved_text,
+                )
+                .await
+            {
+                tracing::warn!(
+                    approval_id = %interaction.approval_id,
+                    error = %err,
+                    "failed to update Slack approval prompt after button action"
+                );
+            }
+        } else if let Err(err) = self
+            .post_ephemeral(
+                &interaction.message_target.channel,
+                &interaction.user_id,
+                &reply.text,
+                Some(&interaction.message_ts),
+            )
+            .await
+        {
+            tracing::warn!(
+                approval_id = %interaction.approval_id,
+                user_id = %interaction.user_id,
+                error = %err,
+                "failed to post Slack approval button feedback"
+            );
         }
         Ok(())
     }
@@ -949,6 +1038,26 @@ impl SlackSocketModeChannel {
         Ok(())
     }
 
+    async fn update_approval_message(
+        &self,
+        target: &SlackReplyTarget,
+        ts: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let body = slack_approval_resolved_update_body(target, ts, text);
+        match self.update_message_body(body).await {
+            Ok(()) => Ok(()),
+            Err(err) if slack_error_is_invalid_blocks(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Slack approval update blocks were rejected; retrying approval update as plain text"
+                );
+                self.update_message(target, ts, text).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn delete_message(&self, target: &SlackReplyTarget, ts: &str) -> anyhow::Result<()> {
         #[derive(Deserialize)]
         struct Response {
@@ -986,6 +1095,46 @@ impl SlackSocketModeChannel {
             ts,
             "deleted Slack message"
         );
+        Ok(())
+    }
+
+    async fn post_ephemeral(
+        &self,
+        channel: &str,
+        user: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            error: Option<String>,
+        }
+
+        let mut body = json!({
+            "channel": channel,
+            "user": user,
+            "text": text,
+        });
+        if let Some(thread_ts) = thread_ts {
+            body["thread_ts"] = Value::String(thread_ts.to_string());
+        }
+        let resp = self
+            .http
+            .post("https://slack.com/api/chat.postEphemeral")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&body)
+            .send()
+            .await?
+            .json::<Response>()
+            .await?;
+        if !resp.ok {
+            return Err(SlackApiError::new(
+                "chat.postEphemeral",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -1137,6 +1286,135 @@ fn slack_markdown_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -
     }))
 }
 
+fn slack_approval_message_body(
+    target: &SlackReplyTarget,
+    prompt: &ApprovalPrompt,
+    text: &str,
+) -> Option<Value> {
+    let selectable_options = prompt
+        .options
+        .iter()
+        .filter(|option| !option.is_deny())
+        .collect::<Vec<_>>();
+    let button_count = selectable_options.len() + 1;
+    if button_count > SLACK_ACTIONS_BLOCK_MAX_ELEMENTS {
+        return None;
+    }
+
+    let mut body = slack_message_body(target, text);
+    let mut elements = selectable_options
+        .iter()
+        .map(|option| {
+            let mut button = json!({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": approval_button_label(prompt, option),
+                    "emoji": true,
+                },
+                "action_id": SLACK_APPROVAL_APPROVE_ACTION_ID,
+                "value": slack_approval_button_value(
+                    &prompt.session_key,
+                    &prompt.id,
+                    Some(option.id.as_str()),
+                ),
+            });
+            if selectable_options.len() == 1 {
+                button["style"] = Value::String("primary".to_string());
+            }
+            button
+        })
+        .collect::<Vec<_>>();
+    elements.push(json!({
+        "type": "button",
+        "text": {
+            "type": "plain_text",
+            "text": "Deny",
+            "emoji": true,
+        },
+        "style": "danger",
+        "action_id": SLACK_APPROVAL_DENY_ACTION_ID,
+        "value": slack_approval_button_value(&prompt.session_key, &prompt.id, None),
+    }));
+    body["blocks"] = json!([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": text,
+            },
+        },
+        {
+            "type": "actions",
+            "elements": elements,
+        }
+    ]);
+    Some(body)
+}
+
+fn approval_button_label<'a>(
+    prompt: &ApprovalPrompt,
+    option: &'a crate::approval::ApprovalOption,
+) -> &'a str {
+    let selectable_count = prompt
+        .options
+        .iter()
+        .filter(|option| !option.is_deny())
+        .count();
+    if selectable_count == 1 && option.kind.starts_with("allow") {
+        "Approve"
+    } else {
+        &option.name
+    }
+}
+
+fn slack_approval_button_value(
+    session_key: &str,
+    approval_id: &str,
+    option_id: Option<&str>,
+) -> String {
+    json!({
+        "session_key": session_key,
+        "approval_id": approval_id,
+        "option_id": option_id,
+    })
+    .to_string()
+}
+
+fn slack_approval_resolved_update_body(target: &SlackReplyTarget, ts: &str, text: &str) -> Value {
+    json!({
+        "channel": target.channel,
+        "ts": ts,
+        "text": text,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": text,
+                },
+            }
+        ],
+    })
+}
+
+fn slack_approval_resolved_text(original_text: &str, status: &str, user_id: &str) -> String {
+    let suffix = format!("{status} by <@{user_id}>.");
+    let original_text = original_text.trim();
+    if original_text.is_empty() {
+        suffix
+    } else {
+        format!("{original_text}\n\n{suffix}")
+    }
+}
+
+fn approval_reply_resolved_for_action(text: &str, action: &ApprovalResolveAction) -> bool {
+    match action {
+        ApprovalResolveAction::Approve { .. } => text.starts_with("Approved "),
+        ApprovalResolveAction::Deny => text.starts_with("Denied "),
+    }
+}
+
 fn slack_text_requires_markdown_snippet(text: &str) -> bool {
     text.chars().count() > SLACK_MARKDOWN_BLOCK_CHAR_LIMIT
 }
@@ -1194,6 +1472,24 @@ struct SlackEnvelope {
     envelope_id: Option<String>,
     #[serde(default)]
     payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackApprovalButtonValue {
+    session_key: String,
+    approval_id: String,
+    option_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SlackApprovalInteraction {
+    session_key: String,
+    approval_id: String,
+    user_id: String,
+    message_target: SlackReplyTarget,
+    message_ts: String,
+    message_text: String,
+    action: ApprovalResolveAction,
 }
 
 #[derive(Debug, Clone)]
@@ -1331,6 +1627,65 @@ fn parse_slash_command(payload: &Value) -> Option<SlackSlashCommand> {
             .to_string(),
         user_id: payload.get("user_id").and_then(Value::as_str)?.to_string(),
     })
+}
+
+fn parse_approval_interaction(payload: &Value) -> Option<SlackApprovalInteraction> {
+    if payload.get("type").and_then(Value::as_str)? != "block_actions" {
+        return None;
+    }
+    let user_id = payload
+        .get("user")?
+        .get("id")
+        .and_then(Value::as_str)?
+        .to_string();
+    let channel = slack_payload_id(payload.get("channel")?)?.to_string();
+    let message = payload.get("message")?;
+    let message_ts = message.get("ts").and_then(Value::as_str)?.to_string();
+    let message_text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let (button_value, action) = payload
+        .get("actions")?
+        .as_array()?
+        .iter()
+        .find_map(parse_approval_interaction_action)?;
+    Some(SlackApprovalInteraction {
+        session_key: button_value.session_key,
+        approval_id: button_value.approval_id,
+        user_id,
+        message_target: SlackReplyTarget {
+            channel,
+            thread_ts: None,
+        },
+        message_ts,
+        message_text,
+        action,
+    })
+}
+
+fn parse_approval_interaction_action(
+    action: &Value,
+) -> Option<(SlackApprovalButtonValue, ApprovalResolveAction)> {
+    let action_id = action.get("action_id").and_then(Value::as_str)?;
+    let value: SlackApprovalButtonValue =
+        serde_json::from_str(action.get("value").and_then(Value::as_str)?).ok()?;
+    let resolve_action = match action_id {
+        SLACK_APPROVAL_APPROVE_ACTION_ID => ApprovalResolveAction::Approve {
+            option_id: value.option_id.clone(),
+        },
+        SLACK_APPROVAL_DENY_ACTION_ID => ApprovalResolveAction::Deny,
+        _ => return None,
+    };
+    Some((value, resolve_action))
+}
+
+fn slack_payload_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
 }
 
 fn normalize_slack_slash_command_text(command: &SlackSlashCommand) -> String {
@@ -1994,6 +2349,274 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn multi_option_approval_request(session_key: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            options: vec![
+                ApprovalOption {
+                    id: "first".to_string(),
+                    kind: "select".to_string(),
+                    name: "First".to_string(),
+                    auto_approvable: false,
+                },
+                ApprovalOption {
+                    id: "second".to_string(),
+                    kind: "select".to_string(),
+                    name: "Second".to_string(),
+                    auto_approvable: false,
+                },
+                ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                    auto_approvable: false,
+                },
+            ],
+            ..approval_request(session_key)
+        }
+    }
+
+    async fn prompt_for_request(
+        request: ApprovalRequest,
+    ) -> (
+        Arc<ApprovalBroker>,
+        ApprovalPrompt,
+        tokio::task::JoinHandle<ApprovalSelection>,
+    ) {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move { request_broker.request(request).await });
+        let prompt = prompts.recv().await.unwrap();
+        (broker, prompt, pending)
+    }
+
+    #[tokio::test]
+    async fn slack_approval_message_body_includes_buttons_and_thread_target() {
+        let (broker, prompt, pending) =
+            prompt_for_request(approval_request("slack:channel:C1:111.000")).await;
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+        let text = prompt.render_text();
+
+        let body = slack_approval_message_body(&target, &prompt, &text).unwrap();
+
+        assert_eq!(body["channel"], "C1");
+        assert_eq!(body["thread_ts"], "111.000");
+        assert_eq!(body["text"], text);
+        assert_eq!(body["blocks"][0]["type"], "section");
+        assert_eq!(body["blocks"][1]["type"], "actions");
+        let elements = body["blocks"][1]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0]["action_id"], SLACK_APPROVAL_APPROVE_ACTION_ID);
+        assert_eq!(elements[0]["style"], "primary");
+        assert_eq!(elements[0]["text"]["text"], "Approve");
+        let approve_value: Value =
+            serde_json::from_str(elements[0]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(approve_value["session_key"], "slack:channel:C1:111.000");
+        assert_eq!(approve_value["approval_id"], prompt.id);
+        assert_eq!(approve_value["option_id"], "allow_once");
+        assert_eq!(elements[1]["action_id"], SLACK_APPROVAL_DENY_ACTION_ID);
+        assert_eq!(elements[1]["style"], "danger");
+
+        broker
+            .resolve_action(
+                "slack:channel:C1:111.000",
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("U1"),
+            )
+            .await;
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_approval_message_body_renders_multi_option_buttons() {
+        let (broker, prompt, pending) =
+            prompt_for_request(multi_option_approval_request("slack:channel:C1:111.000")).await;
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+        let text = prompt.render_text();
+
+        let body = slack_approval_message_body(&target, &prompt, &text).unwrap();
+
+        let elements = body["blocks"][1]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements[0]["text"]["text"], "First");
+        assert!(elements[0].get("style").is_none());
+        assert_eq!(elements[1]["text"]["text"], "Second");
+        assert_eq!(elements[2]["text"]["text"], "Deny");
+        let second_value: Value =
+            serde_json::from_str(elements[1]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(second_value["option_id"], "second");
+
+        broker
+            .resolve_action(
+                "slack:channel:C1:111.000",
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("U1"),
+            )
+            .await;
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_approval_message_body_falls_back_when_actions_would_be_incomplete() {
+        let mut request = approval_request("slack:channel:C1:111.000");
+        request.options = (0..SLACK_ACTIONS_BLOCK_MAX_ELEMENTS)
+            .map(|idx| ApprovalOption {
+                id: format!("option_{idx}"),
+                kind: "select".to_string(),
+                name: format!("Option {idx}"),
+                auto_approvable: false,
+            })
+            .collect();
+        request.options.push(ApprovalOption {
+            id: "deny".to_string(),
+            kind: "reject_once".to_string(),
+            name: "Deny".to_string(),
+            auto_approvable: false,
+        });
+        let (broker, prompt, pending) = prompt_for_request(request).await;
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+
+        assert!(slack_approval_message_body(&target, &prompt, &prompt.render_text()).is_none());
+
+        broker
+            .resolve_action(
+                "slack:channel:C1:111.000",
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("U1"),
+            )
+            .await;
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_slack_approval_block_action_payload() {
+        let (broker, prompt, pending) =
+            prompt_for_request(approval_request("slack:channel:C1:111.000")).await;
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+        let text = prompt.render_text();
+        let body = slack_approval_message_body(&target, &prompt, &text).unwrap();
+        let button = &body["blocks"][1]["elements"][0];
+
+        let payload = json!({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "message": {
+                "ts": "222.000",
+                "text": text,
+            },
+            "actions": [button],
+        });
+
+        let interaction = parse_approval_interaction(&payload).unwrap();
+
+        assert_eq!(interaction.session_key, "slack:channel:C1:111.000");
+        assert_eq!(interaction.approval_id, prompt.id);
+        assert_eq!(interaction.user_id, "U1");
+        assert_eq!(interaction.message_target.channel, "C1");
+        assert_eq!(interaction.message_ts, "222.000");
+        assert!(matches!(
+            interaction.action,
+            ApprovalResolveAction::Approve {
+                option_id: Some(ref option_id)
+            } if option_id == "allow_once"
+        ));
+
+        let reply = broker
+            .resolve_action(
+                &interaction.session_key,
+                &interaction.approval_id,
+                interaction.action,
+                Some(&interaction.user_id),
+            )
+            .await;
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_slack_approval_block_action_resolves_request() {
+        let (broker, prompt, pending) =
+            prompt_for_request(approval_request("slack:channel:C1:111.000")).await;
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+        let text = prompt.render_text();
+        let body = slack_approval_message_body(&target, &prompt, &text).unwrap();
+        let button = &body["blocks"][1]["elements"][1];
+        let payload = json!({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "message": {
+                "ts": "222.000",
+                "text": text,
+            },
+            "actions": [button],
+        });
+        let interaction = parse_approval_interaction(&payload).unwrap();
+
+        let reply = broker
+            .resolve_action(
+                &interaction.session_key,
+                &interaction.approval_id,
+                interaction.action,
+                Some(&interaction.user_id),
+            )
+            .await;
+
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[test]
+    fn slack_approval_resolved_update_body_removes_actions() {
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+        let text = slack_approval_resolved_text("Approval required", "Approved", "U1");
+
+        let body = slack_approval_resolved_update_body(&target, "222.000", &text);
+
+        assert_eq!(body["channel"], "C1");
+        assert_eq!(body["ts"], "222.000");
+        assert_eq!(body["text"], "Approval required\n\nApproved by <@U1>.");
+        assert_eq!(body["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(body["blocks"][0]["type"], "section");
     }
 
     #[test]

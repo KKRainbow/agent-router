@@ -108,6 +108,12 @@ pub struct ApprovalOption {
     pub auto_approvable: bool,
 }
 
+impl ApprovalOption {
+    pub fn is_deny(&self) -> bool {
+        approval_option_is_deny(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalSelection {
     Selected(String),
@@ -245,6 +251,21 @@ impl Default for ApprovalCancellation {
 enum ApprovalDecision {
     Approve,
     Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalResolveAction {
+    Approve { option_id: Option<String> },
+    Deny,
+}
+
+impl ApprovalResolveAction {
+    fn decision(&self) -> ApprovalDecision {
+        match self {
+            Self::Approve { .. } => ApprovalDecision::Approve,
+            Self::Deny => ApprovalDecision::Deny,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -446,9 +467,53 @@ impl ApprovalBroker {
     ) -> Option<ApprovalCommandReply> {
         let command = parse_approval_command(text)?;
         let explicit_target = command.target_id.is_some();
+        let action = match command.decision {
+            ApprovalDecision::Approve => ApprovalResolveAction::Approve {
+                option_id: command.option_id,
+            },
+            ApprovalDecision::Deny => ApprovalResolveAction::Deny,
+        };
+        Some(
+            self.resolve_action_inner(
+                session_key,
+                command.target_id,
+                explicit_target,
+                action,
+                user_id,
+            )
+            .await,
+        )
+    }
+
+    pub async fn resolve_action(
+        &self,
+        session_key: &str,
+        approval_id: &str,
+        action: ApprovalResolveAction,
+        user_id: Option<&str>,
+    ) -> ApprovalCommandReply {
+        self.resolve_action_inner(
+            session_key,
+            Some(approval_id.to_string()),
+            false,
+            action,
+            user_id,
+        )
+        .await
+    }
+
+    async fn resolve_action_inner(
+        &self,
+        session_key: &str,
+        target_id: Option<String>,
+        explicit_target: bool,
+        action: ApprovalResolveAction,
+        user_id: Option<&str>,
+    ) -> ApprovalCommandReply {
+        let decision = action.decision();
         let (pending, target_id, selection) = {
             let mut state = self.state.lock().await;
-            let target_id = match command.target_id {
+            let target_id = match target_id {
                 Some(id) => id,
                 None => state
                     .session_order
@@ -458,18 +523,18 @@ impl ApprovalBroker {
                     .unwrap_or_default(),
             };
             if target_id.is_empty() {
-                return Some(ApprovalCommandReply {
+                return ApprovalCommandReply {
                     text: "No pending approval for this session.".to_string(),
-                });
+                };
             }
             let Some(pending) = state.pending.get(&target_id) else {
-                return Some(ApprovalCommandReply {
+                return ApprovalCommandReply {
                     text: format!("Approval {target_id} is not pending."),
-                });
+                };
             };
 
             if let Some(reply) = validate_resolver_user(&target_id, &pending.request, user_id) {
-                return Some(reply);
+                return reply;
             }
 
             let same_session = pending.request.session_key == session_key;
@@ -482,36 +547,36 @@ impl ApprovalBroker {
                     .resolver_policy
                     .allows_cross_session_resolution();
             if !same_session && !allowed_slack_slash && !allowed_explicit_cross_session {
-                return Some(ApprovalCommandReply {
+                return ApprovalCommandReply {
                     text: format!("Approval {target_id} belongs to a different session."),
-                });
+                };
             }
 
-            let selection = match command.decision {
-                ApprovalDecision::Approve => {
-                    if let Some(option_id) = command.option_id {
+            let selection = match action {
+                ApprovalResolveAction::Approve { option_id } => {
+                    if let Some(option_id) = option_id {
                         if pending.request.options.iter().any(|option| {
                             option.id == option_id && !approval_option_is_deny(option)
                         }) {
                             ApprovalSelection::Selected(option_id)
                         } else {
-                            return Some(ApprovalCommandReply {
+                            return ApprovalCommandReply {
                                 text: format!(
                                     "Approval {target_id} option `{option_id}` is not available."
                                 ),
-                            });
+                            };
                         }
                     } else if let Some(option_id) = pending.request.allow_option_id() {
                         ApprovalSelection::Selected(option_id)
                     } else {
-                        return Some(ApprovalCommandReply {
+                        return ApprovalCommandReply {
                             text: format!(
                                 "Approval {target_id} requires an option. Use `/approve {target_id} <option-id>`."
                             ),
-                        });
+                        };
                     }
                 }
-                ApprovalDecision::Deny => pending
+                ApprovalResolveAction::Deny => pending
                     .request
                     .deny_option_id()
                     .map(ApprovalSelection::Selected)
@@ -530,17 +595,17 @@ impl ApprovalBroker {
             })
             .is_ok();
         if !resolved {
-            return Some(ApprovalCommandReply {
+            return ApprovalCommandReply {
                 text: format!("Approval {target_id} is no longer active."),
-            });
+            };
         }
 
-        Some(ApprovalCommandReply {
-            text: match command.decision {
+        ApprovalCommandReply {
+            text: match decision {
                 ApprovalDecision::Approve => format!("Approved {target_id}."),
                 ApprovalDecision::Deny => format!("Denied {target_id}."),
             },
-        })
+        }
     }
 
     async fn remove_pending(&self, id: &str) {
@@ -881,6 +946,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_is_resolved_by_structured_approval_action() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move { request_broker.request(request("s1")).await });
+
+        let prompt = prompts.recv().await.unwrap();
+        let reply = broker
+            .resolve_action(
+                "s1",
+                &prompt.id,
+                ApprovalResolveAction::Approve {
+                    option_id: Some("allow_once".to_string()),
+                },
+                Some("U1"),
+            )
+            .await;
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn request_is_resolved_by_structured_deny_action() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move { request_broker.request(request("s1")).await });
+
+        let prompt = prompts.recv().await.unwrap();
+        let reply = broker
+            .resolve_action("s1", &prompt.id, ApprovalResolveAction::Deny, Some("U1"))
+            .await;
+
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn multi_option_prompt_renders_explicit_approval_choices() {
         let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
         let mut prompts = broker.subscribe();
@@ -971,6 +1081,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_option_structured_approval_selects_explicit_option() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending =
+            tokio::spawn(async move { request_broker.request(select_request("s1")).await });
+
+        let prompt = prompts.recv().await.unwrap();
+        let reply = broker
+            .resolve_action(
+                "s1",
+                &prompt.id,
+                ApprovalResolveAction::Approve {
+                    option_id: Some("second".to_string()),
+                },
+                Some("U1"),
+            )
+            .await;
+
+        assert!(reply.text.contains("Approved"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("second".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn multi_option_approval_allows_non_reject_option_id_containing_deny() {
         let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
         let mut prompts = broker.subscribe();
@@ -1033,6 +1170,37 @@ mod tests {
             .resolve_command("s1", &format!("/deny {}", prompt.id), Some("U1"))
             .await
             .unwrap();
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_action_rejects_unauthorized_user_and_stays_pending() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move { request_broker.request(request("s1")).await });
+        let prompt = prompts.recv().await.unwrap();
+
+        let reply = broker
+            .resolve_action(
+                "s1",
+                &prompt.id,
+                ApprovalResolveAction::Approve {
+                    option_id: Some("allow_once".to_string()),
+                },
+                Some("U2"),
+            )
+            .await;
+
+        assert!(reply.text.contains("requester"));
+        assert!(broker.has_pending(&prompt.id).await);
+
+        broker
+            .resolve_action("s1", &prompt.id, ApprovalResolveAction::Deny, Some("U1"))
+            .await;
         assert_eq!(
             pending.await.unwrap(),
             ApprovalSelection::Selected("deny".to_string())
@@ -1109,6 +1277,48 @@ mod tests {
             ApprovalSelection::Selected("second".to_string())
         );
         assert_eq!(resolution.resolver_user_id.as_deref(), Some("U_OWNER"));
+    }
+
+    #[tokio::test]
+    async fn structured_action_requires_matching_saved_session() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            let mut request = select_request("slack:channel:C1:123.456");
+            request.resolver_policy = ApprovalResolverPolicy::allowed_user_ids(
+                ["U_OWNER".to_string()].into_iter().collect(),
+            );
+            request_broker.request(request).await
+        });
+        let prompt = prompts.recv().await.unwrap();
+
+        let rejected = broker
+            .resolve_action(
+                "slack:dm:D_OWNER:999.000",
+                &prompt.id,
+                ApprovalResolveAction::Approve {
+                    option_id: Some("second".to_string()),
+                },
+                Some("U_OWNER"),
+            )
+            .await;
+        assert!(rejected.text.contains("different session"));
+        assert!(broker.has_pending(&prompt.id).await);
+
+        let reply = broker
+            .resolve_action(
+                "slack:channel:C1:123.456",
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("U_OWNER"),
+            )
+            .await;
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1326,5 +1536,39 @@ mod tests {
             .unwrap();
 
         assert!(reply.text.contains("no longer active"));
+    }
+
+    #[tokio::test]
+    async fn structured_action_reports_cancelled_approval_as_not_pending() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let cancellation = ApprovalCancellation::new();
+        let request_cancellation = cancellation.clone();
+        let pending = tokio::spawn(async move {
+            request_broker
+                .request_until_cancelled(request("s1"), request_cancellation)
+                .await
+        });
+
+        let prompt = prompts.recv().await.unwrap();
+        cancellation.cancel();
+        assert_eq!(pending.await.unwrap(), None);
+
+        let reply = broker
+            .resolve_action(
+                "s1",
+                &prompt.id,
+                ApprovalResolveAction::Approve {
+                    option_id: Some("allow_once".to_string()),
+                },
+                Some("U1"),
+            )
+            .await;
+
+        assert_eq!(
+            reply.text,
+            format!("Approval {} is not pending.", prompt.id)
+        );
     }
 }
