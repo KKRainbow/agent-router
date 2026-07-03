@@ -10,6 +10,7 @@ use agent_router::{
     session::store::{ConfiguredExecutor, ProductionSessionStore},
 };
 use clap::Parser;
+use time::macros::format_description;
 use tokio::task::JoinSet;
 
 #[derive(Debug, Parser)]
@@ -28,6 +29,9 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "agent_router=info,warn".to_string()),
         )
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::new(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9][offset_hour]:[offset_minute]"
+        )))
         .init();
 
     let cli = Cli::parse();
