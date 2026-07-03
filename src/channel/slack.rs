@@ -907,15 +907,15 @@ impl SlackSocketModeChannel {
         );
 
         let upload_url_body = slack_markdown_snippet_upload_url_body(text);
-        let resp = self
-            .http
-            .post("https://slack.com/api/files.getUploadURLExternal")
-            .bearer_auth(&self.cfg.bot_token)
-            .form(&upload_url_body)
-            .send()
-            .await?
-            .json::<UploadUrlResponse>()
-            .await?;
+        let resp = slack_markdown_snippet_upload_url_request(
+            &self.http,
+            &self.cfg.bot_token,
+            &upload_url_body,
+        )
+        .send()
+        .await?
+        .json::<UploadUrlResponse>()
+        .await?;
         if !resp.ok {
             return Err(SlackApiError::with_messages(
                 "files.getUploadURLExternal",
@@ -1540,6 +1540,16 @@ fn slack_markdown_snippet_upload_url_body(text: &str) -> SlackMarkdownSnippetUpl
         length: text.len(),
         snippet_type: SLACK_MARKDOWN_SNIPPET_TYPE,
     }
+}
+
+fn slack_markdown_snippet_upload_url_request(
+    http: &Client,
+    bot_token: &str,
+    body: &SlackMarkdownSnippetUploadUrlBody,
+) -> reqwest::RequestBuilder {
+    http.post("https://slack.com/api/files.getUploadURLExternal")
+        .bearer_auth(bot_token)
+        .form(body)
 }
 
 fn slack_complete_markdown_snippet_upload_body(target: &SlackReplyTarget, file_id: &str) -> Value {
@@ -2297,18 +2307,22 @@ mod tests {
     #[test]
     fn slack_markdown_snippet_upload_url_request_uses_form_encoding() {
         let body = slack_markdown_snippet_upload_url_body("é");
-        let request = Client::new()
-            .post("https://slack.com/api/files.getUploadURLExternal")
-            .form(&body)
+        let client = Client::new();
+        let request = slack_markdown_snippet_upload_url_request(&client, "xoxb-test-token", &body)
             .build()
             .unwrap();
         let content_type = request
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
+        let authorization = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
         let encoded = request.body().and_then(|body| body.as_bytes()).unwrap();
 
         assert_eq!(content_type, Some("application/x-www-form-urlencoded"));
+        assert_eq!(authorization, Some("Bearer xoxb-test-token"));
         assert_eq!(
             std::str::from_utf8(encoded).unwrap(),
             "filename=agent-router-reply.md&length=2&snippet_type=markdown"
