@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -47,6 +48,7 @@ const SLACK_MARKDOWN_SNIPPET_TYPE: &str = "markdown";
 const SLACK_ACTIONS_BLOCK_MAX_ELEMENTS: usize = 25;
 const SLACK_APPROVAL_APPROVE_ACTION_ID_PREFIX: &str = "agent_router_approval_approve";
 const SLACK_APPROVAL_DENY_ACTION_ID: &str = "agent_router_approval_deny";
+const SLACK_OWNER_APPROVAL_PERMALINK_TIMEOUT: Duration = Duration::from_secs(3);
 
 mod context;
 use self::context::*;
@@ -526,7 +528,8 @@ impl SlackSocketModeChannel {
         }
 
         self.post_owner_approval_waiting_status(&reply_target).await;
-        let request = self.owner_approval_request(&input);
+        let source_link = self.owner_approval_source_link(&route_context).await;
+        let request = self.owner_approval_request(&input, source_link.as_deref());
         let approvals = self.approvals.clone();
         let channel = self.clone();
         tokio::spawn(async move {
@@ -558,8 +561,40 @@ impl SlackSocketModeChannel {
             && !user_id.is_some_and(|user_id| self.cfg.owner_user_ids.contains(user_id))
     }
 
-    fn owner_approval_request(&self, input: &ChannelInput) -> ApprovalRequest {
+    async fn owner_approval_source_link(
+        &self,
+        route_context: &SlackRouteContext,
+    ) -> Option<String> {
+        if self.cfg.bot_token.trim().is_empty() {
+            return None;
+        }
+        let SlackRouteContext::Message { event, .. } = route_context else {
+            return None;
+        };
+        optional_message_permalink(
+            &event.channel,
+            &event.ts,
+            SLACK_OWNER_APPROVAL_PERMALINK_TIMEOUT,
+            self.message_permalink(&event.channel, &event.ts),
+        )
+        .await
+    }
+
+    fn owner_approval_request(
+        &self,
+        input: &ChannelInput,
+        source_link: Option<&str>,
+    ) -> ApprovalRequest {
         let requester = input.user_id.as_deref().unwrap_or("unknown Slack user");
+        let mut body = vec![
+            format!("Session: {}", input.session_key),
+            format!("Requester: {requester}"),
+        ];
+        if let Some(source_link) = source_link {
+            body.push(format!("Link: <{source_link}|Open Slack message>"));
+        }
+        body.push(String::new());
+        body.push(input.text.clone());
         ApprovalRequest {
             session_key: input.session_key.clone(),
             executor: "slack".to_string(),
@@ -569,10 +604,7 @@ impl SlackSocketModeChannel {
             ),
             scope: ApprovalScope::ChannelInput,
             title: format!("Slack input from {requester}"),
-            body: format!(
-                "Session: {}\nRequester: {}\n\n{}",
-                input.session_key, requester, input.text
-            ),
+            body: body.join("\n"),
             options: vec![
                 crate::approval::ApprovalOption {
                     id: "allow_once".to_string(),
@@ -698,6 +730,34 @@ impl SlackSocketModeChannel {
         }
         resp.user_id
             .ok_or_else(|| anyhow::anyhow!("Slack auth.test response omitted user_id"))
+    }
+
+    async fn message_permalink(&self, channel: &str, message_ts: &str) -> anyhow::Result<String> {
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            permalink: Option<String>,
+            error: Option<String>,
+        }
+
+        let resp = self
+            .http
+            .get("https://slack.com/api/chat.getPermalink")
+            .bearer_auth(&self.cfg.bot_token)
+            .query(&[("channel", channel), ("message_ts", message_ts)])
+            .send()
+            .await?
+            .json::<Response>()
+            .await?;
+        if !resp.ok {
+            return Err(SlackApiError::new(
+                "chat.getPermalink",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        resp.permalink
+            .ok_or_else(|| anyhow::anyhow!("Slack chat.getPermalink response omitted permalink"))
     }
 
     async fn open_direct_message(&self, user_id: &str) -> anyhow::Result<String> {
@@ -1207,6 +1267,35 @@ fn slack_output_policy(activity_mode: ChannelEventMode) -> ChannelOutputPolicy {
 fn should_log_unmentioned_approval_route(input: &ChannelInput) -> bool {
     input.intent == ChannelInputIntent::RouteIfPendingApprovalElseObserve
         && is_approval_command(&input.text)
+}
+
+async fn optional_message_permalink(
+    channel: &str,
+    message_ts: &str,
+    timeout_duration: Duration,
+    lookup: impl Future<Output = anyhow::Result<String>>,
+) -> Option<String> {
+    match tokio::time::timeout(timeout_duration, lookup).await {
+        Ok(Ok(permalink)) => Some(permalink),
+        Ok(Err(err)) => {
+            tracing::warn!(
+                channel,
+                message_ts,
+                error = %err,
+                "failed to fetch Slack message permalink for owner approval"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                channel,
+                message_ts,
+                timeout_ms = timeout_duration.as_millis(),
+                "timed out fetching Slack message permalink for owner approval"
+            );
+            None
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2032,6 +2121,79 @@ mod tests {
         let mut cfg = test_slack_config(require_mention);
         cfg.owner_user_ids.insert("U_OWNER".to_string());
         cfg
+    }
+
+    #[tokio::test]
+    async fn optional_message_permalink_returns_none_on_lookup_error() {
+        let permalink =
+            optional_message_permalink("C1", "111.000", Duration::from_secs(1), async {
+                Err(anyhow::anyhow!("lookup failed"))
+            })
+            .await;
+
+        assert_eq!(permalink, None);
+    }
+
+    #[tokio::test]
+    async fn optional_message_permalink_returns_none_on_timeout() {
+        let permalink = optional_message_permalink(
+            "C1",
+            "111.000",
+            Duration::from_millis(1),
+            std::future::pending::<anyhow::Result<String>>(),
+        )
+        .await;
+
+        assert_eq!(permalink, None);
+    }
+
+    #[tokio::test]
+    async fn owner_approval_prompt_includes_source_message_link() {
+        let channel = SlackSocketModeChannel::new(
+            owner_gated_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        );
+        let input = channel_input(
+            "how did you reach this conclusion",
+            ChannelInputIntent::Route,
+        );
+        let permalink = "https://smartx1.slack.com/archives/C1/p111000000";
+        let request = channel.owner_approval_request(&input, Some(permalink));
+
+        assert!(
+            request
+                .body
+                .contains(&format!("Link: <{permalink}|Open Slack message>"))
+        );
+
+        let (broker, prompt, pending) = prompt_for_request(request).await;
+        let target = SlackReplyTarget {
+            channel: "D_OWNER".to_string(),
+            thread_ts: None,
+        };
+        let text = prompt.render_text();
+        let body = slack_approval_message_body(&target, &prompt, &text).unwrap();
+
+        assert!(text.contains(&format!("Link: <{permalink}|Open Slack message>")));
+        assert!(
+            body["blocks"][0]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("Link: <{permalink}|Open Slack message>"))
+        );
+
+        broker
+            .resolve_action(
+                &prompt.session_key,
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("U_OWNER"),
+            )
+            .await;
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
     }
 
     fn dm_message(user: &str, text: &str) -> SlackMessageEvent {
