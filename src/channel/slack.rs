@@ -406,14 +406,6 @@ impl SlackSocketModeChannel {
                 text_len = text.len(),
                 "routing Slack message"
             );
-        } else if event.is_thread_reply() {
-            tracing::info!(
-                channel = %event.channel,
-                user_id = %event.user,
-                session_key = %session_key,
-                text_len = text.len(),
-                "routing Slack approval command from unmentioned thread"
-            );
         }
         let reply_target = event.reply_target();
         let route_context = SlackRouteContext::Message {
@@ -433,6 +425,8 @@ impl SlackSocketModeChannel {
         route_context: SlackRouteContext,
     ) -> anyhow::Result<()> {
         let session_key = input.session_key.clone();
+        let log_unmentioned_approval_route = should_log_unmentioned_approval_route(&input);
+        let text_len = input.text.len();
         let outcome = router.begin_channel_input(input).await?;
         let ChannelIntakeOutcome::Route {
             ticket,
@@ -441,6 +435,17 @@ impl SlackSocketModeChannel {
         else {
             return Ok(());
         };
+        if log_unmentioned_approval_route {
+            if let SlackRouteContext::Message { event, .. } = &route_context {
+                tracing::info!(
+                    channel = %event.channel,
+                    user_id = %event.user,
+                    session_key = %session_key,
+                    text_len,
+                    "routing Slack approval command from unmentioned thread"
+                );
+            }
+        }
         let context_cache_token = if context_allowed {
             if let Some(cache_sequence) = ticket.context_sequence() {
                 self.remember_context_cache_sequence(&session_key, cache_sequence)
@@ -1193,6 +1198,11 @@ fn slack_output_policy(activity_mode: ChannelEventMode) -> ChannelOutputPolicy {
     policy.draft_truncated_prefix = SLACK_REPLY_DRAFT_TRUNCATED_PREFIX;
     policy.draft_marker = SLACK_REPLY_DRAFT_MARKER;
     policy
+}
+
+fn should_log_unmentioned_approval_route(input: &ChannelInput) -> bool {
+    input.intent == ChannelInputIntent::RouteIfPendingApprovalElseObserve
+        && is_approval_command(&input.text)
 }
 
 #[async_trait::async_trait]
@@ -1962,6 +1972,33 @@ mod tests {
             allowed_channels: Default::default(),
             free_response_channels: Default::default(),
         }
+    }
+
+    fn channel_input(text: impl Into<String>, intent: ChannelInputIntent) -> ChannelInput {
+        ChannelInput {
+            session_key: "slack:channel:C1:111.000".to_string(),
+            text: text.into(),
+            user_id: Some("U1".to_string()),
+            source: "slack".to_string(),
+            intent,
+            context_policy: ChannelContextPolicy::disabled("slack"),
+        }
+    }
+
+    #[test]
+    fn should_log_unmentioned_approval_route_only_labels_approval_commands() {
+        assert!(should_log_unmentioned_approval_route(&channel_input(
+            "/approve 1",
+            ChannelInputIntent::RouteIfPendingApprovalElseObserve,
+        )));
+        assert!(!should_log_unmentioned_approval_route(&channel_input(
+            "middle context",
+            ChannelInputIntent::RouteIfPendingApprovalElseObserve,
+        )));
+        assert!(!should_log_unmentioned_approval_route(&channel_input(
+            "/approve 1",
+            ChannelInputIntent::Route,
+        )));
     }
 
     fn owner_gated_slack_config(require_mention: bool) -> SlackConfig {
