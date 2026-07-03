@@ -56,6 +56,7 @@ pub struct SlackConfig {
     pub bot_token: String,
     pub app_token: String,
     pub require_mention: bool,
+    pub owner_user_ids: BTreeSet<String>,
     pub channel_events: ChannelEventMode,
     pub context_sync: SlackContextSyncConfig,
     pub allowed_channels: BTreeSet<String>,
@@ -194,6 +195,7 @@ struct FileSlackConfig {
     bot_token: Option<String>,
     app_token: Option<String>,
     require_mention: Option<bool>,
+    owner_user_ids: Option<StringList>,
     channel_events: Option<String>,
     context_sync: Option<FileSlackContextSyncConfig>,
     allowed_channels: Option<StringList>,
@@ -323,6 +325,10 @@ impl AppConfig {
                 .slack_require_mention
                 .or(slack_file.require_mention)
                 .unwrap_or(true),
+            owner_user_ids: env_cfg
+                .slack_owner_user_ids
+                .or_else(|| slack_file.owner_user_ids.map(StringList::into_set))
+                .unwrap_or_default(),
             channel_events: env_cfg
                 .slack_channel_events
                 .or(slack_file.channel_events)
@@ -499,6 +505,7 @@ struct EnvConfig {
     slack_bot_token: Option<String>,
     slack_app_token: Option<String>,
     slack_require_mention: Option<bool>,
+    slack_owner_user_ids: Option<BTreeSet<String>>,
     slack_channel_events: Option<String>,
     slack_context_sync_enabled: Option<bool>,
     slack_context_sync_max_file_bytes: Option<usize>,
@@ -529,6 +536,7 @@ impl EnvConfig {
             slack_bot_token: nonempty_env("SLACK_BOT_TOKEN"),
             slack_app_token: nonempty_env("SLACK_APP_TOKEN"),
             slack_require_mention: env_bool("SLACK_REQUIRE_MENTION"),
+            slack_owner_user_ids: env_set("SLACK_OWNER_USER_IDS"),
             slack_channel_events: nonempty_env("SLACK_CHANNEL_EVENTS"),
             slack_context_sync_enabled: env_bool("SLACK_CONTEXT_SYNC_ENABLED"),
             slack_context_sync_max_file_bytes: env_usize("SLACK_CONTEXT_SYNC_MAX_FILE_BYTES"),
@@ -823,6 +831,7 @@ mod tests {
         assert_eq!(cfg.machines[LOCAL_MACHINE_ID].kind, MachineKind::Local);
         assert_eq!(cfg.approval.default_mode, ApprovalMode::Normal);
         assert!(!cfg.slack.enabled);
+        assert!(cfg.slack.owner_user_ids.is_empty());
         assert!(!cfg.qq.enabled);
         assert_eq!(cfg.slack.channel_events, ChannelEventMode::Compact);
         assert!(!cfg.slack.context_sync.enabled);
@@ -848,6 +857,7 @@ router:
   default_executor: kimi
 slack:
   require_mention: false
+  owner_user_ids: ["U1", "U2,U3"]
   channel_events: verbose
   context_sync:
     enabled: false
@@ -870,6 +880,10 @@ executors:
         let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
 
         assert!(!cfg.slack.require_mention);
+        assert_eq!(
+            cfg.slack.owner_user_ids,
+            ["U1", "U2", "U3"].into_iter().map(str::to_string).collect()
+        );
         assert_eq!(cfg.slack.channel_events, ChannelEventMode::Verbose);
         assert!(!cfg.slack.context_sync.enabled);
         assert!(cfg.slack.context_sync.current_thread);
@@ -886,6 +900,36 @@ executors:
         assert_eq!(
             cfg.slack.free_response_channels,
             ["C3", "C4", "C5"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn env_slack_owner_user_ids_override_file_config() {
+        let raw = r#"
+slack:
+  owner_user_ids: ["U_FILE"]
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(
+            file_cfg,
+            EnvConfig {
+                slack_owner_user_ids: Some(
+                    ["U_ENV1", "U_ENV2"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                ),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.slack.owner_user_ids,
+            ["U_ENV1", "U_ENV2"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
         );
     }
 

@@ -20,7 +20,10 @@ const SLACK_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
 const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 use crate::{
-    approval::SharedApprovalBroker,
+    approval::{
+        ApprovalPrompt, ApprovalRequest, ApprovalResolverPolicy, ApprovalScope, ApprovalSelection,
+        SharedApprovalBroker, is_approval_command,
+    },
     channel::{
         EventDeduper,
         context::{ChannelContextResolveRequest, ChannelContextResolver},
@@ -52,6 +55,15 @@ pub struct SlackSocketModeChannel {
     http: Client,
     seen_events: Arc<Mutex<EventDeduper>>,
     context_cache: Arc<Mutex<SlackContextCache>>,
+}
+
+#[derive(Debug, Clone)]
+enum SlackRouteContext {
+    Message {
+        event: SlackMessageEvent,
+        bot_user_id: String,
+    },
+    None,
 }
 
 impl SlackSocketModeChannel {
@@ -164,7 +176,7 @@ impl SlackSocketModeChannel {
                 tokio::select! {
                     biased;
                     _ = prompt.cancelled() => continue,
-                    result = prompt_channel.post_message(&target, &text) => {
+                    result = prompt_channel.post_approval_prompt(&prompt, &target, &text) => {
                         if let Err(err) = result {
                             tracing::warn!(error = %err, "failed to post Slack approval prompt");
                         }
@@ -175,6 +187,48 @@ impl SlackSocketModeChannel {
 
         // YOLO auto-approvals are high-frequency bookkeeping. Keep them out of
         // chat and let the tool activity message carry the useful progress.
+    }
+
+    async fn post_approval_prompt(
+        &self,
+        prompt: &ApprovalPrompt,
+        fallback_target: &SlackReplyTarget,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if prompt.scope != ApprovalScope::ChannelInput {
+            return self.post_message(fallback_target, text).await;
+        }
+
+        let Some(owner_user_ids) = prompt.resolver_policy.explicit_allowed_user_ids() else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        for owner_user_id in owner_user_ids {
+            let result = async {
+                let dm_channel = self.open_direct_message(owner_user_id).await?;
+                self.post_message(
+                    &SlackReplyTarget {
+                        channel: dm_channel,
+                        thread_ts: None,
+                    },
+                    text,
+                )
+                .await
+            }
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(
+                    owner_user_id,
+                    error = %err,
+                    "failed to post Slack owner approval prompt"
+                );
+                first_error.get_or_insert_with(|| err.to_string());
+            }
+        }
+        if let Some(err) = first_error {
+            anyhow::bail!("failed to post at least one Slack owner approval prompt: {err}");
+        }
+        Ok(())
     }
 
     async fn handle_envelope(
@@ -206,7 +260,9 @@ impl SlackSocketModeChannel {
         router: Arc<dyn RouterService>,
         bot_user_id: &str,
     ) -> anyhow::Result<()> {
-        if !self.should_accept_channel(&event.channel) {
+        let accepts_owner_approval_dm =
+            self.is_owner_approval_dm_command(&event.channel, &event.user, &event.text);
+        if !self.should_accept_channel(&event.channel) && !accepts_owner_approval_dm {
             return Ok(());
         }
         if !self
@@ -242,25 +298,16 @@ impl SlackSocketModeChannel {
         } else {
             ChannelInputIntent::Ignore
         };
-        let outcome = router
-            .begin_channel_input(ChannelInput {
-                session_key: session_key.clone(),
-                text: text.clone(),
-                user_id: Some(event.user.clone()),
+        let input = ChannelInput {
+            session_key: session_key.clone(),
+            text: text.clone(),
+            user_id: Some(event.user.clone()),
+            source: "slack".to_string(),
+            intent,
+            context_policy: ChannelContextPolicy {
                 source: "slack".to_string(),
-                intent,
-                context_policy: ChannelContextPolicy {
-                    source: "slack".to_string(),
-                    enabled: self.should_sync_context(),
-                },
-            })
-            .await?;
-        let ChannelIntakeOutcome::Route {
-            ticket,
-            context_allowed,
-        } = outcome
-        else {
-            return Ok(());
+                enabled: self.should_sync_context(),
+            },
         };
         if should_route {
             tracing::info!(
@@ -279,6 +326,32 @@ impl SlackSocketModeChannel {
                 "routing Slack approval command from unmentioned thread"
             );
         }
+        let reply_target = event.reply_target();
+        let route_context = SlackRouteContext::Message {
+            event,
+            bot_user_id: bot_user_id.to_string(),
+        };
+        let gateable = should_route && !is_approval_command(&text);
+        self.route_or_request_owner_approval(input, reply_target, router, route_context, gateable)
+            .await
+    }
+
+    async fn route_slack_input(
+        &self,
+        input: ChannelInput,
+        reply_target: SlackReplyTarget,
+        router: Arc<dyn RouterService>,
+        route_context: SlackRouteContext,
+    ) -> anyhow::Result<()> {
+        let session_key = input.session_key.clone();
+        let outcome = router.begin_channel_input(input).await?;
+        let ChannelIntakeOutcome::Route {
+            ticket,
+            context_allowed,
+        } = outcome
+        else {
+            return Ok(());
+        };
         let context_cache_token = if context_allowed {
             if let Some(cache_sequence) = ticket.context_sequence() {
                 self.remember_context_cache_sequence(&session_key, cache_sequence)
@@ -297,18 +370,19 @@ impl SlackSocketModeChannel {
         } else {
             None
         };
-        let context = if context_cache_token.is_some() {
-            let existing_context = router.context_artifacts(&session_key, "slack").await?;
-            Some(
-                SlackContextResolver::new(self, &event, bot_user_id, context_cache_token.as_ref())
-                    .resolve(ChannelContextResolveRequest {
-                        session_key: session_key.clone(),
-                        existing_artifacts: existing_context,
-                    })
-                    .await?,
-            )
-        } else {
-            None
+        let context = match (&route_context, context_cache_token.as_ref()) {
+            (SlackRouteContext::Message { event, bot_user_id }, Some(context_cache_token)) => {
+                let existing_context = router.context_artifacts(&session_key, "slack").await?;
+                Some(
+                    SlackContextResolver::new(self, event, bot_user_id, Some(context_cache_token))
+                        .resolve(ChannelContextResolveRequest {
+                            session_key: session_key.clone(),
+                            existing_artifacts: existing_context,
+                        })
+                        .await?,
+                )
+            }
+            _ => None,
         };
         let succeeded_file_sync_keys = context
             .as_ref()
@@ -318,7 +392,6 @@ impl SlackSocketModeChannel {
             .as_ref()
             .map(|context| context.failed_cache_keys.clone())
             .unwrap_or_default();
-        let reply_target = event.reply_target();
         let mut output = ChannelOutputSink::new(
             SlackReplyPort {
                 channel: self.clone(),
@@ -344,15 +417,111 @@ impl SlackSocketModeChannel {
         Ok(())
     }
 
+    async fn route_or_request_owner_approval(
+        &self,
+        input: ChannelInput,
+        reply_target: SlackReplyTarget,
+        router: Arc<dyn RouterService>,
+        route_context: SlackRouteContext,
+        gateable: bool,
+    ) -> anyhow::Result<()> {
+        if !gateable || !self.requires_owner_approval(input.user_id.as_deref()) {
+            return self
+                .route_slack_input(input, reply_target, router, route_context)
+                .await;
+        }
+
+        self.post_owner_approval_waiting_status(&reply_target).await;
+        let request = self.owner_approval_request(&input);
+        let approvals = self.approvals.clone();
+        let channel = self.clone();
+        tokio::spawn(async move {
+            let resolution = approvals.request_resolution(request).await;
+            let ApprovalSelection::Selected(option_id) = resolution.selection else {
+                return;
+            };
+            if option_id != "allow_once" {
+                return;
+            }
+            let Some(owner_user_id) = resolution.resolver_user_id else {
+                tracing::warn!("Slack owner approval resolved without resolver identity");
+                return;
+            };
+            let mut approved_input = input;
+            approved_input.user_id = Some(owner_user_id);
+            if let Err(err) = channel
+                .route_slack_input(approved_input, reply_target, router, route_context)
+                .await
+            {
+                tracing::warn!(error = %err, "failed to route approved Slack input");
+            }
+        });
+        Ok(())
+    }
+
+    fn requires_owner_approval(&self, user_id: Option<&str>) -> bool {
+        !self.cfg.owner_user_ids.is_empty()
+            && !user_id.is_some_and(|user_id| self.cfg.owner_user_ids.contains(user_id))
+    }
+
+    fn owner_approval_request(&self, input: &ChannelInput) -> ApprovalRequest {
+        let requester = input.user_id.as_deref().unwrap_or("unknown Slack user");
+        ApprovalRequest {
+            session_key: input.session_key.clone(),
+            executor: "slack".to_string(),
+            requester_user_id: input.user_id.clone(),
+            resolver_policy: ApprovalResolverPolicy::allowed_user_ids(
+                self.cfg.owner_user_ids.clone(),
+            ),
+            scope: ApprovalScope::ChannelInput,
+            title: format!("Slack input from {requester}"),
+            body: format!(
+                "Session: {}\nRequester: {}\n\n{}",
+                input.session_key, requester, input.text
+            ),
+            options: vec![
+                crate::approval::ApprovalOption {
+                    id: "allow_once".to_string(),
+                    kind: "allow_once".to_string(),
+                    name: "Approve".to_string(),
+                    auto_approvable: false,
+                },
+                crate::approval::ApprovalOption {
+                    id: "deny".to_string(),
+                    kind: "reject_once".to_string(),
+                    name: "Deny".to_string(),
+                    auto_approvable: false,
+                },
+            ],
+        }
+    }
+
+    async fn post_owner_approval_waiting_status(&self, target: &SlackReplyTarget) {
+        if self.cfg.bot_token.is_empty() {
+            return;
+        }
+        if let Err(err) = self
+            .post_message(
+                target,
+                "Waiting for owner approval before routing this request.",
+            )
+            .await
+        {
+            tracing::warn!(error = %err, "failed to post Slack owner approval waiting status");
+        }
+    }
+
     async fn handle_slash_command(
         &self,
         command: SlackSlashCommand,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
-        if !self.should_accept_channel(&command.channel_id) {
+        let text = normalize_slack_slash_command_text(&command);
+        let accepts_owner_approval_dm =
+            self.is_owner_approval_dm_command(&command.channel_id, &command.user_id, &text);
+        if !self.should_accept_channel(&command.channel_id) && !accepts_owner_approval_dm {
             return Ok(());
         }
-        let text = normalize_slack_slash_command_text(&command);
         let reply_target = SlackReplyTarget {
             channel: command.channel_id.clone(),
             thread_ts: None,
@@ -365,30 +534,22 @@ impl SlackSocketModeChannel {
             text_len = text.len(),
             "routing Slack slash command"
         );
-        let mut output = ChannelOutputSink::new(
-            SlackReplyPort {
-                channel: self.clone(),
-            },
-            reply_target,
-            slack_output_policy(self.cfg.channel_events),
-        );
-        let outcome = router
-            .begin_channel_input(ChannelInput {
+        let gateable = !is_approval_command(&text);
+        self.route_or_request_owner_approval(
+            ChannelInput {
                 session_key,
                 text,
                 user_id: Some(command.user_id),
                 source: "slack".to_string(),
                 intent: ChannelInputIntent::Route,
                 context_policy: ChannelContextPolicy::disabled("slack"),
-            })
-            .await?;
-        let ChannelIntakeOutcome::Route { ticket, .. } = outcome else {
-            return Ok(());
-        };
-        router
-            .finish_channel_input(ticket, None, &mut output)
-            .await?;
-        Ok(())
+            },
+            reply_target,
+            router,
+            SlackRouteContext::None,
+            gateable,
+        )
+        .await
     }
 
     async fn open_socket_url(&self) -> anyhow::Result<String> {
@@ -443,6 +604,40 @@ impl SlackSocketModeChannel {
         }
         resp.user_id
             .ok_or_else(|| anyhow::anyhow!("Slack auth.test response omitted user_id"))
+    }
+
+    async fn open_direct_message(&self, user_id: &str) -> anyhow::Result<String> {
+        #[derive(Deserialize)]
+        struct Conversation {
+            id: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            channel: Option<Conversation>,
+            error: Option<String>,
+        }
+
+        let resp = self
+            .http
+            .post("https://slack.com/api/conversations.open")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&json!({ "users": user_id }))
+            .send()
+            .await?
+            .json::<Response>()
+            .await?;
+        if !resp.ok {
+            return Err(SlackApiError::new(
+                "conversations.open",
+                resp.error.unwrap_or_else(|| "unknown_error".to_string()),
+            )
+            .into());
+        }
+        resp.channel
+            .and_then(|channel| channel.id)
+            .ok_or_else(|| anyhow::anyhow!("Slack conversations.open response omitted channel id"))
     }
 
     async fn post_message(&self, target: &SlackReplyTarget, text: &str) -> anyhow::Result<()> {
@@ -808,6 +1003,12 @@ impl SlackSocketModeChannel {
 
     fn should_accept_channel(&self, channel: &str) -> bool {
         self.cfg.allowed_channels.is_empty() || self.cfg.allowed_channels.contains(channel)
+    }
+
+    fn is_owner_approval_dm_command(&self, channel: &str, user_id: &str, text: &str) -> bool {
+        channel.starts_with('D')
+            && self.cfg.owner_user_ids.contains(user_id)
+            && is_approval_command(text)
     }
 
     fn should_accept_linked_thread_channel(
@@ -1385,6 +1586,7 @@ mod tests {
             app_token: String::new(),
             require_mention,
             channel_events: ChannelEventMode::Compact,
+            owner_user_ids: Default::default(),
             context_sync: crate::config::SlackContextSyncConfig {
                 enabled: true,
                 current_thread: true,
@@ -1398,6 +1600,46 @@ mod tests {
             allowed_channels: Default::default(),
             free_response_channels: Default::default(),
         }
+    }
+
+    fn owner_gated_slack_config(require_mention: bool) -> SlackConfig {
+        let mut cfg = test_slack_config(require_mention);
+        cfg.owner_user_ids.insert("U_OWNER".to_string());
+        cfg
+    }
+
+    fn dm_message(user: &str, text: &str) -> SlackMessageEvent {
+        SlackMessageEvent {
+            event_key: format!("Ev-{user}-{text}"),
+            channel: "D1".to_string(),
+            user: user.to_string(),
+            text: text.to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+            files: Vec::new(),
+        }
+    }
+
+    fn channel_message(user: &str, text: &str) -> SlackMessageEvent {
+        SlackMessageEvent {
+            event_key: format!("Ev-{user}-{text}"),
+            channel: "C1".to_string(),
+            user: user.to_string(),
+            text: text.to_string(),
+            ts: "111.000".to_string(),
+            thread_ts: None,
+            files: Vec::new(),
+        }
+    }
+
+    async fn wait_for_finished(router: &IntakeOnlyRouter, expected: usize) {
+        for _ in 0..50 {
+            if *router.finished.lock().await >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*router.finished.lock().await, expected);
     }
 
     #[test]
@@ -1733,6 +1975,8 @@ mod tests {
             session_key: session_key.to_string(),
             executor: "kimi".to_string(),
             requester_user_id: Some("U1".to_string()),
+            resolver_policy: Default::default(),
+            scope: Default::default(),
             title: "Run command".to_string(),
             body: "$ cargo test".to_string(),
             options: vec![
@@ -3271,6 +3515,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_owner_message_routes_immediately_with_owner_gate_enabled() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let channel = SlackSocketModeChannel::new(owner_gated_slack_config(true), approvals);
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(dm_message("U_OWNER", "hello"), router_service, "BOT")
+            .await
+            .unwrap();
+
+        let began = router.began.lock().await;
+        assert_eq!(began.len(), 1);
+        assert_eq!(began[0].user_id.as_deref(), Some("U_OWNER"));
+        drop(began);
+        assert_eq!(*router.finished.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn slack_owner_approval_dm_bypasses_allowed_channel_filter() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut cfg = owner_gated_slack_config(true);
+        cfg.allowed_channels.insert("C_ALLOWED".to_string());
+        let channel = SlackSocketModeChannel::new(cfg, approvals);
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(
+                dm_message("U_GUEST", "/approve 1"),
+                router_service.clone(),
+                "BOT",
+            )
+            .await
+            .unwrap();
+        assert!(router.began.lock().await.is_empty());
+
+        channel
+            .handle_message_event(dm_message("U_OWNER", "/approve 1"), router_service, "BOT")
+            .await
+            .unwrap();
+
+        let began = router.began.lock().await;
+        assert_eq!(began.len(), 1);
+        assert_eq!(began[0].session_key, "slack:dm:D1:111.000");
+        assert_eq!(began[0].text, "/approve 1");
+        assert_eq!(began[0].user_id.as_deref(), Some("U_OWNER"));
+    }
+
+    #[tokio::test]
+    async fn slack_non_owner_dm_waits_for_owner_approval() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let channel =
+            SlackSocketModeChannel::new(owner_gated_slack_config(true), approvals.clone());
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(dm_message("U_GUEST", "hello"), router_service, "BOT")
+            .await
+            .unwrap();
+
+        assert!(router.began.lock().await.is_empty());
+        let prompt = prompts.recv().await.unwrap();
+        assert_eq!(prompt.scope, ApprovalScope::ChannelInput);
+        assert_eq!(prompt.requester_user_id.as_deref(), Some("U_GUEST"));
+
+        let rejected = approvals
+            .resolve_command(
+                "slack:dm:D1:111.000",
+                &format!("/approve {}", prompt.id),
+                Some("U_GUEST"),
+            )
+            .await
+            .unwrap();
+        assert!(rejected.text.contains("allowed user"));
+        assert!(router.began.lock().await.is_empty());
+
+        let approved = approvals
+            .resolve_command(
+                "slack:dm:D_OWNER:999.000",
+                &format!("/approve {}", prompt.id),
+                Some("U_OWNER"),
+            )
+            .await
+            .unwrap();
+        assert!(approved.text.contains("Approved"));
+        wait_for_finished(&router, 1).await;
+
+        let began = router.began.lock().await;
+        assert_eq!(began.len(), 1);
+        assert_eq!(began[0].text, "hello");
+        assert_eq!(began[0].user_id.as_deref(), Some("U_OWNER"));
+    }
+
+    #[tokio::test]
+    async fn slack_owner_denial_does_not_route_non_owner_input() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let channel =
+            SlackSocketModeChannel::new(owner_gated_slack_config(true), approvals.clone());
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(dm_message("U_GUEST", "hello"), router_service, "BOT")
+            .await
+            .unwrap();
+
+        let prompt = prompts.recv().await.unwrap();
+        let denied = approvals
+            .resolve_command(
+                "slack:dm:D_OWNER:999.000",
+                &format!("/deny {}", prompt.id),
+                Some("U_OWNER"),
+            )
+            .await
+            .unwrap();
+        assert!(denied.text.contains("Denied"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(router.began.lock().await.is_empty());
+        assert_eq!(*router.finished.lock().await, 0);
+    }
+
+    #[tokio::test]
+    async fn slack_non_owner_mention_waits_for_owner_approval() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let channel =
+            SlackSocketModeChannel::new(owner_gated_slack_config(true), approvals.clone());
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(
+                channel_message("U_GUEST", "<@BOT> hello from channel"),
+                router_service,
+                "BOT",
+            )
+            .await
+            .unwrap();
+
+        assert!(router.began.lock().await.is_empty());
+        let prompt = prompts.recv().await.unwrap();
+        assert_eq!(prompt.scope, ApprovalScope::ChannelInput);
+        approvals
+            .resolve_command(
+                "slack:dm:D_OWNER:999.000",
+                &format!("/deny {}", prompt.id),
+                Some("U_OWNER"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn slack_non_owner_free_response_waits_for_owner_approval() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let mut cfg = owner_gated_slack_config(true);
+        cfg.free_response_channels.insert("C1".to_string());
+        let channel = SlackSocketModeChannel::new(cfg, approvals.clone());
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_message_event(
+                channel_message("U_GUEST", "free response"),
+                router_service,
+                "BOT",
+            )
+            .await
+            .unwrap();
+
+        assert!(router.began.lock().await.is_empty());
+        let prompt = prompts.recv().await.unwrap();
+        assert_eq!(prompt.scope, ApprovalScope::ChannelInput);
+        approvals
+            .resolve_command(
+                "slack:dm:D_OWNER:999.000",
+                &format!("/deny {}", prompt.id),
+                Some("U_OWNER"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn slack_app_entry_slash_command_routes_payload_text() {
         let channel = SlackSocketModeChannel::new(
             test_slack_config(true),
@@ -3325,6 +3758,76 @@ mod tests {
         assert_eq!(handled.len(), 1);
         assert_eq!(handled[0].session_key, "slack:C1:slash:U1");
         assert_eq!(handled[0].text, "/agent status");
+    }
+
+    #[tokio::test]
+    async fn slack_non_owner_slash_command_waits_for_owner_approval() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = approvals.subscribe();
+        let channel =
+            SlackSocketModeChannel::new(owner_gated_slack_config(true), approvals.clone());
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_slash_command(
+                SlackSlashCommand {
+                    command: "/hermes".to_string(),
+                    text: "//status --json".to_string(),
+                    channel_id: "C1".to_string(),
+                    user_id: "U_GUEST".to_string(),
+                },
+                router_service,
+            )
+            .await
+            .unwrap();
+
+        assert!(router.began.lock().await.is_empty());
+        let prompt = prompts.recv().await.unwrap();
+        assert_eq!(prompt.scope, ApprovalScope::ChannelInput);
+        assert_eq!(prompt.requester_user_id.as_deref(), Some("U_GUEST"));
+        approvals
+            .resolve_command(
+                "slack:dm:D_OWNER:999.000",
+                &format!("/approve {}", prompt.id),
+                Some("U_OWNER"),
+            )
+            .await
+            .unwrap();
+        wait_for_finished(&router, 1).await;
+        let began = router.began.lock().await;
+        assert_eq!(began[0].session_key, "slack:C1:slash:U_GUEST");
+        assert_eq!(began[0].text, "//status --json");
+        assert_eq!(began[0].user_id.as_deref(), Some("U_OWNER"));
+    }
+
+    #[tokio::test]
+    async fn slack_owner_approval_slash_bypasses_allowed_channel_filter() {
+        let approvals = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut cfg = owner_gated_slack_config(true);
+        cfg.allowed_channels.insert("C_ALLOWED".to_string());
+        let channel = SlackSocketModeChannel::new(cfg, approvals);
+        let router = Arc::new(IntakeOnlyRouter::default());
+        let router_service: Arc<dyn RouterService> = router.clone();
+
+        channel
+            .handle_slash_command(
+                SlackSlashCommand {
+                    command: "/approve".to_string(),
+                    text: "1".to_string(),
+                    channel_id: "D1".to_string(),
+                    user_id: "U_OWNER".to_string(),
+                },
+                router_service,
+            )
+            .await
+            .unwrap();
+
+        let began = router.began.lock().await;
+        assert_eq!(began.len(), 1);
+        assert_eq!(began[0].session_key, "slack:D1:slash:U_OWNER");
+        assert_eq!(began[0].text, "/approve 1");
+        assert_eq!(began[0].user_id.as_deref(), Some("U_OWNER"));
     }
 
     #[tokio::test]

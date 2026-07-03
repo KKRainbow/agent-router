@@ -96,6 +96,8 @@ Slack:
 ```bash
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
+# Optional: gate non-owner Slack requests behind owner approval.
+SLACK_OWNER_USER_IDS=U123,U456
 ```
 
 Slack app setup:
@@ -111,6 +113,7 @@ In OAuth & Permissions, add these Bot Token Scopes:
 
 ```text
 chat:write
+im:write
 app_mentions:read
 channels:history
 groups:history

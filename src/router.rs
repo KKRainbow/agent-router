@@ -6298,6 +6298,8 @@ mod tests {
                 session_key: "slack:dm:D1:111.000".to_string(),
                 executor: "route-planner".to_string(),
                 requester_user_id: Some("U1".to_string()),
+                resolver_policy: Default::default(),
+                scope: Default::default(),
                 title: "Run command".to_string(),
                 body: "$ rm -rf repo".to_string(),
                 options: vec![ApprovalOption {
@@ -6348,6 +6350,8 @@ mod tests {
                 session_key: "slack:dm:D1:111.000".to_string(),
                 executor: "kimi".to_string(),
                 requester_user_id: Some("U1".to_string()),
+                resolver_policy: Default::default(),
+                scope: Default::default(),
                 title: "Run command".to_string(),
                 body: "$ cargo test".to_string(),
                 options: vec![ApprovalOption {
@@ -7068,6 +7072,8 @@ mod tests {
                 session_key: "slack:dm:D1:111.000".to_string(),
                 executor: "kimi".to_string(),
                 requester_user_id: Some("U1".to_string()),
+                resolver_policy: Default::default(),
+                scope: Default::default(),
                 title: "Run command".to_string(),
                 body: "$ cargo test".to_string(),
                 options: vec![ApprovalOption {
@@ -7100,6 +7106,8 @@ mod tests {
             session_key: "slack:dm:D1:111.000".to_string(),
             executor: "kimi".to_string(),
             requester_user_id: Some("U1".to_string()),
+            resolver_policy: Default::default(),
+            scope: Default::default(),
             title: "Run command".to_string(),
             body: "$ cargo test".to_string(),
             options: vec![
@@ -7141,6 +7149,8 @@ mod tests {
             session_key: "slack:channel:C1:111.000".to_string(),
             executor: "kimi".to_string(),
             requester_user_id: Some("U1".to_string()),
+            resolver_policy: Default::default(),
+            scope: Default::default(),
             title: "Run command".to_string(),
             body: "$ cargo test".to_string(),
             options: vec![ApprovalOption {
@@ -7178,6 +7188,8 @@ mod tests {
                     session_key: "slack:C1:T1".to_string(),
                     executor: "kimi".to_string(),
                     requester_user_id: Some("U1".to_string()),
+                    resolver_policy: Default::default(),
+                    scope: Default::default(),
                     title: "Run command".to_string(),
                     body: "$ cargo test".to_string(),
                     options: vec![

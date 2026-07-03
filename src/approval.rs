@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     sync::{
         Arc, Mutex as StdMutex,
@@ -19,6 +19,8 @@ pub struct ApprovalRequest {
     pub session_key: String,
     pub executor: String,
     pub requester_user_id: Option<String>,
+    pub resolver_policy: ApprovalResolverPolicy,
+    pub scope: ApprovalScope,
     pub title: String,
     pub body: String,
     pub options: Vec<ApprovalOption>,
@@ -58,6 +60,47 @@ impl ApprovalRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalResolverPolicy {
+    Requester,
+    AllowedUserIds(BTreeSet<String>),
+}
+
+impl ApprovalResolverPolicy {
+    pub fn allowed_user_ids(user_ids: BTreeSet<String>) -> Self {
+        Self::AllowedUserIds(user_ids)
+    }
+
+    pub fn explicit_allowed_user_ids(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::Requester => None,
+            Self::AllowedUserIds(user_ids) => Some(user_ids),
+        }
+    }
+
+    fn allows_cross_session_resolution(&self) -> bool {
+        matches!(self, Self::AllowedUserIds(_))
+    }
+}
+
+impl Default for ApprovalResolverPolicy {
+    fn default() -> Self {
+        Self::Requester
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalScope {
+    ToolPermission,
+    ChannelInput,
+}
+
+impl Default for ApprovalScope {
+    fn default() -> Self {
+        Self::ToolPermission
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalOption {
     pub id: String,
     pub kind: String,
@@ -71,12 +114,20 @@ pub enum ApprovalSelection {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalResolution {
+    pub selection: ApprovalSelection,
+    pub resolver_user_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalPrompt {
     pub id: String,
     pub session_key: String,
     pub executor: String,
     pub requester_user_id: Option<String>,
+    pub resolver_policy: ApprovalResolverPolicy,
+    pub scope: ApprovalScope,
     pub title: String,
     pub body: String,
     pub options: Vec<ApprovalOption>,
@@ -199,7 +250,7 @@ enum ApprovalDecision {
 #[derive(Debug)]
 struct PendingApproval {
     request: ApprovalRequest,
-    responder: oneshot::Sender<ApprovalSelection>,
+    responder: oneshot::Sender<ApprovalResolution>,
 }
 
 #[async_trait]
@@ -295,6 +346,25 @@ impl ApprovalBroker {
         request: ApprovalRequest,
         cancel: ApprovalCancellation,
     ) -> Option<ApprovalSelection> {
+        self.request_resolution_until_cancelled(request, cancel)
+            .await
+            .map(|resolution| resolution.selection)
+    }
+
+    pub async fn request_resolution(&self, request: ApprovalRequest) -> ApprovalResolution {
+        self.request_resolution_until_cancelled(request, ApprovalCancellation::new())
+            .await
+            .unwrap_or(ApprovalResolution {
+                selection: ApprovalSelection::Cancelled,
+                resolver_user_id: None,
+            })
+    }
+
+    pub async fn request_resolution_until_cancelled(
+        &self,
+        request: ApprovalRequest,
+        cancel: ApprovalCancellation,
+    ) -> Option<ApprovalResolution> {
         let auto_selection = tokio::select! {
             biased;
             _ = cancel.cancelled() => return None,
@@ -309,7 +379,10 @@ impl ApprovalBroker {
                     option_id: option_id.clone(),
                 });
             }
-            return Some(selection);
+            return Some(ApprovalResolution {
+                selection,
+                resolver_user_id: None,
+            });
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
@@ -319,6 +392,8 @@ impl ApprovalBroker {
             session_key: request.session_key.clone(),
             executor: request.executor.clone(),
             requester_user_id: request.requester_user_id.clone(),
+            resolver_policy: request.resolver_policy.clone(),
+            scope: request.scope,
             title: request.title.clone(),
             body: request.body.clone(),
             options: request.options.clone(),
@@ -351,8 +426,11 @@ impl ApprovalBroker {
             _ = cancel.cancelled() => None,
             selection = time::timeout(self.timeout, rx) => {
                 Some(match selection {
-                    Ok(Ok(selection)) => selection,
-                    Ok(Err(_)) | Err(_) => ApprovalSelection::Cancelled,
+                    Ok(Ok(resolution)) => resolution,
+                    Ok(Err(_)) | Err(_) => ApprovalResolution {
+                        selection: ApprovalSelection::Cancelled,
+                        resolver_user_id: None,
+                    },
                 })
             }
         };
@@ -390,31 +468,20 @@ impl ApprovalBroker {
                 });
             };
 
-            if let Some(requester) = pending.request.requester_user_id.as_deref() {
-                match user_id {
-                    Some(user_id) if user_id == requester => {}
-                    Some(_) => {
-                        return Some(ApprovalCommandReply {
-                            text: format!(
-                                "Approval {target_id} can only be resolved by the requester."
-                            ),
-                        });
-                    }
-                    None => {
-                        return Some(ApprovalCommandReply {
-                            text: format!(
-                                "Approval {target_id} requires requester identity to resolve."
-                            ),
-                        });
-                    }
-                }
+            if let Some(reply) = validate_resolver_user(&target_id, &pending.request, user_id) {
+                return Some(reply);
             }
 
             let same_session = pending.request.session_key == session_key;
             let allowed_slack_slash = explicit_target
                 && pending.request.requester_user_id.is_some()
                 && slack_slash_session_matches(&pending.request.session_key, session_key);
-            if !same_session && !allowed_slack_slash {
+            let allowed_explicit_cross_session = explicit_target
+                && pending
+                    .request
+                    .resolver_policy
+                    .allows_cross_session_resolution();
+            if !same_session && !allowed_slack_slash && !allowed_explicit_cross_session {
                 return Some(ApprovalCommandReply {
                     text: format!("Approval {target_id} belongs to a different session."),
                 });
@@ -455,7 +522,13 @@ impl ApprovalBroker {
             remove_session_order(&mut state, &session_key, &target_id);
             (pending, target_id, selection)
         };
-        let resolved = pending.responder.send(selection).is_ok();
+        let resolved = pending
+            .responder
+            .send(ApprovalResolution {
+                selection,
+                resolver_user_id: user_id.map(ToOwned::to_owned),
+            })
+            .is_ok();
         if !resolved {
             return Some(ApprovalCommandReply {
                 text: format!("Approval {target_id} is no longer active."),
@@ -519,6 +592,36 @@ fn approval_option_is_deny(option: &ApprovalOption) -> bool {
     option.id == "deny" || option.kind.starts_with("reject")
 }
 
+fn validate_resolver_user(
+    target_id: &str,
+    request: &ApprovalRequest,
+    user_id: Option<&str>,
+) -> Option<ApprovalCommandReply> {
+    match &request.resolver_policy {
+        ApprovalResolverPolicy::Requester => {
+            let requester = request.requester_user_id.as_deref()?;
+            match user_id {
+                Some(user_id) if user_id == requester => None,
+                Some(_) => Some(ApprovalCommandReply {
+                    text: format!("Approval {target_id} can only be resolved by the requester."),
+                }),
+                None => Some(ApprovalCommandReply {
+                    text: format!("Approval {target_id} requires requester identity to resolve."),
+                }),
+            }
+        }
+        ApprovalResolverPolicy::AllowedUserIds(allowed_user_ids) => match user_id {
+            Some(user_id) if allowed_user_ids.contains(user_id) => None,
+            Some(_) => Some(ApprovalCommandReply {
+                text: format!("Approval {target_id} can only be resolved by an allowed user."),
+            }),
+            None => Some(ApprovalCommandReply {
+                text: format!("Approval {target_id} requires allowed user identity to resolve."),
+            }),
+        },
+    }
+}
+
 fn slack_slash_session_matches(pending_session: &str, command_session: &str) -> bool {
     let Some(command_channel) = parse_slack_slash_channel(command_session) else {
         return false;
@@ -560,6 +663,8 @@ mod tests {
             session_key: session_key.to_string(),
             executor: "kimi".to_string(),
             requester_user_id: Some("U1".to_string()),
+            resolver_policy: ApprovalResolverPolicy::default(),
+            scope: ApprovalScope::ToolPermission,
             title: "Run command".to_string(),
             body: "$ cargo test".to_string(),
             options: vec![
@@ -591,6 +696,8 @@ mod tests {
             session_key: session_key.to_string(),
             executor: "pi".to_string(),
             requester_user_id: Some("U1".to_string()),
+            resolver_policy: ApprovalResolverPolicy::default(),
+            scope: ApprovalScope::ToolPermission,
             title: "Pick target".to_string(),
             body: "Choose one option.".to_string(),
             options: vec![
@@ -956,6 +1063,82 @@ mod tests {
         assert_eq!(
             pending.await.unwrap(),
             ApprovalSelection::Selected("allow_once".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_allowed_user_can_resolve_from_different_session() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            let mut request = select_request("slack:channel:C1:123.456");
+            request.requester_user_id = Some("U_REQUESTER".to_string());
+            request.resolver_policy = ApprovalResolverPolicy::allowed_user_ids(
+                ["U_OWNER".to_string()].into_iter().collect(),
+            );
+            request_broker.request_resolution(request).await
+        });
+        let prompt = prompts.recv().await.unwrap();
+        assert_eq!(prompt.scope, ApprovalScope::ToolPermission);
+
+        let rejected = broker
+            .resolve_command(
+                "slack:dm:D2:999.000",
+                &format!("/approve {} second", prompt.id),
+                Some("U_REQUESTER"),
+            )
+            .await
+            .unwrap();
+        assert!(rejected.text.contains("allowed user"));
+        assert!(broker.has_pending(&prompt.id).await);
+
+        let reply = broker
+            .resolve_command(
+                "slack:dm:D1:999.000",
+                &format!("/approve {} second", prompt.id),
+                Some("U_OWNER"),
+            )
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("Approved"));
+        let resolution = pending.await.unwrap();
+        assert_eq!(
+            resolution.selection,
+            ApprovalSelection::Selected("second".to_string())
+        );
+        assert_eq!(resolution.resolver_user_id.as_deref(), Some("U_OWNER"));
+    }
+
+    #[tokio::test]
+    async fn explicit_allowed_user_policy_requires_identity() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let request_broker = broker.clone();
+        let pending = tokio::spawn(async move {
+            let mut request = request("s1");
+            request.resolver_policy = ApprovalResolverPolicy::allowed_user_ids(
+                ["U_OWNER".to_string()].into_iter().collect(),
+            );
+            request_broker.request(request).await
+        });
+        let prompt = prompts.recv().await.unwrap();
+
+        let reply = broker
+            .resolve_command("s1", &format!("/deny {}", prompt.id), None)
+            .await
+            .unwrap();
+
+        assert!(reply.text.contains("requires allowed user identity"));
+        let reply = broker
+            .resolve_command("s1", &format!("/deny {}", prompt.id), Some("U_OWNER"))
+            .await
+            .unwrap();
+        assert!(reply.text.contains("Denied"));
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
         );
     }
 

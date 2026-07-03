@@ -1299,6 +1299,8 @@ impl PiRpcSession {
                     session_key: self.session_key.clone(),
                     executor: self.executor.clone(),
                     requester_user_id: user_id,
+                    resolver_policy: Default::default(),
+                    scope: Default::default(),
                     title: message
                         .get("title")
                         .and_then(Value::as_str)
@@ -1384,6 +1386,8 @@ impl PiRpcSession {
                     session_key: self.session_key.clone(),
                     executor: self.executor.clone(),
                     requester_user_id: user_id,
+                    resolver_policy: Default::default(),
+                    scope: Default::default(),
                     title: message
                         .get("title")
                         .and_then(Value::as_str)

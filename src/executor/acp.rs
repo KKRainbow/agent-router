@@ -1790,6 +1790,8 @@ fn approval_request_from_permission_message(
         session_key: session_key.to_string(),
         executor: executor.to_string(),
         requester_user_id,
+        resolver_policy: Default::default(),
+        scope: Default::default(),
         title,
         body: permission_body(params, tool_call),
         options: permission_options(params),

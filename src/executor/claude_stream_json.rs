@@ -1278,6 +1278,8 @@ fn build_approval_request(
         session_key: session_key.to_string(),
         executor: executor.to_string(),
         requester_user_id,
+        resolver_policy: Default::default(),
+        scope: Default::default(),
         title: format!("Claude: {tool_name}"),
         body: description,
         options: vec![

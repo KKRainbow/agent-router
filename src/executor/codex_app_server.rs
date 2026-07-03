@@ -1624,6 +1624,8 @@ fn codex_approval_request(
         session_key: session_key.to_string(),
         executor: executor.to_string(),
         requester_user_id,
+        resolver_policy: Default::default(),
+        scope: Default::default(),
         title,
         body: truncate_text(body, 2_000),
         options: vec![
