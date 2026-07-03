@@ -192,6 +192,7 @@ executors:
 
 slack:
   require_mention: true
+  owner_user_ids: []
   allowed_channels: []
   free_response_channels: []
 

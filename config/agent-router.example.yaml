@@ -83,6 +83,9 @@ slack:
   # SLACK_BOT_TOKEN=xoxb-...
   # SLACK_APP_TOKEN=xapp-...
   require_mention: true
+  # Optional. When set, Slack input from non-owner users waits for approval from
+  # one of these Slack user IDs before it is routed. Empty disables this gate.
+  owner_user_ids: []
   allowed_channels: []
   free_response_channels: []
 
