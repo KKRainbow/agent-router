@@ -76,6 +76,7 @@ pub enum MachineKind {
 pub struct MachineRegistry {
     machines: BTreeMap<String, MachineConfig>,
     materialization_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+    workspace_environment_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,7 @@ impl MachineRegistry {
         Self {
             machines,
             materialization_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            workspace_environment_locks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -168,9 +170,6 @@ impl MachineRegistry {
         let machine = self
             .get(request.machine_id)
             .ok_or_else(|| anyhow::anyhow!("machine `{}` is not configured", request.machine_id))?;
-        if let Some(router_workspace) = request.router_workspace {
-            refresh_workspace_environment_files(router_workspace)?;
-        }
         match machine.kind {
             MachineKind::Local => self.prepare_local_command(machine, request).await,
             MachineKind::Ssh => self.prepare_ssh_command(machine, request).await,
@@ -202,19 +201,27 @@ impl MachineRegistry {
             ensure_dir_path_without_symlinks(&cwd)?;
         }
 
-        let materialization = if let (Some(router_workspace), Some(workspace)) =
-            (request.router_workspace, workspace.as_ref())
-        {
-            let lock = self
+        let mut artifact_fingerprint = None;
+        let materialization = if let Some(router_workspace) = request.router_workspace {
+            let workspace_environment_lock =
+                self.workspace_environment_lock(router_workspace).await;
+            let _workspace_environment_guard = workspace_environment_lock.lock().await;
+            let materialization_lock = self
                 .materialization_lock(&machine.id, request.session_key)
                 .await;
-            let _guard = lock.lock().await;
+            let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
-            let router_workspace = canonicalize_lossy(router_workspace);
-            let workspace = canonicalize_lossy(workspace);
-            if router_workspace != workspace {
-                sync_workspace_contents(&router_workspace, &workspace, request.cancel)?;
-                MachineWorkspaceMaterialization::Materialized
+            refresh_workspace_environment_files(router_workspace)?;
+            artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
+            if let Some(workspace) = workspace.as_ref() {
+                let router_workspace = canonicalize_lossy(router_workspace);
+                let workspace = canonicalize_lossy(workspace);
+                if router_workspace != workspace {
+                    sync_workspace_contents(&router_workspace, &workspace, request.cancel)?;
+                    MachineWorkspaceMaterialization::Materialized
+                } else {
+                    MachineWorkspaceMaterialization::NotNeeded
+                }
             } else {
                 MachineWorkspaceMaterialization::NotNeeded
             }
@@ -223,10 +230,6 @@ impl MachineRegistry {
         };
         ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
-        let artifact_fingerprint = request
-            .router_workspace
-            .map(workspace_fingerprint)
-            .transpose()?;
         let cwd = canonicalize_lossy(&cwd);
         let workspace_record = workspace.map(|_| MachineWorkspaceRecord {
             machine_id: machine.id.clone(),
@@ -266,20 +269,26 @@ impl MachineRegistry {
         ensure_ssh_workspace(host, &remote_cwd).await?;
         ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
-        let artifact_fingerprint = request
-            .router_workspace
-            .map(workspace_fingerprint)
-            .transpose()?;
-        let materialization = if let Some(router_workspace) = request.router_workspace {
-            let lock = self
+        let (materialization, artifact_fingerprint) = if let Some(router_workspace) =
+            request.router_workspace
+        {
+            let workspace_environment_lock =
+                self.workspace_environment_lock(router_workspace).await;
+            let _workspace_environment_guard = workspace_environment_lock.lock().await;
+            let materialization_lock = self
                 .materialization_lock(&machine.id, request.session_key)
                 .await;
-            let _guard = lock.lock().await;
+            let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
+            refresh_workspace_environment_files(router_workspace)?;
+            let artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
             materialize_ssh_workspace(host, router_workspace, &remote_cwd, request.cancel).await?;
-            MachineWorkspaceMaterialization::Materialized
+            (
+                MachineWorkspaceMaterialization::Materialized,
+                artifact_fingerprint,
+            )
         } else {
-            MachineWorkspaceMaterialization::NotNeeded
+            (MachineWorkspaceMaterialization::NotNeeded, None)
         };
         ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
@@ -301,6 +310,15 @@ impl MachineRegistry {
     async fn materialization_lock(&self, machine_id: &str, session_key: &str) -> Arc<Mutex<()>> {
         let key = format!("{machine_id}:{}", session_workspace_dir_name(session_key));
         let mut locks = self.materialization_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn workspace_environment_lock(&self, router_workspace: &Path) -> Arc<Mutex<()>> {
+        let key = canonicalize_lossy(router_workspace).display().to_string();
+        let mut locks = self.workspace_environment_locks.lock().await;
         locks
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -760,7 +778,7 @@ fn refresh_workspace_environment_files(router_workspace: &Path) -> anyhow::Resul
 
 fn refresh_workspace_environment_file(path: &Path) -> anyhow::Result<()> {
     let Some(metadata) = symlink_metadata_optional(path)? else {
-        return replace_workspace_environment_file(path, WORKSPACE_ENVIRONMENT_BLOCK.as_bytes());
+        return write_workspace_environment_file(path, WORKSPACE_ENVIRONMENT_BLOCK.as_bytes());
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         tracing::warn!(
@@ -777,7 +795,7 @@ fn refresh_workspace_environment_file(path: &Path) -> anyhow::Result<()> {
     if refreshed == existing {
         return Ok(());
     }
-    replace_workspace_environment_file(path, &refreshed)
+    write_workspace_environment_file(path, &refreshed)
 }
 
 fn workspace_environment_file_content(existing: &[u8]) -> Vec<u8> {
@@ -789,23 +807,23 @@ fn workspace_environment_file_content(existing: &[u8]) -> Vec<u8> {
 }
 
 fn remove_workspace_environment_block(existing: &[u8]) -> Vec<u8> {
-    let Some(start) = find_bytes(existing, WORKSPACE_ENVIRONMENT_START_MARKER) else {
-        return existing.to_vec();
-    };
-    let Some(end_relative) = find_bytes(&existing[start..], WORKSPACE_ENVIRONMENT_END_MARKER)
-    else {
-        return existing.to_vec();
-    };
-    let mut end = start + end_relative + WORKSPACE_ENVIRONMENT_END_MARKER.len();
-    if existing.get(end) == Some(&b'\r') && existing.get(end + 1) == Some(&b'\n') {
-        end += 2;
-    } else if existing.get(end) == Some(&b'\n') {
-        end += 1;
+    let mut remaining = existing;
+    let mut stripped = Vec::with_capacity(existing.len());
+    while let Some(start) = find_bytes(remaining, WORKSPACE_ENVIRONMENT_START_MARKER) {
+        let Some(end_relative) = find_bytes(&remaining[start..], WORKSPACE_ENVIRONMENT_END_MARKER)
+        else {
+            break;
+        };
+        stripped.extend_from_slice(&remaining[..start]);
+        let mut end = start + end_relative + WORKSPACE_ENVIRONMENT_END_MARKER.len();
+        if remaining.get(end) == Some(&b'\r') && remaining.get(end + 1) == Some(&b'\n') {
+            end += 2;
+        } else if remaining.get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        remaining = &remaining[end..];
     }
-
-    let mut stripped = Vec::with_capacity(existing.len() - (end - start));
-    stripped.extend_from_slice(&existing[..start]);
-    stripped.extend_from_slice(&existing[end..]);
+    stripped.extend_from_slice(remaining);
     stripped
 }
 
@@ -815,84 +833,91 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn replace_workspace_environment_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
-    let temp_path = create_workspace_environment_temp_file(path, content)?;
+fn write_workspace_environment_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     match symlink_metadata_optional(path)? {
         Some(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            let _ = std::fs::remove_file(&temp_path);
             tracing::warn!(
                 path = %path.display(),
                 "skipping Agent Router workspace environment file conflict"
             );
             Ok(())
         }
-        Some(_) => {
-            std::fs::remove_file(path).map_err(|err| {
-                anyhow::anyhow!(
-                    "replace workspace environment file {}: {err}",
-                    path.display()
-                )
-            })?;
-            std::fs::rename(&temp_path, path).map_err(|err| {
-                let _ = std::fs::remove_file(&temp_path);
-                anyhow::anyhow!(
-                    "replace workspace environment file {}: {err}",
-                    path.display()
-                )
-            })
-        }
-        None => std::fs::rename(&temp_path, path).map_err(|err| {
-            let _ = std::fs::remove_file(&temp_path);
-            anyhow::anyhow!(
-                "create workspace environment file {}: {err}",
-                path.display()
-            )
-        }),
+        Some(metadata) => overwrite_workspace_environment_file(path, &metadata, content),
+        None => create_workspace_environment_file(path, content),
     }
 }
 
-fn create_workspace_environment_temp_file(path: &Path, content: &[u8]) -> anyhow::Result<PathBuf> {
-    let parent = path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "workspace environment file has no parent: {}",
-            path.display()
-        )
+fn overwrite_workspace_environment_file(
+    path: &Path,
+    expected_metadata: &std::fs::Metadata,
+    content: &[u8],
+) -> anyhow::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| {
+            anyhow::anyhow!("open workspace environment file {}: {err}", path.display())
+        })?;
+    let opened_metadata = file.metadata().map_err(|err| {
+        anyhow::anyhow!("stat workspace environment file {}: {err}", path.display())
     })?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspace-environment");
-    let pid = std::process::id();
-    for attempt in 0..100 {
-        let temp_path = parent.join(format!(".{file_name}.agent-router-{pid}-{attempt}.tmp"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(mut file) => {
-                if let Err(err) = file.write_all(content).and_then(|_| file.sync_all()) {
-                    let _ = std::fs::remove_file(&temp_path);
-                    return Err(anyhow::anyhow!(
-                        "write workspace environment file {}: {err}",
-                        path.display()
-                    ));
-                }
-                return Ok(temp_path);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "create workspace environment file {}: {err}",
-                    path.display()
-                ));
-            }
-        }
+    if !same_workspace_file(expected_metadata, &opened_metadata) {
+        tracing::warn!(
+            path = %path.display(),
+            "skipping changed Agent Router workspace environment file"
+        );
+        return Ok(());
     }
-    anyhow::bail!(
-        "could not create temporary workspace environment file for {}",
-        path.display()
-    )
+    file.set_len(0)
+        .and_then(|_| file.write_all(content))
+        .and_then(|_| file.sync_all())
+        .map_err(|err| {
+            anyhow::anyhow!("write workspace environment file {}: {err}", path.display())
+        })
+}
+
+fn create_workspace_environment_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file
+            .write_all(content)
+            .and_then(|_| file.sync_all())
+            .map_err(|err| {
+                anyhow::anyhow!("write workspace environment file {}: {err}", path.display())
+            }),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            refresh_workspace_environment_file(path)
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "create workspace environment file {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn same_workspace_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_workspace_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_workspace_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.permissions().readonly() == right.permissions().readonly()
 }
 
 fn symlink_metadata_optional(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
@@ -1205,7 +1230,7 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    use std::os::unix::fs::{FileTypeExt, symlink};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 
     fn test_local_machine(
         id: &str,
@@ -1318,7 +1343,9 @@ mod tests {
         let end_marker = std::str::from_utf8(WORKSPACE_ENVIRONMENT_END_MARKER).unwrap();
         std::fs::write(
             router_workspace.join("AGENTS.md"),
-            format!("{start_marker}\nstale router text\n{end_marker}\nUser agents notes\n"),
+            format!(
+                "{WORKSPACE_ENVIRONMENT_BLOCK}User agents notes\n{start_marker}\nstale router text\n{end_marker}\n"
+            ),
         )
         .unwrap();
         std::fs::write(router_workspace.join("CLAUDE.md"), "User claude notes\n").unwrap();
@@ -1387,6 +1414,30 @@ mod tests {
         assert!(router_workspace.join("AGENTS.md").is_dir());
         assert!(
             std::fs::read_to_string(router_workspace.join("CLAUDE.md"))
+                .unwrap()
+                .starts_with(WORKSPACE_ENVIRONMENT_BLOCK)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_environment_refresh_preserves_existing_file_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let router_workspace = tmp.path();
+        let agents_path = router_workspace.join("AGENTS.md");
+        std::fs::write(&agents_path, "User agents notes\n").unwrap();
+        std::fs::set_permissions(&agents_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        refresh_workspace_environment_files(router_workspace).unwrap();
+
+        let mode = std::fs::metadata(&agents_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(
+            std::fs::read_to_string(&agents_path)
                 .unwrap()
                 .starts_with(WORKSPACE_ENVIRONMENT_BLOCK)
         );
