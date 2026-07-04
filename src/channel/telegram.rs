@@ -325,9 +325,7 @@ impl TelegramBotChannel {
     ) -> TypingRefreshGuard {
         let channel = self.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        if let Ok(mut active_typing) = self.active_typing.lock() {
-            active_typing.insert(session_key.clone(), stop.clone());
-        }
+        replace_active_typing_stop(&self.active_typing, session_key.clone(), stop.clone());
         let task_session_key = session_key.clone();
         let task_stop = stop.clone();
         let handle = tokio::spawn(async move {
@@ -456,6 +454,18 @@ impl TelegramBotChannel {
             "telegram.poll_timeout_secs must be greater than 0"
         );
         Ok(())
+    }
+}
+
+fn replace_active_typing_stop(
+    active_typing: &StdMutex<BTreeMap<String, Arc<AtomicBool>>>,
+    session_key: String,
+    stop: Arc<AtomicBool>,
+) {
+    if let Ok(mut active_typing) = active_typing.lock() {
+        if let Some(previous_stop) = active_typing.insert(session_key, stop) {
+            previous_stop.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -1218,6 +1228,34 @@ mod tests {
 
     fn update(value: Value) -> TelegramUpdate {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn replacing_active_typing_token_stops_previous_token() {
+        let active_typing = StdMutex::new(BTreeMap::new());
+        let first = Arc::new(AtomicBool::new(false));
+        replace_active_typing_stop(
+            &active_typing,
+            "telegram:private:123".to_string(),
+            first.clone(),
+        );
+        let second = Arc::new(AtomicBool::new(false));
+
+        replace_active_typing_stop(
+            &active_typing,
+            "telegram:private:123".to_string(),
+            second.clone(),
+        );
+
+        assert!(first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
+        assert!(
+            active_typing
+                .lock()
+                .unwrap()
+                .get("telegram:private:123")
+                .is_some_and(|stop| Arc::ptr_eq(stop, &second))
+        );
     }
 
     #[test]
