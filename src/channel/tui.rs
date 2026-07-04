@@ -29,6 +29,7 @@ pub struct TerminalChatChannel {
     cfg: TuiConfig,
     default_executor: String,
     available_executors: Vec<String>,
+    external_channels: Option<Vec<String>>,
     log_path: Option<String>,
     approvals: SharedApprovalBroker,
 }
@@ -38,6 +39,7 @@ impl TerminalChatChannel {
         cfg: TuiConfig,
         default_executor: impl Into<String>,
         available_executors: Vec<String>,
+        external_channels: Option<Vec<String>>,
         log_path: Option<String>,
         approvals: SharedApprovalBroker,
     ) -> Self {
@@ -45,6 +47,7 @@ impl TerminalChatChannel {
             cfg,
             default_executor: default_executor.into(),
             available_executors,
+            external_channels,
             log_path,
             approvals,
         }
@@ -171,6 +174,14 @@ impl TerminalChatChannel {
                 self.available_executors.join(", ")
             ))?;
             writer.write_str("switch: /agent <name>\n")?;
+        }
+        if let Some(channels) = &self.external_channels {
+            let channels = if channels.is_empty() {
+                "none".to_string()
+            } else {
+                channels.join(", ")
+            };
+            writer.write_str(&format!("channels: {channels}\n"))?;
         }
         writer.write_str(&format!("session: {}\n", self.cfg.session_id))?;
         if let Some(log_path) = &self.log_path {
@@ -636,6 +647,7 @@ mod tests {
             },
             "codex",
             vec!["codex".to_string(), "claude".to_string()],
+            Some(vec!["slack".to_string(), "web".to_string()]),
             Some("/tmp/agent-router.log".to_string()),
             Arc::new(ApprovalBroker::default()),
         );
@@ -646,6 +658,29 @@ mod tests {
         assert!(text.contains("default: codex\n"));
         assert!(text.contains("agents: codex, claude\n"));
         assert!(text.contains("switch: /agent <name>\n"));
+        assert!(text.contains("channels: slack, web\n"));
+    }
+
+    #[test]
+    fn header_prints_no_external_channels_when_requested() {
+        let writer = SharedTerminalWriter::new(Cursor::new(Vec::new()));
+        let handle = writer.inner.clone();
+        let channel = TerminalChatChannel::new(
+            TuiConfig {
+                enabled: true,
+                session_id: "local".to_string(),
+                channel_events: ChannelEventMode::Compact,
+            },
+            "codex",
+            vec!["codex".to_string()],
+            Some(Vec::new()),
+            None,
+            Arc::new(ApprovalBroker::default()),
+        );
+
+        channel.print_header(&writer).unwrap();
+
+        assert!(writer_text(&handle).contains("channels: none\n"));
     }
 
     #[test]

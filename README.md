@@ -233,7 +233,8 @@ Terminal chat uses the configured executors, workspace, approval defaults, and
 session persistence. The `chat` subcommand does not start Slack, QQ, Telegram,
 or Web. Normal logs are written to the local Agent Router log file so chat
 output stays readable. At startup the header lists the default agent, available
-agents, and the `/agent <name>` switch command.
+agents, the `/agent <name>` switch command, and external channels when running
+in combined chat-and-serve mode.
 
 ## Configuration Overview
 

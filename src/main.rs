@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (approvals, router) = build_router(&config);
     match mode {
-        RunMode::Chat => run_chat_mode(config, router, approvals, chat_log_path).await,
+        RunMode::Chat => run_chat_mode(config, router, approvals, chat_log_path, None).await,
         RunMode::Serve => run_serve_mode(config, router, approvals).await,
         RunMode::ChatAndServe => {
             run_chat_and_serve_mode(config, router, approvals, chat_log_path).await
@@ -236,6 +236,7 @@ async fn run_chat_mode(
     router: Arc<dyn RouterService>,
     approvals: Arc<ApprovalBroker>,
     log_path: Option<PathBuf>,
+    external_channels: Option<Vec<String>>,
 ) -> anyhow::Result<()> {
     tracing::info!("starting terminal chat channel");
     let available_executors = available_executor_names(&config);
@@ -243,6 +244,7 @@ async fn run_chat_mode(
         config.tui,
         config.router.default_executor,
         available_executors,
+        external_channels,
         log_path.map(|path| path.display().to_string()),
         approvals,
     )
@@ -256,8 +258,18 @@ async fn run_chat_and_serve_mode(
     approvals: Arc<ApprovalBroker>,
     log_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let external_channels = enabled_external_channel_names(&config)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let mut channels = spawn_external_channels(config.clone(), router.clone(), approvals.clone())?;
-    let mut chat = tokio::spawn(run_chat_mode(config, router, approvals, log_path));
+    let mut chat = tokio::spawn(run_chat_mode(
+        config,
+        router,
+        approvals,
+        log_path,
+        Some(external_channels),
+    ));
 
     if channels.is_empty() {
         return chat.await?;
@@ -297,25 +309,13 @@ fn spawn_external_channels(
     router: Arc<dyn RouterService>,
     approvals: Arc<ApprovalBroker>,
 ) -> anyhow::Result<JoinSet<(&'static str, anyhow::Result<()>)>> {
+    let enabled_channels = enabled_external_channel_names(&config);
     if config.web.enabled {
         config.web.validate_for_serve()?;
     }
 
     let mut channels: JoinSet<(&'static str, anyhow::Result<()>)> = JoinSet::new();
-    if config.telegram.enabled {
-        tracing::info!("starting Telegram channel");
-        let router = router.clone();
-        let approvals = approvals.clone();
-        channels.spawn(async move {
-            (
-                "telegram",
-                TelegramBotChannel::new(config.telegram, approvals)
-                    .run(router)
-                    .await,
-            )
-        });
-    }
-    if config.slack.enabled {
+    if enabled_channels.contains(&"slack") {
         tracing::info!("starting Slack channel");
         let router = router.clone();
         let approvals = approvals.clone();
@@ -328,7 +328,20 @@ fn spawn_external_channels(
             )
         });
     }
-    if config.qq.enabled {
+    if enabled_channels.contains(&"telegram") {
+        tracing::info!("starting Telegram channel");
+        let router = router.clone();
+        let approvals = approvals.clone();
+        channels.spawn(async move {
+            (
+                "telegram",
+                TelegramBotChannel::new(config.telegram, approvals)
+                    .run(router)
+                    .await,
+            )
+        });
+    }
+    if enabled_channels.contains(&"qq") {
         tracing::info!("starting QQ channel");
         let router = router.clone();
         let approvals = approvals.clone();
@@ -339,7 +352,7 @@ fn spawn_external_channels(
             )
         });
     }
-    if config.web.enabled {
+    if enabled_channels.contains(&"web") {
         tracing::info!("starting web channel");
         let router = router.clone();
         channels.spawn(async move { ("web", WebChannel::new(config.web).run(router).await) });
@@ -400,6 +413,37 @@ fn available_executor_names(config: &AppConfig) -> Vec<String> {
     names
 }
 
+fn enabled_external_channel_names(config: &AppConfig) -> Vec<&'static str> {
+    external_channel_names_from_flags(
+        config.slack.enabled,
+        config.telegram.enabled,
+        config.qq.enabled,
+        config.web.enabled,
+    )
+}
+
+fn external_channel_names_from_flags(
+    slack: bool,
+    telegram: bool,
+    qq: bool,
+    web: bool,
+) -> Vec<&'static str> {
+    let mut channels = Vec::new();
+    if slack {
+        channels.push("slack");
+    }
+    if telegram {
+        channels.push("telegram");
+    }
+    if qq {
+        channels.push("qq");
+    }
+    if web {
+        channels.push("web");
+    }
+    channels
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -442,6 +486,15 @@ mod tests {
     fn missing_command_requires_explicit_mode_without_tty() {
         let err = resolve_run_mode(None, true, false, true).unwrap_err();
         assert!(err.to_string().contains("use `agent-router chat`"));
+    }
+
+    #[test]
+    fn external_channel_names_follow_spawn_order() {
+        assert_eq!(
+            external_channel_names_from_flags(true, true, false, true),
+            ["slack", "telegram", "web"]
+        );
+        assert!(external_channel_names_from_flags(false, false, false, false).is_empty());
     }
 
     #[test]

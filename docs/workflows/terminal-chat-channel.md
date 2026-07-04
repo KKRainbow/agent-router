@@ -355,10 +355,14 @@ Agent Router
 default: <default_executor>
 agents: <agent>, <agent>
 switch: /agent <name>
+channels: <channel>, <channel>
 session: <session_id>
 
 > 
 ```
+
+Only `RunMode::ChatAndServe` prints `channels:`. If no external channel is
+enabled in that mode, print `channels: none`.
 
 After each submitted line, print a separator or assistant prefix:
 
@@ -545,6 +549,8 @@ testable so a later renderer can subscribe to the same internal events.
 - No-config chat auto-detects installed local agents in priority order:
   `codex`, `claude`, `pi`, then `kimi`.
 - The terminal header lists available agents and `switch: /agent <name>`.
+- In chat-and-serve mode, the terminal header lists enabled external channels
+  or `channels: none`.
 - User prompts are routed through `ChannelInput` and `RouterService`.
 - Ordinary input entered while a turn is running is rejected locally; `/stop`
   and approval commands remain available.
