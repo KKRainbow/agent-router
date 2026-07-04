@@ -2784,6 +2784,16 @@ fn session_source_metadata(session_key: &str) -> SessionSourceMetadata {
                 source_kind,
             }
         }
+        Some("tui") => {
+            let source_kind = match parts.next() {
+                Some("user") => "user",
+                _ => "unknown",
+            };
+            SessionSourceMetadata {
+                source: "tui",
+                source_kind,
+            }
+        }
         _ => SessionSourceMetadata {
             source: "unknown",
             source_kind: "unknown",
@@ -2803,6 +2813,10 @@ fn request_channel_id(session_key: &str) -> Option<String> {
         },
         Some("qq") => match parts.collect::<Vec<_>>().as_slice() {
             ["group", group_id, ..] => Some((*group_id).to_string()),
+            _ => None,
+        },
+        Some("tui") => match parts.collect::<Vec<_>>().as_slice() {
+            ["user", _, session_id, ..] => Some((*session_id).to_string()),
             _ => None,
         },
         _ => None,
@@ -4759,6 +4773,13 @@ mod tests {
                 },
             ),
             (
+                "tui:user:local:session-id",
+                SessionSourceMetadata {
+                    source: "tui",
+                    source_kind: "user",
+                },
+            ),
+            (
                 "local-session",
                 SessionSourceMetadata {
                     source: "unknown",
@@ -4770,6 +4791,10 @@ mod tests {
         for (session_key, expected) in cases {
             assert_eq!(session_source_metadata(session_key), expected);
         }
+        assert_eq!(
+            request_channel_id("tui:user:local:session-id").as_deref(),
+            Some("session-id")
+        );
     }
 
     #[test]

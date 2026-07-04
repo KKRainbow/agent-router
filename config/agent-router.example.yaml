@@ -138,3 +138,11 @@ web:
   channel_events: compact
   # Required when binding to a non-loopback address.
   # auth_token: local-token
+
+tui:
+  # Local terminal chat. `agent-router chat` starts this channel explicitly;
+  # interactive `agent-router` also defaults to chat even when this flag is false.
+  enabled: false
+  session_id: local
+  # channel_events: off | compact | verbose
+  channel_events: compact

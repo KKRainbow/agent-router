@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub telegram: TelegramConfig,
     pub qq: QqConfig,
     pub web: WebConfig,
+    pub tui: TuiConfig,
     pub machines: BTreeMap<String, MachineConfig>,
     pub executors: BTreeMap<String, ExecutorConfig>,
 }
@@ -108,6 +109,25 @@ pub struct WebConfig {
     pub auth_token: Option<String>,
 }
 
+impl WebConfig {
+    pub fn validate_for_serve(&self) -> anyhow::Result<()> {
+        if self.enabled && !self.bind.ip().is_loopback() {
+            anyhow::ensure!(
+                self.auth_token.is_some(),
+                "web.auth_token or WEB_AUTH_TOKEN is required when web.bind is non-loopback"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiConfig {
+    pub enabled: bool,
+    pub session_id: String,
+    pub channel_events: ChannelEventMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebAssetSource {
     Embedded,
@@ -161,6 +181,7 @@ struct FileConfig {
     telegram: Option<FileTelegramConfig>,
     qq: Option<FileQqConfig>,
     web: Option<FileWebConfig>,
+    tui: Option<FileTuiConfig>,
     executors: Option<BTreeMap<String, FileExecutorConfig>>,
 }
 
@@ -257,6 +278,13 @@ struct FileWebConfig {
     static_dir: Option<PathBuf>,
     channel_events: Option<String>,
     auth_token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileTuiConfig {
+    enabled: Option<bool>,
+    session_id: Option<String>,
+    channel_events: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,12 +517,22 @@ impl AppConfig {
                 .unwrap_or(ChannelEventMode::Compact),
             auth_token: web_auth_token,
         };
-        if web.enabled && !web.bind.ip().is_loopback() {
-            anyhow::ensure!(
-                web.auth_token.is_some(),
-                "web.auth_token or WEB_AUTH_TOKEN is required when web.bind is non-loopback"
-            );
-        }
+        let tui_file = file_cfg.tui.unwrap_or_default();
+        let tui_session_id = env_cfg
+            .tui_session_id
+            .or(tui_file.session_id)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        let tui = TuiConfig {
+            enabled: env_cfg.tui_enabled.or(tui_file.enabled).unwrap_or(false),
+            session_id: tui_session_id,
+            channel_events: env_cfg
+                .tui_channel_events
+                .or(tui_file.channel_events)
+                .map(|value| parse_channel_event_mode("tui.channel_events", &value))
+                .transpose()?
+                .unwrap_or(ChannelEventMode::Compact),
+        };
 
         let mut executors = BTreeMap::new();
         if let Some(raw_executors) = file_cfg.executors {
@@ -555,6 +593,7 @@ impl AppConfig {
             telegram,
             qq,
             web,
+            tui,
             machines,
             executors,
         })
@@ -595,6 +634,9 @@ struct EnvConfig {
     web_static_dir: Option<PathBuf>,
     web_channel_events: Option<String>,
     web_auth_token: Option<String>,
+    tui_enabled: Option<bool>,
+    tui_session_id: Option<String>,
+    tui_channel_events: Option<String>,
 }
 
 impl EnvConfig {
@@ -637,6 +679,9 @@ impl EnvConfig {
             web_static_dir: nonempty_env("WEB_STATIC_DIR").map(PathBuf::from),
             web_channel_events: nonempty_env("WEB_CHANNEL_EVENTS"),
             web_auth_token: nonempty_env("WEB_AUTH_TOKEN"),
+            tui_enabled: env_bool("TUI_ENABLED"),
+            tui_session_id: nonempty_env("TUI_SESSION_ID"),
+            tui_channel_events: nonempty_env("TUI_CHANNEL_EVENTS"),
         }
     }
 }
@@ -956,6 +1001,9 @@ mod tests {
         assert_eq!(cfg.web.asset_source, WebAssetSource::Embedded);
         assert_eq!(cfg.web.channel_events, ChannelEventMode::Compact);
         assert_eq!(cfg.web.auth_token, None);
+        assert!(!cfg.tui.enabled);
+        assert_eq!(cfg.tui.session_id, "local");
+        assert_eq!(cfg.tui.channel_events, ChannelEventMode::Compact);
     }
 
     #[test]
@@ -1389,14 +1437,71 @@ web:
     }
 
     #[test]
-    fn enabled_web_requires_auth_token_for_non_loopback_bind() {
+    fn parses_tui_config() {
+        let raw = r#"
+tui:
+  enabled: true
+  session_id: work
+  channel_events: verbose
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert!(cfg.tui.enabled);
+        assert_eq!(cfg.tui.session_id, "work");
+        assert_eq!(cfg.tui.channel_events, ChannelEventMode::Verbose);
+    }
+
+    #[test]
+    fn env_tui_config_overrides_file_config() {
+        let raw = r#"
+tui:
+  enabled: false
+  session_id: file
+  channel_events: off
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(
+            file_cfg,
+            EnvConfig {
+                tui_enabled: Some(true),
+                tui_session_id: Some("env".to_string()),
+                tui_channel_events: Some("verbose".to_string()),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cfg.tui.enabled);
+        assert_eq!(cfg.tui.session_id, "env");
+        assert_eq!(cfg.tui.channel_events, ChannelEventMode::Verbose);
+    }
+
+    #[test]
+    fn invalid_tui_channel_events_are_rejected() {
+        let raw = r#"
+tui:
+  channel_events: noisy
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("tui.channel_events `noisy` is not supported")
+        );
+    }
+
+    #[test]
+    fn enabled_web_validation_requires_auth_token_for_non_loopback_bind() {
         let raw = r#"
 web:
   enabled: true
   bind: 0.0.0.0:8787
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let err = cfg.web.validate_for_serve().unwrap_err();
 
         assert!(
             err.to_string()
@@ -1417,6 +1522,7 @@ web:
 
         assert_eq!(cfg.web.bind, "0.0.0.0:8787".parse().unwrap());
         assert_eq!(cfg.web.auth_token.as_deref(), Some("token"));
+        cfg.web.validate_for_serve().unwrap();
     }
 
     #[test]

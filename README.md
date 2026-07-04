@@ -32,6 +32,7 @@ Channels:
 - Slack Socket Mode
 - Tencent QQ Official Bot Gateway
 - Local browser web chat
+- Local terminal chat
 
 Planned/supporting implementation targets:
 
@@ -75,7 +76,7 @@ Requirements:
 - Credentials or local config for at least one supported channel
 - At least one configured agent command available on `PATH`
 
-Run with the example configuration:
+Start a local terminal chat with the example configuration:
 
 ```bash
 cargo run -- --config config/agent-router.example.yaml
@@ -87,6 +88,20 @@ commands, and channel options:
 ```bash
 cp config/agent-router.example.yaml config/agent-router.yaml
 cargo run -- --config config/agent-router.yaml
+```
+
+In an interactive terminal, omitting the subcommand starts local chat. Use
+`chat` to make that intent explicit:
+
+```bash
+cargo run -- chat --config config/agent-router.yaml
+```
+
+Use `serve` for long-running external channels such as Slack, QQ, Telegram, or
+Web:
+
+```bash
+cargo run -- serve --config config/agent-router.yaml
 ```
 
 ## Secrets
@@ -189,7 +204,7 @@ Web chat:
 ```bash
 npm --prefix web install
 npm --prefix web run build
-WEB_ENABLED=true cargo run -- --config config/agent-router.example.yaml
+WEB_ENABLED=true cargo run -- serve --config config/agent-router.example.yaml
 ```
 
 The Rust build embeds `web/dist` into the binary. Rebuild the frontend before
@@ -198,6 +213,16 @@ placeholder page. Set `web.static_dir` or `WEB_STATIC_DIR` for local debugging;
 that switches the web channel to runtime static files instead of embedded
 assets. `WEB_AUTH_TOKEN` is required when `WEB_BIND` uses a non-loopback
 address.
+
+Terminal chat:
+
+```bash
+cargo run -- chat --config config/agent-router.example.yaml
+```
+
+Terminal chat uses the configured executors, workspace, approval defaults, and
+session persistence. It does not start Slack, QQ, Telegram, or Web. Normal logs
+are written to the local Agent Router log file so chat output stays readable.
 
 ## Configuration Overview
 

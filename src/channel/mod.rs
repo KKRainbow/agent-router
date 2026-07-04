@@ -4,6 +4,7 @@ pub(crate) mod context;
 pub mod qq;
 pub mod slack;
 pub mod telegram;
+pub mod tui;
 pub mod web;
 
 pub(crate) mod output;
