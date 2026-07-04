@@ -46,8 +46,7 @@ impl TelegramBotChannel {
     pub async fn run(self, router: Arc<dyn RouterService>) -> anyhow::Result<()> {
         self.validate_config()?;
         let channel = Arc::new(self);
-        let bot = channel.get_me().await?;
-        channel.delete_webhook().await?;
+        let bot = channel.startup_handshake_until_ready().await?;
         channel.clone().spawn_approval_notifier();
         let mut offset = None;
 
@@ -60,6 +59,28 @@ impl TelegramBotChannel {
                 }
             }
         }
+    }
+
+    async fn startup_handshake_until_ready(&self) -> anyhow::Result<TelegramBotIdentity> {
+        loop {
+            match self.startup_handshake().await {
+                Ok(bot) => return Ok(bot),
+                Err(err) if telegram_error_is_auth_failure(&err) => return Err(err),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Telegram startup handshake failed; retrying"
+                    );
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
+            }
+        }
+    }
+
+    async fn startup_handshake(&self) -> anyhow::Result<TelegramBotIdentity> {
+        let bot = self.get_me().await?;
+        self.delete_webhook().await?;
+        Ok(bot)
     }
 
     async fn poll_once(
@@ -718,6 +739,20 @@ impl std::fmt::Display for TelegramApiError {
 
 impl std::error::Error for TelegramApiError {}
 
+fn telegram_error_is_auth_failure(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TelegramApiError>()
+        .is_some_and(TelegramApiError::is_auth_failure)
+}
+
+impl TelegramApiError {
+    fn is_auth_failure(&self) -> bool {
+        let description = self.description.to_ascii_lowercase();
+        matches!(self.error_code, Some(401 | 404))
+            || description.contains("unauthorized")
+            || description.contains("not found")
+    }
+}
+
 #[derive(Debug)]
 struct TelegramTransportError {
     method: &'static str,
@@ -1133,5 +1168,32 @@ mod tests {
         assert!(!sanitized.contains(token));
         assert!(!sanitized.contains("/bot"));
         assert!(sanitized.contains("Telegram getMe request failed"));
+    }
+
+    #[test]
+    fn only_telegram_auth_errors_are_startup_fatal() {
+        let unauthorized = anyhow::Error::new(TelegramApiError {
+            method: "getMe",
+            error_code: Some(401),
+            description: "Unauthorized".to_string(),
+        });
+        assert!(telegram_error_is_auth_failure(&unauthorized));
+
+        let bad_gateway = anyhow::Error::new(TelegramApiError {
+            method: "getMe",
+            error_code: Some(502),
+            description: "Bad Gateway".to_string(),
+        });
+        assert!(!telegram_error_is_auth_failure(&bad_gateway));
+
+        let malformed_token = anyhow::Error::new(TelegramApiError {
+            method: "getMe",
+            error_code: Some(404),
+            description: "Not Found".to_string(),
+        });
+        assert!(telegram_error_is_auth_failure(&malformed_token));
+
+        let transport = anyhow::anyhow!("Telegram getMe request failed: error sending request");
+        assert!(!telegram_error_is_auth_failure(&transport));
     }
 }
