@@ -73,10 +73,18 @@ Requirements:
 
 - Rust toolchain
 - Node.js and npm when rebuilding the bundled web UI
-- Credentials or local config for at least one supported channel
-- At least one configured agent command available on `PATH`
+- At least one supported agent command available on `PATH`, or configured
+  executors
+- Credentials only for external channels you want to serve
 
-Start a local terminal chat with the example configuration:
+Start a local terminal chat with auto-detected local agents:
+
+```bash
+cargo run --
+```
+
+Start terminal chat with the example configuration and any external channels
+enabled by that configuration:
 
 ```bash
 cargo run -- --config config/agent-router.example.yaml
@@ -90,8 +98,9 @@ cp config/agent-router.example.yaml config/agent-router.yaml
 cargo run -- --config config/agent-router.yaml
 ```
 
-In an interactive terminal, omitting the subcommand starts local chat. Use
-`chat` to make that intent explicit:
+In an interactive terminal, omitting the subcommand starts local chat. If you
+pass `--config`, it also starts the enabled external channels. Use `chat` to
+force local-only chat:
 
 ```bash
 cargo run -- chat --config config/agent-router.yaml
@@ -221,8 +230,10 @@ cargo run -- chat --config config/agent-router.example.yaml
 ```
 
 Terminal chat uses the configured executors, workspace, approval defaults, and
-session persistence. It does not start Slack, QQ, Telegram, or Web. Normal logs
-are written to the local Agent Router log file so chat output stays readable.
+session persistence. The `chat` subcommand does not start Slack, QQ, Telegram,
+or Web. Normal logs are written to the local Agent Router log file so chat
+output stays readable. At startup the header lists the default agent, available
+agents, and the `/agent <name>` switch command.
 
 ## Configuration Overview
 

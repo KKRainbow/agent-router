@@ -4,8 +4,8 @@
 
 Agent Router should be useful as a local command-line chat client without
 requiring Slack, QQ, Telegram, or Web to be configured. A user should be able to
-run the binary in a terminal, type prompts, receive streamed output, and type a
-new prompt while the current turn is still running.
+run the binary in a terminal, type prompts, receive streamed output, and use an
+explicit control command such as `/stop` before replacing a running turn.
 
 The first implementation should be a terminal REPL channel, not a full-screen
 `ratatui` application. The REPL keeps the initial surface small and validates
@@ -29,20 +29,19 @@ agent-router serve --config a.yaml
 Rules:
 
 - `agent-router` in a TTY defaults to `agent-router chat`.
-- `agent-router --config a.yaml` in a TTY also defaults to
-  `agent-router chat --config a.yaml`.
+- `agent-router --config a.yaml` in a TTY starts local terminal chat and the
+  external channels enabled by that config.
 - `agent-router chat` starts only the local terminal channel.
 - `agent-router serve` starts configured external channels, such as Slack, QQ,
   Telegram, and Web.
-- `--config` selects configuration input only. It must not imply service mode.
 - If no subcommand is provided and stdin or stdout is not a TTY, return a clear
   error asking the caller to choose `chat` or `serve`.
 - If `chat` is selected while external channels are enabled in the config, do
   not start them.
 - If `serve` is selected, do not start the terminal chat channel.
 
-This keeps accidental background channel startup out of the common local
-workflow and makes scripts explicit.
+This keeps scripts explicit while making the interactive configured startup act
+as an operator console for both local chat and enabled external channels.
 
 ## Non-Goals
 
@@ -197,6 +196,7 @@ Startup mode resolution:
 enum RunMode {
     Chat,
     Serve,
+    ChatAndServe,
 }
 ```
 
@@ -204,15 +204,21 @@ Resolution rules:
 
 1. Explicit `chat` maps to `RunMode::Chat`.
 2. Explicit `serve` maps to `RunMode::Serve`.
-3. No command with TTY stdin and stdout maps to `RunMode::Chat`.
-4. No command without TTY stdin or stdout is an error.
+3. No command with explicit `--config` and TTY stdin/stdout maps to
+   `RunMode::ChatAndServe`.
+4. No command with TTY stdin and stdout maps to `RunMode::Chat`.
+5. No command without TTY stdin or stdout is an error.
 
 Use a small helper for this decision so it can be unit-tested without launching
 the runtime:
 
 ```rust
-fn resolve_run_mode(command: Option<Command>, stdin_is_tty: bool, stdout_is_tty: bool)
-    -> anyhow::Result<RunMode>
+fn resolve_run_mode(
+    command: Option<Command>,
+    explicit_config: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> anyhow::Result<RunMode>
 ```
 
 Use `std::io::IsTerminal` for TTY detection.
@@ -260,14 +266,15 @@ await turn completion
 read next prompt
 ```
 
-That loop cannot receive a new prompt while the current turn is running.
+That loop cannot receive control commands while the current turn is running.
 
 Instead:
 
 1. Spawn an input task that continuously reads lines from stdin.
 2. Send each line to the channel event loop through `tokio::sync::mpsc`.
-3. Spawn each routed turn as its own task.
-4. Let the router's normal turn replacement semantics handle interrupts.
+3. Spawn routed turns as tasks so output can continue while input is read.
+4. While a prompt turn is active, reject ordinary text locally and route only
+   explicit control commands such as `/stop`, `/approve`, and `/deny`.
 
 The reader task should:
 
@@ -285,17 +292,21 @@ The terminal channel does not need a special interrupt API.
 
 For normal prompts, `begin_channel_input` creates a replacement reservation
 through the existing intake path. This maps to `TurnBeginMode::ReplaceActive`
-for non-approval, non-router-control prompts.
+for non-approval, non-router-control prompts. The terminal REPL does not use a
+second ordinary line as an implicit replacement while a prompt turn is active;
+that line is rejected locally with a `busy>` message. Users must send `/stop`
+before entering a replacement prompt.
 
 Expected behavior:
 
 1. User sends prompt A.
 2. Terminal channel starts turn A in a background task.
 3. User sends prompt B before turn A finishes.
-4. Terminal channel starts turn B through the same `ChannelInput` path.
-5. Router cancels/replaces active turn A.
-6. Stale output from turn A is suppressed by router-owned turn output handling.
-7. Turn B output becomes the visible active output.
+4. Terminal channel prints `busy>` and does not route prompt B.
+5. User sends `/stop`.
+6. `/stop` is routed through the existing `ChannelInput` path.
+7. When the prompt turn finishes or is stopped, the terminal prints the idle
+   `>` prompt again.
 
 The terminal channel should not track router generations or decide which output
 is stale. That belongs to the router.
@@ -331,16 +342,19 @@ reply, `send_final_reply` should only close formatting and draw the next prompt.
 If no chunks were printed, it should print the final reply.
 
 Because normal stdout can interleave with typed input, the first version may
-accept imperfect line redraw. Correctness is that input is accepted and router
-turns are replaced. A full-screen redraw model can be added later.
+accept imperfect line redraw. Correctness is that idle input is routed, busy
+ordinary input is rejected locally, and explicit controls remain available. A
+full-screen redraw model can be added later.
 
 ## Prompt Rendering
 
 The REPL prompt can be minimal:
 
 ```text
-agent-router
-executor: <default_executor>
+Agent Router
+default: <default_executor>
+agents: <agent>, <agent>
+switch: /agent <name>
 session: <session_id>
 
 > 
@@ -456,8 +470,9 @@ Integration-style tests:
 
 - a fake router records `ChannelInput` from a prompt and verifies source,
   session key, user id, intent, and disabled context policy.
-- two prompts submitted while the first fake turn is blocked cause two routed
-  inputs; the second prompt uses the normal replacement path.
+- normal prompt inputs use the router replacement reservation path when routed.
+- ordinary input submitted while a prompt turn is active is rejected locally;
+  `/stop` and approval commands are still routable.
 - `/stop` is forwarded to router rather than consumed locally.
 - `/exit` exits the terminal channel locally and is not routed.
 
@@ -521,13 +536,18 @@ testable so a later renderer can subscribe to the same internal events.
 ## Acceptance Criteria
 
 - `agent-router` opens local chat in an interactive terminal.
-- `agent-router --config a.yaml` opens local chat with that config.
+- `agent-router --config a.yaml` opens local chat with that config and starts
+  enabled external channels.
 - `agent-router chat --config a.yaml` opens only local chat.
 - `agent-router serve --config a.yaml` starts only configured external channels.
 - Non-TTY no-subcommand startup fails with a clear mode-selection error.
 - Chat mode does not require Slack, QQ, Telegram, or Web credentials.
+- No-config chat auto-detects installed local agents in priority order:
+  `codex`, `claude`, `pi`, then `kimi`.
+- The terminal header lists available agents and `switch: /agent <name>`.
 - User prompts are routed through `ChannelInput` and `RouterService`.
-- New prompts can be entered while a turn is running.
+- Ordinary input entered while a turn is running is rejected locally; `/stop`
+  and approval commands remain available.
 - Router-owned slash commands keep existing behavior.
 - `/exit` and `/quit` close only the local terminal channel.
 - Normal logs do not corrupt chat output.

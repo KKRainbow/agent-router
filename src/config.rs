@@ -141,7 +141,7 @@ pub enum ChannelEventMode {
     Verbose,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutorProtocol {
     Acp,
     AppServer,
@@ -169,6 +169,45 @@ pub struct ExecutorConfig {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutoAgentExecutor {
+    name: &'static str,
+    protocol: ExecutorProtocol,
+    command: &'static str,
+    args: &'static [&'static str],
+}
+
+const AUTO_AGENT_EXECUTORS: &[AutoAgentExecutor] = &[
+    AutoAgentExecutor {
+        name: "codex",
+        protocol: ExecutorProtocol::AppServer,
+        command: "codex",
+        args: &["app-server"],
+    },
+    AutoAgentExecutor {
+        name: "claude",
+        protocol: ExecutorProtocol::ClaudeStreamJson,
+        command: "claude",
+        args: &[],
+    },
+    AutoAgentExecutor {
+        name: "pi",
+        protocol: ExecutorProtocol::PiRpc,
+        command: "pi",
+        args: &[],
+    },
+    AutoAgentExecutor {
+        name: "kimi",
+        protocol: ExecutorProtocol::Acp,
+        command: "kimi",
+        args: &["acp"],
+    },
+];
+
+pub fn known_agent_priority() -> &'static [&'static str] {
+    &["codex", "claude", "pi", "kimi"]
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,12 +371,26 @@ impl AppConfig {
     }
 
     fn from_file_config(file_cfg: FileConfig, env_cfg: EnvConfig) -> anyhow::Result<Self> {
+        Self::from_file_config_with_agent_detector(
+            file_cfg,
+            env_cfg,
+            detect_installed_agent_executors,
+        )
+    }
+
+    fn from_file_config_with_agent_detector<F>(
+        file_cfg: FileConfig,
+        env_cfg: EnvConfig,
+        detect_agent_executors: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce() -> BTreeMap<String, ExecutorConfig>,
+    {
         let router_file = file_cfg.router.unwrap_or_default();
-        let default_executor = env_cfg
+        let explicit_default_executor = env_cfg
             .default_executor
             .filter(|value| !value.trim().is_empty())
-            .or(router_file.default_executor.clone())
-            .unwrap_or_else(|| "kimi".to_string());
+            .or(router_file.default_executor.clone());
         let orchestrator = parse_orchestrator_config(router_file.orchestrator)?;
 
         let approval_file = file_cfg.approval.unwrap_or_default();
@@ -541,20 +594,22 @@ impl AppConfig {
                 executors.insert(cfg.name.clone(), cfg);
             }
         }
+        let auto_detected_executors = executors.is_empty();
         if executors.is_empty() {
-            executors.insert(
-                "kimi".to_string(),
-                ExecutorConfig {
-                    name: "kimi".to_string(),
-                    protocol: ExecutorProtocol::Acp,
-                    machine: LOCAL_MACHINE_ID.to_string(),
-                    command: "kimi".to_string(),
-                    args: vec!["acp".to_string()],
-                    cwd: None,
-                    env: BTreeMap::new(),
-                },
-            );
+            executors = detect_agent_executors();
         }
+        anyhow::ensure!(
+            !executors.is_empty(),
+            "no supported agent executors found in PATH; install codex, claude, pi, or kimi, or configure executors"
+        );
+
+        let default_executor = explicit_default_executor.unwrap_or_else(|| {
+            if auto_detected_executors {
+                preferred_known_agent_executor(&executors).unwrap_or_else(|| "kimi".to_string())
+            } else {
+                "kimi".to_string()
+            }
+        });
 
         anyhow::ensure!(
             executors.contains_key(&default_executor),
@@ -727,6 +782,95 @@ pub fn default_config_path() -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|candidate| candidate.exists())
+}
+
+fn detect_installed_agent_executors() -> BTreeMap<String, ExecutorConfig> {
+    installed_agent_executors(command_is_available)
+}
+
+fn installed_agent_executors<F>(mut command_is_available: F) -> BTreeMap<String, ExecutorConfig>
+where
+    F: FnMut(&str) -> bool,
+{
+    AUTO_AGENT_EXECUTORS
+        .iter()
+        .filter(|agent| command_is_available(agent.command))
+        .map(|agent| {
+            let name = agent.name.to_string();
+            (
+                name.clone(),
+                ExecutorConfig {
+                    name,
+                    protocol: agent.protocol,
+                    machine: LOCAL_MACHINE_ID.to_string(),
+                    command: agent.command.to_string(),
+                    args: agent.args.iter().map(|arg| (*arg).to_string()).collect(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn preferred_known_agent_executor(executors: &BTreeMap<String, ExecutorConfig>) -> Option<String> {
+    known_agent_priority()
+        .iter()
+        .find(|name| executors.contains_key(**name))
+        .map(|name| (*name).to_string())
+}
+
+fn command_is_available(command: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| {
+        command_candidate_paths(&dir, command)
+            .into_iter()
+            .any(|candidate| is_executable_file(&candidate))
+    })
+}
+
+fn command_candidate_paths(dir: &Path, command: &str) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        let command_path = Path::new(command);
+        if command_path.extension().is_some() {
+            return vec![dir.join(command)];
+        }
+        let pathext =
+            env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string().into());
+        let mut candidates = vec![dir.join(command)];
+        candidates.extend(
+            pathext
+                .to_string_lossy()
+                .split(';')
+                .map(str::trim)
+                .filter(|ext| !ext.is_empty())
+                .map(|ext| dir.join(format!("{command}{ext}"))),
+        );
+        candidates
+    } else {
+        vec![dir.join(command)]
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Result<ExecutorConfig> {
@@ -964,14 +1108,42 @@ fn split_csv(raw: &str) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_config_uses_kimi_acp_executor() {
-        let cfg = AppConfig::from_file_config(FileConfig::default(), EnvConfig::default()).unwrap();
+    fn app_config_from_file(file_cfg: FileConfig, env_cfg: EnvConfig) -> anyhow::Result<AppConfig> {
+        AppConfig::from_file_config_with_agent_detector(file_cfg, env_cfg, || {
+            installed_agent_executors(|command| command == "kimi")
+        })
+    }
 
-        assert_eq!(cfg.router.default_executor, "kimi");
+    fn app_config_from_file_with_agents(
+        file_cfg: FileConfig,
+        env_cfg: EnvConfig,
+        available_agents: &'static [&'static str],
+    ) -> anyhow::Result<AppConfig> {
+        AppConfig::from_file_config_with_agent_detector(file_cfg, env_cfg, || {
+            installed_agent_executors(|command| available_agents.contains(&command))
+        })
+    }
+
+    #[test]
+    fn default_config_uses_detected_agents_by_priority() {
+        let cfg = app_config_from_file_with_agents(
+            FileConfig::default(),
+            EnvConfig::default(),
+            &["kimi", "pi", "claude"],
+        )
+        .unwrap();
+
+        assert_eq!(cfg.router.default_executor, "claude");
+        assert!(!cfg.executors.contains_key("codex"));
+        let claude = cfg.executors.get("claude").unwrap();
+        assert_eq!(claude.protocol, ExecutorProtocol::ClaudeStreamJson);
+        assert_eq!(claude.machine, LOCAL_MACHINE_ID);
+        assert_eq!(claude.command, "claude");
+        assert!(claude.args.is_empty());
+        let pi = cfg.executors.get("pi").unwrap();
+        assert_eq!(pi.protocol, ExecutorProtocol::PiRpc);
         let kimi = cfg.executors.get("kimi").unwrap();
         assert_eq!(kimi.protocol, ExecutorProtocol::Acp);
-        assert_eq!(kimi.machine, LOCAL_MACHINE_ID);
         assert_eq!(kimi.command, "kimi");
         assert_eq!(kimi.args, ["acp"]);
         assert_eq!(cfg.machines[LOCAL_MACHINE_ID].kind, MachineKind::Local);
@@ -1007,6 +1179,62 @@ mod tests {
     }
 
     #[test]
+    fn env_default_executor_overrides_detected_priority() {
+        let cfg = app_config_from_file_with_agents(
+            FileConfig::default(),
+            EnvConfig {
+                default_executor: Some("pi".to_string()),
+                ..EnvConfig::default()
+            },
+            &["codex", "pi"],
+        )
+        .unwrap();
+
+        assert_eq!(cfg.router.default_executor, "pi");
+    }
+
+    #[test]
+    fn default_config_prefers_codex_when_available() {
+        let cfg = app_config_from_file_with_agents(
+            FileConfig::default(),
+            EnvConfig::default(),
+            &["kimi", "pi", "claude", "codex"],
+        )
+        .unwrap();
+
+        assert_eq!(cfg.router.default_executor, "codex");
+    }
+
+    #[test]
+    fn configured_executors_without_default_keep_kimi_default() {
+        let raw = r#"
+executors:
+  codex:
+    protocol: app_server
+  kimi:
+    protocol: acp
+    command: kimi
+    args: ["acp"]
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
+
+        assert_eq!(cfg.router.default_executor, "kimi");
+    }
+
+    #[test]
+    fn default_config_requires_an_installed_or_configured_agent() {
+        let err =
+            app_config_from_file_with_agents(FileConfig::default(), EnvConfig::default(), &[])
+                .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("no supported agent executors found in PATH")
+        );
+    }
+
+    #[test]
     fn parses_slack_channel_lists_and_executor_config() {
         let raw = r#"
 router:
@@ -1033,7 +1261,7 @@ executors:
     args: ["acp"]
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert!(!cfg.slack.require_mention);
         assert_eq!(
@@ -1066,7 +1294,7 @@ slack:
   owner_user_ids: ["U_FILE"]
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             file_cfg,
             EnvConfig {
                 slack_owner_user_ids: Some(
@@ -1114,7 +1342,7 @@ executors:
     command: /opt/node/bin/codex-acp
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert_eq!(
             cfg.machines[LOCAL_MACHINE_ID].workspace_root.as_deref(),
@@ -1156,7 +1384,7 @@ executors:
     command: kimi
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
         let orchestrator = cfg.router.orchestrator.unwrap();
 
         assert!(orchestrator.enabled);
@@ -1190,7 +1418,7 @@ executors:
     command: kimi
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
         let orchestrator = cfg.router.orchestrator.unwrap();
 
         assert_eq!(orchestrator.mode, OrchestratorMode::Initial);
@@ -1215,7 +1443,7 @@ executors:
     command: kimi
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+        let err = app_config_from_file(file_cfg, EnvConfig::default()).unwrap_err();
 
         assert!(
             err.to_string()
@@ -1238,7 +1466,7 @@ executors:
     command: kimi
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+        let err = app_config_from_file(file_cfg, EnvConfig::default()).unwrap_err();
 
         assert!(
             err.to_string()
@@ -1259,7 +1487,7 @@ qq:
   allowed_groups: ["g1", "g2,g3"]
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert!(cfg.qq.enabled);
         assert_eq!(cfg.qq.app_id, "app");
@@ -1290,7 +1518,7 @@ telegram:
   poll_timeout_secs: 45
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert!(cfg.telegram.enabled);
         assert_eq!(cfg.telegram.bot_token, "token");
@@ -1312,7 +1540,7 @@ telegram:
 
     #[test]
     fn telegram_bot_token_auto_enables_channel_unless_disabled() {
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             FileConfig::default(),
             EnvConfig {
                 telegram_bot_token: Some("token".to_string()),
@@ -1324,7 +1552,7 @@ telegram:
         assert!(cfg.telegram.enabled);
         assert_eq!(cfg.telegram.bot_token, "token");
 
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             FileConfig::default(),
             EnvConfig {
                 telegram_enabled: Some(false),
@@ -1350,7 +1578,7 @@ telegram:
   poll_timeout_secs: 10
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             file_cfg,
             EnvConfig {
                 telegram_enabled: Some(true),
@@ -1391,7 +1619,7 @@ web:
   auth_token: local-token
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert!(cfg.web.enabled);
         assert_eq!(cfg.web.bind, "127.0.0.1:9000".parse().unwrap());
@@ -1413,7 +1641,7 @@ web:
   channel_events: off
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             file_cfg,
             EnvConfig {
                 web_enabled: Some(true),
@@ -1445,7 +1673,7 @@ tui:
   channel_events: verbose
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert!(cfg.tui.enabled);
         assert_eq!(cfg.tui.session_id, "work");
@@ -1461,7 +1689,7 @@ tui:
   channel_events: off
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             file_cfg,
             EnvConfig {
                 tui_enabled: Some(true),
@@ -1484,7 +1712,7 @@ tui:
   channel_events: noisy
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+        let err = app_config_from_file(file_cfg, EnvConfig::default()).unwrap_err();
 
         assert!(
             err.to_string()
@@ -1500,7 +1728,7 @@ web:
   bind: 0.0.0.0:8787
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
         let err = cfg.web.validate_for_serve().unwrap_err();
 
         assert!(
@@ -1518,7 +1746,7 @@ web:
   auth_token: token
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert_eq!(cfg.web.bind, "0.0.0.0:8787".parse().unwrap());
         assert_eq!(cfg.web.auth_token.as_deref(), Some("token"));
@@ -1532,7 +1760,7 @@ approval:
   default_mode: yolo
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert_eq!(cfg.approval.default_mode, ApprovalMode::Yolo);
     }
@@ -1544,7 +1772,7 @@ workspace:
   root: /tmp/hermes-workspaces
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
 
         assert_eq!(
             cfg.workspace.root.as_deref(),
@@ -1559,7 +1787,7 @@ approval:
   default_mode: normal
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             file_cfg,
             EnvConfig {
                 approval_default_mode: Some("yolo".to_string()),
@@ -1573,7 +1801,7 @@ approval:
 
     #[test]
     fn env_qq_credentials_enable_channel() {
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             FileConfig::default(),
             EnvConfig {
                 qq_app_id: Some("app".to_string()),
@@ -1590,7 +1818,7 @@ approval:
 
     #[test]
     fn partial_channel_credentials_do_not_auto_enable_channels() {
-        let cfg = AppConfig::from_file_config(
+        let cfg = app_config_from_file(
             FileConfig::default(),
             EnvConfig {
                 slack_bot_token: Some("xoxb-token".to_string()),
@@ -1614,7 +1842,7 @@ executors:
     protocol: app_server
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
         let codex = cfg.executors.get("codex").unwrap();
 
         assert_eq!(cfg.router.default_executor, "codex");
@@ -1636,7 +1864,7 @@ executors:
       CLAUDE_CODE_DIR: /tmp/claude
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
         let claude = cfg.executors.get("claude").unwrap();
 
         assert_eq!(cfg.router.default_executor, "claude");
@@ -1659,7 +1887,7 @@ executors:
     protocol: pi_rpc
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
-        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let cfg = app_config_from_file(file_cfg, EnvConfig::default()).unwrap();
         let pi = cfg.executors.get("pi").unwrap();
 
         assert_eq!(cfg.router.default_executor, "pi");

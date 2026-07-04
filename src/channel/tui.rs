@@ -28,6 +28,7 @@ const TUI_USER_ID: &str = "local";
 pub struct TerminalChatChannel {
     cfg: TuiConfig,
     default_executor: String,
+    available_executors: Vec<String>,
     log_path: Option<String>,
     approvals: SharedApprovalBroker,
 }
@@ -36,12 +37,14 @@ impl TerminalChatChannel {
     pub fn new(
         cfg: TuiConfig,
         default_executor: impl Into<String>,
+        available_executors: Vec<String>,
         log_path: Option<String>,
         approvals: SharedApprovalBroker,
     ) -> Self {
         Self {
             cfg,
             default_executor: default_executor.into(),
+            available_executors,
             log_path,
             approvals,
         }
@@ -161,7 +164,14 @@ impl TerminalChatChannel {
         W: Write + Send + 'static,
     {
         writer.write_str("Agent Router\n")?;
-        writer.write_str(&format!("executor: {}\n", self.default_executor))?;
+        writer.write_str(&format!("default: {}\n", self.default_executor))?;
+        if !self.available_executors.is_empty() {
+            writer.write_str(&format!(
+                "agents: {}\n",
+                self.available_executors.join(", ")
+            ))?;
+            writer.write_str("switch: /agent <name>\n")?;
+        }
         writer.write_str(&format!("session: {}\n", self.cfg.session_id))?;
         if let Some(log_path) = &self.log_path {
             writer.write_str(&format!("log: {log_path}\n"))?;
@@ -612,6 +622,30 @@ mod tests {
             Some(TerminalInput::Prompt("/stop".to_string()))
         );
         assert_eq!(parse_terminal_input("   "), None);
+    }
+
+    #[test]
+    fn header_prints_available_agents_and_switch_hint() {
+        let writer = SharedTerminalWriter::new(Cursor::new(Vec::new()));
+        let handle = writer.inner.clone();
+        let channel = TerminalChatChannel::new(
+            TuiConfig {
+                enabled: true,
+                session_id: "local".to_string(),
+                channel_events: ChannelEventMode::Compact,
+            },
+            "codex",
+            vec!["codex".to_string(), "claude".to_string()],
+            Some("/tmp/agent-router.log".to_string()),
+            Arc::new(ApprovalBroker::default()),
+        );
+
+        channel.print_header(&writer).unwrap();
+
+        let text = writer_text(&handle);
+        assert!(text.contains("default: codex\n"));
+        assert!(text.contains("agents: codex, claude\n"));
+        assert!(text.contains("switch: /agent <name>\n"));
     }
 
     #[test]
