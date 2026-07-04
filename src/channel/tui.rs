@@ -73,28 +73,34 @@ impl TerminalChatChannel {
                 event = rx.recv(), if !input_closed => {
                     match event {
                         Some(TerminalInput::Prompt(text)) => {
-                            let replaces_active_turn = prompt_replaces_active_turn(&text);
-                            let status_message = turn_status_message(
-                                &text,
-                                replaces_active_turn && active_prompt_turns > 0,
-                            );
+                            if active_prompt_turns > 0 && !can_route_during_active_prompt(&text) {
+                                writer.write_str(
+                                    "\nbusy> input was not sent; only /stop, /approve, and /deny are accepted while this turn runs.\n",
+                                )?;
+                                continue;
+                            }
+
+                            let turn_kind = TerminalTurnKind::from_text(&text);
+                            let status_message = turn_status_message(&text);
                             let status = TerminalStatus::start(writer.clone(), status_message);
                             let ticket = match begin_tui_text(router.clone(), session_key.clone(), text).await {
                                 Ok(Some(ticket)) => ticket,
                                 Ok(None) => {
                                     drop(status);
+                                    write_ready_prompt(&writer, active_prompt_turns)?;
                                     continue;
                                 }
                                 Err(err) => {
                                     drop(status);
-                                    writer.write_str(&format!("\nerror> {err}\n> "))?;
+                                    writer.write_str(&format!("\nerror> {err}\n"))?;
+                                    write_ready_prompt(&writer, active_prompt_turns)?;
                                     continue;
                                 }
                             };
                             let writer = writer.clone();
                             let channel_events = self.cfg.channel_events;
                             let router = router.clone();
-                            if replaces_active_turn {
+                            if turn_kind.is_prompt() {
                                 active_prompt_turns += 1;
                             }
                             turns.spawn(async move {
@@ -106,7 +112,7 @@ impl TerminalChatChannel {
                                 if let Err(err) = finish_tui_text(router, ticket, &mut output).await {
                                     let _ = writer.write_str(&format!("\nerror> {err}\n"));
                                 }
-                                replaces_active_turn
+                                turn_kind
                             });
                         }
                         Some(TerminalInput::EndOfInput) | None => {
@@ -123,14 +129,17 @@ impl TerminalChatChannel {
                 }
                 result = turns.join_next(), if !turns.is_empty() => {
                     match result {
-                        Some(Ok(replaces_active_turn)) => {
-                            if replaces_active_turn {
+                        Some(Ok(turn_kind)) => {
+                            if turn_kind.is_prompt() {
                                 active_prompt_turns = active_prompt_turns.saturating_sub(1);
                             }
-                            writer.write_str("\n> ")?
+                            write_ready_prompt(&writer, active_prompt_turns)?;
                         }
                         Some(Err(err)) if err.is_cancelled() => {}
-                        Some(Err(err)) => writer.write_str(&format!("\nerror> terminal turn task failed: {err}\n> "))?,
+                        Some(Err(err)) => {
+                            writer.write_str(&format!("\nerror> terminal turn task failed: {err}\n"))?;
+                            write_ready_prompt(&writer, active_prompt_turns)?;
+                        }
                         None => {}
                     }
                 }
@@ -166,7 +175,40 @@ pub(crate) fn tui_session_key(session_id: &str) -> String {
     format!("tui:user:local:{}", session_id.trim())
 }
 
-fn turn_status_message(text: &str, replacing_active_turn: bool) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalTurnKind {
+    Prompt,
+    Control,
+}
+
+impl TerminalTurnKind {
+    fn from_text(text: &str) -> Self {
+        if is_prompt_turn_input(text) {
+            Self::Prompt
+        } else {
+            Self::Control
+        }
+    }
+
+    fn is_prompt(self) -> bool {
+        matches!(self, Self::Prompt)
+    }
+}
+
+fn write_ready_prompt<W>(
+    writer: &SharedTerminalWriter<W>,
+    active_prompt_turns: usize,
+) -> anyhow::Result<()>
+where
+    W: Write + Send + 'static,
+{
+    if active_prompt_turns == 0 {
+        writer.write_str("\n> ")?;
+    }
+    Ok(())
+}
+
+fn turn_status_message(text: &str) -> String {
     let command = text.trim().split_whitespace().next().unwrap_or("");
     if is_approval_command(text) {
         return "resolving approval".to_string();
@@ -174,24 +216,23 @@ fn turn_status_message(text: &str, replacing_active_turn: bool) -> String {
     if command == "/stop" {
         return "stopping active turn".to_string();
     }
-    if replacing_active_turn
-        && !matches!(command, "/agent" | "/yolo")
-        && !is_slash_command_input(text)
-    {
-        return "replacing active turn".to_string();
-    }
     if is_slash_command_input(text) {
         return "handling slash command".to_string();
     }
     "waiting for output".to_string()
 }
 
-fn prompt_replaces_active_turn(text: &str) -> bool {
+fn is_prompt_turn_input(text: &str) -> bool {
     let text = text.trim();
     let command = text.split_whitespace().next().unwrap_or("");
     !is_approval_command(text)
         && !matches!(command, "/stop" | "/agent" | "/yolo")
         && !is_slash_command_input(text)
+}
+
+fn can_route_during_active_prompt(text: &str) -> bool {
+    let command = text.trim().split_whitespace().next().unwrap_or("");
+    command == "/stop" || is_approval_command(text)
 }
 
 #[cfg(test)]
@@ -532,7 +573,7 @@ where
             let result = tokio::select! {
                 biased;
                 _ = prompt.cancelled() => continue,
-                result = async { writer.write_str(&format!("\napproval>\n{text}\n> ")) } => result,
+                result = async { writer.write_str(&format!("\napproval>\n{text}\napproval-input> ")) } => result,
             };
             if let Err(err) = result {
                 tracing::warn!(error = %err, "failed to write terminal approval prompt");
@@ -575,33 +616,34 @@ mod tests {
 
     #[test]
     fn turn_status_message_describes_local_state() {
-        assert_eq!(turn_status_message("/stop", false), "stopping active turn");
+        assert_eq!(turn_status_message("/stop"), "stopping active turn");
+        assert_eq!(turn_status_message("/approve 1"), "resolving approval");
         assert_eq!(
-            turn_status_message("/approve 1", true),
-            "resolving approval"
-        );
-        assert_eq!(
-            turn_status_message("/agent status", true),
+            turn_status_message("/agent status"),
             "handling slash command"
         );
-        assert_eq!(
-            turn_status_message("new prompt", true),
-            "replacing active turn"
-        );
-        assert_eq!(
-            turn_status_message("new prompt", false),
-            "waiting for output"
-        );
+        assert_eq!(turn_status_message("new prompt"), "waiting for output");
     }
 
     #[test]
-    fn prompt_replacement_status_matches_router_intake_shape() {
-        assert!(prompt_replaces_active_turn("normal prompt"));
-        assert!(!prompt_replaces_active_turn("/stop"));
-        assert!(!prompt_replaces_active_turn("/agent codex"));
-        assert!(!prompt_replaces_active_turn("/yolo on"));
-        assert!(!prompt_replaces_active_turn("/approve 1"));
-        assert!(!prompt_replaces_active_turn("//agent-owned-command"));
+    fn prompt_turn_tracking_matches_router_intake_shape() {
+        assert!(is_prompt_turn_input("normal prompt"));
+        assert!(!is_prompt_turn_input("/stop"));
+        assert!(!is_prompt_turn_input("/agent codex"));
+        assert!(!is_prompt_turn_input("/yolo on"));
+        assert!(!is_prompt_turn_input("/approve 1"));
+        assert!(!is_prompt_turn_input("//agent-owned-command"));
+    }
+
+    #[test]
+    fn running_prompt_policy_only_allows_controls() {
+        assert!(!can_route_during_active_prompt("normal prompt"));
+        assert!(can_route_during_active_prompt("/stop"));
+        assert!(can_route_during_active_prompt("/approve 1"));
+        assert!(can_route_during_active_prompt("/deny 1"));
+        assert!(!can_route_during_active_prompt("/agent status"));
+        assert!(!can_route_during_active_prompt("/yolo on"));
+        assert!(!can_route_during_active_prompt("//agent-owned-command"));
     }
 
     #[tokio::test]
