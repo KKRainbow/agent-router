@@ -24,9 +24,26 @@ const TELEGRAM_API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEGRAM_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TELEGRAM_GET_UPDATES_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
+const TELEGRAM_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(4);
 const TELEGRAM_REPLY_DRAFT_PREVIEW_MAX_BYTES: usize = 3500;
 const TELEGRAM_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
 const TELEGRAM_REPLY_DRAFT_MARKER: &str = "[router-draft]";
+
+struct TypingRefreshGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TypingRefreshGuard {
+    fn stop(&self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for TypingRefreshGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TelegramBotChannel {
@@ -166,6 +183,7 @@ impl TelegramBotChannel {
             text_len = message.text.len(),
             "routing Telegram message"
         );
+        let typing = self.spawn_typing_refresh(message.target.clone(), message.session_key.clone());
         let mut output = ChannelOutputSink::new(
             TelegramReplyPort {
                 channel: self.clone(),
@@ -173,7 +191,9 @@ impl TelegramBotChannel {
             message.target,
             telegram_output_policy(self.cfg.channel_events),
         );
-        router.finish_channel_input(ticket, None, &mut output).await
+        let result = router.finish_channel_input(ticket, None, &mut output).await;
+        typing.stop();
+        result
     }
 
     fn spawn_approval_notifier(self: Arc<Self>) {
@@ -259,6 +279,37 @@ impl TelegramBotChannel {
             first_id.get_or_insert_with(|| sent.message_id.to_string());
         }
         Ok(first_id)
+    }
+
+    fn spawn_typing_refresh(
+        &self,
+        target: TelegramReplyTarget,
+        session_key: String,
+    ) -> TypingRefreshGuard {
+        let channel = self.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                if let Err(err) = channel.send_typing_action(&target).await {
+                    tracing::debug!(
+                        error = %err,
+                        session_key = %session_key,
+                        "failed to send Telegram typing action"
+                    );
+                }
+                tokio::time::sleep(TELEGRAM_TYPING_REFRESH_INTERVAL).await;
+            }
+        });
+        TypingRefreshGuard { handle }
+    }
+
+    async fn send_typing_action(&self, target: &TelegramReplyTarget) -> anyhow::Result<()> {
+        let _: bool = self
+            .api_request(
+                "sendChatAction",
+                telegram_chat_action_body(target, "typing"),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn update_text_message(
@@ -678,6 +729,17 @@ fn telegram_send_message_body(target: &TelegramReplyTarget, text: &str) -> Value
     let mut body = json!({
         "chat_id": telegram_id_value(&target.chat_id),
         "text": telegram_nonempty_text(text),
+    });
+    if let Some(message_thread_id) = &target.message_thread_id {
+        body["message_thread_id"] = telegram_id_value(message_thread_id);
+    }
+    body
+}
+
+fn telegram_chat_action_body(target: &TelegramReplyTarget, action: &str) -> Value {
+    let mut body = json!({
+        "chat_id": telegram_id_value(&target.chat_id),
+        "action": action,
     });
     if let Some(message_thread_id) = &target.message_thread_id {
         body["message_thread_id"] = telegram_id_value(message_thread_id);
@@ -1181,6 +1243,34 @@ mod tests {
             &bot(),
         );
         assert!(empty.is_none());
+    }
+
+    #[test]
+    fn typing_action_body_includes_message_thread_id_when_present() {
+        let target = TelegramReplyTarget {
+            chat_id: "123".to_string(),
+            message_thread_id: Some("35".to_string()),
+        };
+
+        let body = telegram_chat_action_body(&target, "typing");
+
+        assert_eq!(body["chat_id"], 123);
+        assert_eq!(body["message_thread_id"], 35);
+        assert_eq!(body["action"], "typing");
+    }
+
+    #[test]
+    fn typing_action_body_omits_message_thread_id_when_absent() {
+        let target = TelegramReplyTarget {
+            chat_id: "123".to_string(),
+            message_thread_id: None,
+        };
+
+        let body = telegram_chat_action_body(&target, "typing");
+
+        assert_eq!(body["chat_id"], 123);
+        assert!(body.get("message_thread_id").is_none());
+        assert_eq!(body["action"], "typing");
     }
 
     #[test]
