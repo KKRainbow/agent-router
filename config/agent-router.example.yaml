@@ -103,6 +103,19 @@ qq:
   allowed_users: []
   allowed_groups: []
 
+# telegram:
+#   # Optional. When omitted, Telegram is enabled if bot_token is configured.
+#   # enabled: true
+#   # channel_events: off | compact | verbose
+#   # compact groups useful turn activity and suppresses single successful tool calls.
+#   channel_events: compact
+#   # Prefer environment variables for secrets:
+#   # TELEGRAM_BOT_TOKEN=123456:...
+#   require_mention: true
+#   allowed_users: []
+#   allowed_chats: []
+#   poll_timeout_secs: 30
+
 web:
   # Local browser chat UI. Frontend assets are embedded into the Rust binary at
   # build time from web/dist; run `npm --prefix web run build` before packaging.

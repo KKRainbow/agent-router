@@ -33,6 +33,11 @@ Channels:
 - Tencent QQ Official Bot Gateway
 - Local browser web chat
 
+Planned/supporting implementation targets:
+
+- Telegram Bot API long polling with topic-aware sessions
+  ([design](docs/workflows/telegram-topic-mode.md))
+
 Agent integrations:
 
 - Kimi through ACP, for example `kimi acp`
@@ -164,6 +169,17 @@ QQ_ALLOWED_USERS=...
 QQ_ALLOWED_GROUPS=...
 ```
 
+Telegram:
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:...
+TELEGRAM_REQUIRE_MENTION=true
+```
+
+Telegram support is designed around Bot API long polling and forum topic
+isolation. See the
+[Telegram Topic Mode workflow](docs/workflows/telegram-topic-mode.md).
+
 Web chat:
 
 ```bash
@@ -208,6 +224,12 @@ qq:
   allowed_users: []
   allowed_groups: []
 
+telegram:
+  require_mention: true
+  allowed_users: []
+  allowed_chats: []
+  poll_timeout_secs: 30
+
 web:
   enabled: false
   bind: 127.0.0.1:8787
@@ -243,6 +265,7 @@ session key.
 - [Session Executor Routing Workflow](docs/workflows/session-executor-routing.md)
 - [Remote Machines, Workspaces, and Skill Collection](docs/workflows/remote-machines.md)
 - [Slack User Token Proxy Workflow](docs/workflows/slack-user-token-proxy.md)
+- [Telegram Topic Mode Workflow](docs/workflows/telegram-topic-mode.md)
 - [ADR 0001: Split Channel Router From Agent Runtime](docs/adr/0001-router-runtime-boundary.md)
 - [ADR 0002: Use ACP as the First Backend Protocol](docs/adr/0002-acp-first-backend-protocol.md)
 - [ADR 0003: Default Executor, Active Executor, and Shared Context](docs/adr/0003-default-active-executor-context.md)
