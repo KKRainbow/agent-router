@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::{
-    approval::SharedApprovalBroker,
+    approval::{ApprovalPrompt, ApprovalResolveAction, SharedApprovalBroker},
     channel::{
         EventDeduper,
         output::{ChannelOutputPolicy, ChannelOutputSink, ChannelReplyPort, PostedMessage},
@@ -37,6 +37,9 @@ const TELEGRAM_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(4);
 const TELEGRAM_REPLY_DRAFT_PREVIEW_MAX_BYTES: usize = 3500;
 const TELEGRAM_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
 const TELEGRAM_REPLY_DRAFT_MARKER: &str = "[router-draft]";
+const TELEGRAM_APPROVAL_CALLBACK_PREFIX: &str = "ar:";
+const TELEGRAM_CALLBACK_DATA_MAX_BYTES: usize = 64;
+const TELEGRAM_CALLBACK_ANSWER_MAX_CHARS: usize = 200;
 
 struct TypingRefreshGuard {
     active_typing: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
@@ -163,6 +166,11 @@ impl TelegramBotChannel {
             return Ok(());
         }
 
+        if let Some(callback_query) = update.callback_query.clone() {
+            self.handle_callback_query(callback_query).await?;
+            return Ok(());
+        }
+
         let Some(message) = parse_inbound_update(update, &self.cfg, bot) else {
             return Ok(());
         };
@@ -219,6 +227,91 @@ impl TelegramBotChannel {
         result
     }
 
+    async fn handle_callback_query(&self, callback: TelegramCallbackQuery) -> anyhow::Result<()> {
+        let Some(data) = callback.data.as_deref() else {
+            return Ok(());
+        };
+        if !data.starts_with(TELEGRAM_APPROVAL_CALLBACK_PREFIX) {
+            return Ok(());
+        }
+        let Some(action) = parse_telegram_approval_callback(data) else {
+            self.answer_callback_query(&callback.id, "Invalid approval action.")
+                .await?;
+            return Ok(());
+        };
+
+        let user_id = callback.from.id.to_string();
+        if !allowed_by_set(&self.cfg.allowed_users, Some(&user_id)) {
+            self.answer_callback_query(&callback.id, "This user is not allowed.")
+                .await?;
+            return Ok(());
+        }
+
+        let Some(message) = callback.message else {
+            self.answer_callback_query(&callback.id, "Approval message is unavailable.")
+                .await?;
+            return Ok(());
+        };
+        let chat_id = message.chat.id.to_string();
+        if !allowed_by_set(&self.cfg.allowed_chats, Some(&chat_id)) {
+            self.answer_callback_query(&callback.id, "This chat is not allowed.")
+                .await?;
+            return Ok(());
+        }
+        let Some(session_key) = telegram_session_key(&message.chat, message.message_thread_id)
+        else {
+            self.answer_callback_query(&callback.id, "Unsupported chat type.")
+                .await?;
+            return Ok(());
+        };
+
+        let reply = self
+            .approvals
+            .resolve_action(
+                &session_key,
+                &action.approval_id,
+                action.action.clone(),
+                Some(&user_id),
+            )
+            .await;
+        if let Err(err) = self.answer_callback_query(&callback.id, &reply.text).await {
+            tracing::warn!(
+                approval_id = %action.approval_id,
+                user_id = %user_id,
+                error = %err,
+                "failed to answer Telegram approval callback"
+            );
+        }
+
+        if approval_reply_resolved_for_action(&reply.text, &action.action) {
+            let status = match action.action {
+                ApprovalResolveAction::Approve { .. } => "Approved",
+                ApprovalResolveAction::Deny => "Denied",
+            };
+            let resolved_text = telegram_approval_resolved_text(
+                message.text.as_deref().unwrap_or(""),
+                status,
+                &user_id,
+            );
+            let target = TelegramReplyTarget {
+                chat_id,
+                message_thread_id: message.message_thread_id.map(|id| id.to_string()),
+            };
+            if let Err(err) = self
+                .update_text_message(&target, &message.message_id.to_string(), &resolved_text)
+                .await
+            {
+                tracing::warn!(
+                    approval_id = %action.approval_id,
+                    user_id = %user_id,
+                    error = %err,
+                    "failed to update Telegram approval prompt after button action"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn spawn_approval_notifier(self: Arc<Self>) {
         let mut prompts = self.approvals.subscribe();
         let prompt_channel = self.clone();
@@ -241,7 +334,7 @@ impl TelegramBotChannel {
                 tokio::select! {
                     biased;
                     _ = prompt.cancelled() => continue,
-                    result = prompt_channel.post_text_message(&target, &text) => {
+                    result = prompt_channel.post_approval_prompt(&target, &prompt, &text) => {
                         if let Err(err) = result {
                             tracing::warn!(error = %err, "failed to post Telegram approval prompt");
                         }
@@ -284,12 +377,52 @@ impl TelegramBotChannel {
     async fn get_updates(&self, offset: Option<i64>) -> anyhow::Result<Vec<TelegramUpdate>> {
         let mut body = json!({
             "timeout": self.cfg.poll_timeout_secs,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         });
         if let Some(offset) = offset {
             body["offset"] = Value::from(offset);
         }
         self.api_request("getUpdates", body).await
+    }
+
+    async fn post_approval_prompt(
+        &self,
+        target: &TelegramReplyTarget,
+        prompt: &ApprovalPrompt,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let Some(reply_markup) = telegram_approval_reply_markup(prompt) else {
+            self.post_text_message(target, text).await?;
+            return Ok(());
+        };
+
+        for mut body in
+            telegram_send_message_bodies_with_reply_markup(target, text, Some(reply_markup))
+        {
+            let has_reply_markup = body.get("reply_markup").is_some();
+            match self
+                .api_request::<TelegramSentMessage>("sendMessage", body.clone())
+                .await
+            {
+                Ok(_) => {}
+                Err(err)
+                    if has_reply_markup && telegram_error_allows_approval_markup_fallback(&err) =>
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "Telegram approval inline keyboard was rejected; retrying fragment as text"
+                    );
+                    if let Some(body) = body.as_object_mut() {
+                        body.remove("reply_markup");
+                    }
+                    self.api_request::<TelegramSentMessage>("sendMessage", body)
+                        .await?;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 
     async fn post_text_message(
@@ -304,7 +437,6 @@ impl TelegramBotChannel {
         }
         Ok(first_id)
     }
-
     async fn post_markdown_message(
         &self,
         target: &TelegramReplyTarget,
@@ -418,6 +550,16 @@ impl TelegramBotChannel {
     ) -> anyhow::Result<()> {
         let body = telegram_delete_message_body(target, message_id)?;
         let _: bool = self.api_request("deleteMessage", body).await?;
+        Ok(())
+    }
+
+    async fn answer_callback_query(&self, callback_id: &str, text: &str) -> anyhow::Result<()> {
+        let _: bool = self
+            .api_request(
+                "answerCallbackQuery",
+                telegram_answer_callback_query_body(callback_id, text),
+            )
+            .await?;
         Ok(())
     }
 
@@ -565,6 +707,15 @@ struct TelegramBotIdentity {
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
+    callback_query: Option<TelegramCallbackQuery>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    from: TelegramUser,
+    message: Option<TelegramMessage>,
+    data: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -632,6 +783,12 @@ struct TelegramInboundMessage {
     user_id: Option<String>,
     text: String,
     target: TelegramReplyTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramApprovalCallback {
+    approval_id: String,
+    action: ApprovalResolveAction,
 }
 
 fn parse_inbound_update(
@@ -810,10 +967,22 @@ fn is_telegram_mention_punctuation(ch: char) -> bool {
 }
 
 fn telegram_send_message_bodies(target: &TelegramReplyTarget, text: &str) -> Vec<Value> {
-    telegram_message_chunks(text)
+    telegram_send_message_bodies_with_reply_markup(target, text, None)
+}
+
+fn telegram_send_message_bodies_with_reply_markup(
+    target: &TelegramReplyTarget,
+    text: &str,
+    reply_markup: Option<Value>,
+) -> Vec<Value> {
+    let mut bodies = telegram_message_chunks(text)
         .into_iter()
         .map(|chunk| telegram_send_message_body(target, &chunk))
-        .collect()
+        .collect::<Vec<_>>();
+    if let (Some(reply_markup), Some(body)) = (reply_markup, bodies.last_mut()) {
+        body["reply_markup"] = reply_markup;
+    }
+    bodies
 }
 
 fn telegram_markdown_message_bodies(target: &TelegramReplyTarget, text: &str) -> Vec<Value> {
@@ -845,6 +1014,113 @@ fn telegram_send_message_body(target: &TelegramReplyTarget, text: &str) -> Value
         body["message_thread_id"] = telegram_id_value(message_thread_id);
     }
     body
+}
+
+fn telegram_approval_reply_markup(prompt: &ApprovalPrompt) -> Option<Value> {
+    let selectable_options = prompt
+        .options
+        .iter()
+        .filter(|option| !option.is_deny())
+        .collect::<Vec<_>>();
+    let mut buttons = selectable_options
+        .iter()
+        .map(|option| {
+            let explicit_option = selectable_options.len() > 1 || !option.kind.starts_with("allow");
+            let option_id = explicit_option.then_some(option.id.as_str());
+            let callback_data = telegram_approval_callback_data(
+                &prompt.id,
+                ApprovalResolveAction::Approve {
+                    option_id: option_id.map(ToOwned::to_owned),
+                },
+            )?;
+            Some(json!({
+                "text": telegram_approval_button_label(prompt, option),
+                "callback_data": callback_data,
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    buttons.push(json!({
+        "text": "Deny",
+        "callback_data": telegram_approval_callback_data(&prompt.id, ApprovalResolveAction::Deny)?,
+    }));
+    Some(json!({
+        "inline_keyboard": [buttons],
+    }))
+}
+
+fn telegram_approval_button_label<'a>(
+    prompt: &ApprovalPrompt,
+    option: &'a crate::approval::ApprovalOption,
+) -> &'a str {
+    let selectable_count = prompt
+        .options
+        .iter()
+        .filter(|option| !option.is_deny())
+        .count();
+    if selectable_count == 1 && option.kind.starts_with("allow") {
+        "Approve"
+    } else {
+        &option.name
+    }
+}
+
+fn telegram_approval_callback_data(
+    approval_id: &str,
+    action: ApprovalResolveAction,
+) -> Option<String> {
+    let data = match action {
+        ApprovalResolveAction::Approve { option_id: None } => {
+            format!("{TELEGRAM_APPROVAL_CALLBACK_PREFIX}a:{approval_id}")
+        }
+        ApprovalResolveAction::Approve {
+            option_id: Some(option_id),
+        } => format!("{TELEGRAM_APPROVAL_CALLBACK_PREFIX}a:{approval_id}:{option_id}"),
+        ApprovalResolveAction::Deny => {
+            format!("{TELEGRAM_APPROVAL_CALLBACK_PREFIX}d:{approval_id}")
+        }
+    };
+    (data.len() <= TELEGRAM_CALLBACK_DATA_MAX_BYTES).then_some(data)
+}
+
+fn parse_telegram_approval_callback(data: &str) -> Option<TelegramApprovalCallback> {
+    let payload = data.strip_prefix(TELEGRAM_APPROVAL_CALLBACK_PREFIX)?;
+    let mut parts = payload.splitn(3, ':');
+    let action = parts.next()?;
+    let approval_id = parts.next()?.to_string();
+    if approval_id.is_empty() {
+        return None;
+    }
+    let action = match action {
+        "a" => ApprovalResolveAction::Approve {
+            option_id: parts
+                .next()
+                .filter(|option_id| !option_id.is_empty())
+                .map(ToOwned::to_owned),
+        },
+        "d" => ApprovalResolveAction::Deny,
+        _ => return None,
+    };
+    Some(TelegramApprovalCallback {
+        approval_id,
+        action,
+    })
+}
+
+fn telegram_approval_resolved_text(original_text: &str, status: &str, user_id: &str) -> String {
+    let suffix = format!("{status} by Telegram user {user_id}.");
+    let original_text = original_text.trim();
+    if original_text.is_empty() {
+        suffix
+    } else {
+        format!("{original_text}\n\n{suffix}")
+    }
+}
+
+fn approval_reply_resolved_for_action(text: &str, action: &ApprovalResolveAction) -> bool {
+    match action {
+        ApprovalResolveAction::Approve { .. } => text.starts_with("Approved "),
+        ApprovalResolveAction::Deny => text.starts_with("Denied "),
+    }
 }
 
 fn telegram_markdown_message_body(target: &TelegramReplyTarget, text: &str) -> Value {
@@ -914,6 +1190,26 @@ fn telegram_delete_message_body(
         "chat_id": telegram_id_value(&target.chat_id),
         "message_id": message_id,
     }))
+}
+
+fn telegram_answer_callback_query_body(callback_id: &str, text: &str) -> Value {
+    json!({
+        "callback_query_id": callback_id,
+        "text": telegram_callback_answer_text(text),
+    })
+}
+
+fn telegram_callback_answer_text(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= TELEGRAM_CALLBACK_ANSWER_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut truncated = text
+        .chars()
+        .take(TELEGRAM_CALLBACK_ANSWER_MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn telegram_message_chunks(text: &str) -> Vec<String> {
@@ -1430,6 +1726,21 @@ fn telegram_error_is_auth_failure(err: &anyhow::Error) -> bool {
         .is_some_and(TelegramApiError::is_auth_failure)
 }
 
+fn telegram_error_allows_approval_markup_fallback(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TelegramApiError>().is_some_and(|err| {
+        err.method == "sendMessage"
+            && err.error_code == Some(400)
+            && telegram_error_description_is_markup_rejection(&err.description)
+    })
+}
+
+fn telegram_error_description_is_markup_rejection(description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    description.contains("reply markup")
+        || description.contains("button")
+        || description.contains("callback")
+}
+
 impl TelegramApiError {
     fn is_auth_failure(&self) -> bool {
         let description = self.description.to_ascii_lowercase();
@@ -1470,9 +1781,15 @@ impl std::error::Error for TelegramTransportError {}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, sync::Arc};
+
+    use crate::approval::{
+        ApprovalBroker, ApprovalOption, ApprovalRequest, ApprovalResolution,
+        ApprovalResolverPolicy, ApprovalScope,
+    };
 
     use serde_json::json;
+    use tokio::task::JoinHandle;
 
     use super::*;
 
@@ -1492,6 +1809,43 @@ mod tests {
         TelegramBotIdentity {
             id: "42".to_string(),
             username: "router_bot".to_string(),
+        }
+    }
+
+    async fn test_approval_prompt(
+        options: Vec<ApprovalOption>,
+    ) -> (
+        Arc<ApprovalBroker>,
+        ApprovalPrompt,
+        JoinHandle<ApprovalResolution>,
+    ) {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let mut prompts = broker.subscribe();
+        let task_broker = broker.clone();
+        let handle = tokio::spawn(async move {
+            task_broker
+                .request_resolution(ApprovalRequest {
+                    session_key: "telegram:private:123".to_string(),
+                    executor: "codex".to_string(),
+                    requester_user_id: Some("7".to_string()),
+                    resolver_policy: ApprovalResolverPolicy::Requester,
+                    scope: ApprovalScope::ToolPermission,
+                    title: "Run command".to_string(),
+                    body: "echo hi".to_string(),
+                    options,
+                })
+                .await
+        });
+        let prompt = prompts.recv().await.unwrap();
+        (broker, prompt, handle)
+    }
+
+    fn approval_option(id: &str, kind: &str, name: &str) -> ApprovalOption {
+        ApprovalOption {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            auto_approvable: false,
         }
     }
 
@@ -2060,6 +2414,142 @@ mod tests {
                 .iter()
                 .all(|body| body["message_thread_id"] == json!(77))
         );
+    }
+
+    #[tokio::test]
+    async fn approval_reply_markup_uses_inline_keyboard_buttons() {
+        let (broker, prompt, handle) = test_approval_prompt(vec![
+            approval_option("allow_once", "allow_once", "Allow once"),
+            approval_option("deny", "reject_once", "Deny"),
+        ])
+        .await;
+
+        let markup = telegram_approval_reply_markup(&prompt).unwrap();
+        let buttons = markup["inline_keyboard"][0].as_array().unwrap();
+
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0]["text"], "Approve");
+        assert_eq!(buttons[0]["callback_data"], format!("ar:a:{}", prompt.id));
+        assert_eq!(buttons[1]["text"], "Deny");
+        assert_eq!(buttons[1]["callback_data"], format!("ar:d:{}", prompt.id));
+
+        let parsed =
+            parse_telegram_approval_callback(buttons[0]["callback_data"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(parsed.approval_id, prompt.id);
+        assert_eq!(
+            parsed.action,
+            ApprovalResolveAction::Approve { option_id: None }
+        );
+
+        let reply = broker
+            .resolve_action(
+                &prompt.session_key,
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("7"),
+            )
+            .await;
+        assert!(reply.text.starts_with("Denied "));
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_reply_markup_includes_explicit_option_ids_when_needed() {
+        let (broker, prompt, handle) = test_approval_prompt(vec![
+            approval_option("read", "allow_read", "Read"),
+            approval_option("write", "allow_write", "Write"),
+            approval_option("deny", "reject_once", "Deny"),
+        ])
+        .await;
+
+        let markup = telegram_approval_reply_markup(&prompt).unwrap();
+        let buttons = markup["inline_keyboard"][0].as_array().unwrap();
+
+        assert_eq!(buttons[0]["text"], "Read");
+        assert_eq!(
+            buttons[0]["callback_data"],
+            format!("ar:a:{}:read", prompt.id)
+        );
+        assert_eq!(buttons[1]["text"], "Write");
+        assert_eq!(
+            buttons[1]["callback_data"],
+            format!("ar:a:{}:write", prompt.id)
+        );
+
+        let parsed =
+            parse_telegram_approval_callback(buttons[1]["callback_data"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            parsed.action,
+            ApprovalResolveAction::Approve {
+                option_id: Some("write".to_string())
+            }
+        );
+
+        let reply = broker
+            .resolve_action(
+                &prompt.session_key,
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("7"),
+            )
+            .await;
+        assert!(reply.text.starts_with("Denied "));
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn approval_callback_data_preserves_colons_and_respects_telegram_limit() {
+        let parsed = parse_telegram_approval_callback("ar:a:17:allow:danger").unwrap();
+
+        assert_eq!(parsed.approval_id, "17");
+        assert_eq!(
+            parsed.action,
+            ApprovalResolveAction::Approve {
+                option_id: Some("allow:danger".to_string())
+            }
+        );
+        assert!(
+            telegram_approval_callback_data(
+                "17",
+                ApprovalResolveAction::Approve {
+                    option_id: Some("x".repeat(80)),
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn approval_reply_markup_is_attached_to_last_message_chunk() {
+        let target = TelegramReplyTarget {
+            chat_id: "-100".to_string(),
+            message_thread_id: Some("77".to_string()),
+        };
+        let text = format!("{}{}", "a".repeat(TELEGRAM_MESSAGE_CHAR_LIMIT), "b");
+        let markup = json!({
+            "inline_keyboard": [[{"text": "Approve", "callback_data": "ar:a:1"}]],
+        });
+
+        let bodies = telegram_send_message_bodies_with_reply_markup(&target, &text, Some(markup));
+
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].get("reply_markup").is_none());
+        assert_eq!(
+            bodies[1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "ar:a:1"
+        );
+        assert_eq!(bodies[1]["message_thread_id"], 77);
+    }
+
+    #[test]
+    fn telegram_callback_answer_text_is_truncated_to_bot_api_limit() {
+        let text =
+            telegram_callback_answer_text(&"a".repeat(TELEGRAM_CALLBACK_ANSWER_MAX_CHARS + 1));
+
+        assert_eq!(text.chars().count(), TELEGRAM_CALLBACK_ANSWER_MAX_CHARS);
+        assert!(text.ends_with("..."));
     }
 
     #[test]

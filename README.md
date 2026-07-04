@@ -207,6 +207,10 @@ TELEGRAM_REQUIRE_MENTION=true
 Telegram support is designed around Bot API long polling and forum topic
 isolation. See the
 [Telegram Topic Mode workflow](docs/workflows/telegram-topic-mode.md).
+Approval prompts use Telegram inline keyboard buttons when possible and keep
+`/approve` and `/deny` text commands as fallback. Long polling subscribes to
+both `message` and `callback_query` updates, so no webhook is required for
+button clicks.
 
 Web chat:
 

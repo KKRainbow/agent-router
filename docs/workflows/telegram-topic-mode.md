@@ -1,9 +1,9 @@
 # Telegram Topic Mode
 
 Telegram support is implemented as a channel adapter that treats a private chat,
-group chat, or forum topic as the router session boundary. The first version
-uses the Bot API `getUpdates` long-polling API. Webhooks, media handling, inline
-keyboard approvals, and topic administration are outside this workflow.
+group chat, or forum topic as the router session boundary. The channel uses the
+Bot API `getUpdates` long-polling API. Webhooks, media handling, and topic
+administration are outside this workflow.
 
 ## Update Intake
 
@@ -12,11 +12,11 @@ username. Before polling it calls `deleteWebhook` with
 `drop_pending_updates=false` so long polling can receive the existing update
 stream without discarding messages.
 
-Polling uses `getUpdates` with `allowed_updates=["message"]`, a configured
-timeout, and a monotonically increasing offset. Each processed `update_id`
-advances the offset to `update_id + 1`. Empty text messages, messages sent by
-the bot itself, duplicate updates, unsupported chat types, and disallowed users
-or chats are ignored.
+Polling uses `getUpdates` with `allowed_updates=["message", "callback_query"]`,
+a configured timeout, and a monotonically increasing offset. Each processed
+`update_id` advances the offset to `update_id + 1`. Empty text messages,
+messages sent by the bot itself, duplicate updates, unsupported chat types, and
+disallowed users or chats are ignored.
 
 ## Session Keys
 
@@ -74,10 +74,39 @@ Replies use the original `chat_id`. Topic replies include the original
 forum topic. `editMessageText` and `deleteMessage` identify an existing message
 with `chat_id` and `message_id`; they do not carry `message_thread_id`.
 
-The first implementation sends plain text only. `sendMessage`, `editMessageText`,
-and `deleteMessage` all target the original chat. Final replies longer than
-Telegram's 4096 character message limit are split into multiple plain-text
-messages, and every `sendMessage` fragment keeps the same topic target.
+Normal assistant output is sent as plain text or Telegram HTML converted from
+router markdown. `sendMessage`, `editMessageText`, and `deleteMessage` all
+target the original chat. Final replies longer than Telegram's 4096 character
+message limit are split into multiple messages, and every `sendMessage` fragment
+keeps the same topic target.
+
+## Approval Buttons
+
+Approval prompts are still rendered as text with `/approve <id>` and `/deny
+<id>` commands so old clients and manual fallback remain usable. When the prompt
+can fit Telegram's inline keyboard constraints, the channel also attaches
+Approve/Deny buttons to the final `sendMessage` fragment.
+
+Telegram callback data is limited to 64 bytes. The channel therefore stores only
+compact routing data in `callback_data`:
+
+```text
+ar:a:<approval_id>
+ar:a:<approval_id>:<option_id>
+ar:d:<approval_id>
+```
+
+The session key is not stored in callback data. On click, the channel derives the
+session from the callback message's `chat_id` and `message_thread_id`, then calls
+the shared approval broker with the clicking Telegram user id. This preserves the
+same resolver checks as text commands: requester-only approvals can only be
+resolved by the requester, and chat/user allow lists are still enforced.
+
+After the broker accepts a click, the channel answers the callback query so the
+Telegram client stops showing the loading spinner, then edits the approval
+message to append `Approved by Telegram user <id>.` or `Denied by Telegram user
+<id>.` and removes the inline keyboard. If Telegram rejects the inline keyboard
+payload, the channel retries the prompt as plain text.
 
 ## Configuration
 
