@@ -459,6 +459,10 @@ impl TelegramReplyTarget {
                 chat_id: (*chat_id).to_string(),
                 message_thread_id: None,
             }),
+            ["telegram", "private", chat_id, "thread", message_thread_id] => Some(Self {
+                chat_id: (*chat_id).to_string(),
+                message_thread_id: Some((*message_thread_id).to_string()),
+            }),
             ["telegram", "chat", chat_id] => Some(Self {
                 chat_id: (*chat_id).to_string(),
                 message_thread_id: None,
@@ -537,7 +541,12 @@ fn parse_inbound_update(
 fn telegram_session_key(chat: &TelegramChat, message_thread_id: Option<i64>) -> Option<String> {
     let chat_id = chat.id;
     match chat.kind.as_str() {
-        "private" => Some(format!("telegram:private:{chat_id}")),
+        "private" => match message_thread_id {
+            Some(message_thread_id) => Some(format!(
+                "telegram:private:{chat_id}:thread:{message_thread_id}"
+            )),
+            None => Some(format!("telegram:private:{chat_id}")),
+        },
         "group" | "supergroup" => match message_thread_id {
             Some(message_thread_id) => {
                 Some(format!("telegram:chat:{chat_id}:topic:{message_thread_id}"))
@@ -858,6 +867,45 @@ mod tests {
                 chat_id: "123".to_string(),
                 message_thread_id: None,
             }
+        );
+    }
+
+    #[test]
+    fn private_thread_message_uses_thread_id_in_session_key_and_target() {
+        let message = parse_inbound_update(
+            update(json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "message_thread_id": 35,
+                    "chat": {"id": 123, "type": "private"},
+                    "from": {"id": 7, "is_bot": false},
+                    "text": " hello "
+                }
+            })),
+            &test_config(true),
+            &bot(),
+        )
+        .unwrap();
+
+        assert_eq!(message.session_key, "telegram:private:123:thread:35");
+        assert_eq!(
+            message.target,
+            TelegramReplyTarget {
+                chat_id: "123".to_string(),
+                message_thread_id: Some("35".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn reply_target_parses_private_thread_session_key() {
+        assert_eq!(
+            TelegramReplyTarget::from_session_key("telegram:private:123:thread:35"),
+            Some(TelegramReplyTarget {
+                chat_id: "123".to_string(),
+                message_thread_id: Some("35".to_string()),
+            })
         );
     }
 
