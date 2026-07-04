@@ -20,6 +20,9 @@ use crate::{
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const TELEGRAM_API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TELEGRAM_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const TELEGRAM_GET_UPDATES_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
 const TELEGRAM_REPLY_DRAFT_PREVIEW_MAX_BYTES: usize = 3500;
 const TELEGRAM_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
@@ -38,7 +41,7 @@ impl TelegramBotChannel {
         Self {
             cfg,
             approvals,
-            http: Client::new(),
+            http: telegram_http_client(),
             seen_updates: Arc::new(Mutex::new(EventDeduper::new(1024))),
         }
     }
@@ -291,6 +294,7 @@ impl TelegramBotChannel {
         let resp = self
             .http
             .post(self.api_url(method))
+            .timeout(telegram_api_timeout(method, self.cfg.poll_timeout_secs))
             .json(&body)
             .send()
             .await
@@ -327,6 +331,14 @@ impl TelegramBotChannel {
         );
         Ok(())
     }
+}
+
+fn telegram_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(TELEGRAM_API_CONNECT_TIMEOUT)
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
+        .build()
+        .expect("Telegram HTTP client configuration must be valid")
 }
 
 #[derive(Clone)]
@@ -643,6 +655,14 @@ fn telegram_send_message_bodies(target: &TelegramReplyTarget, text: &str) -> Vec
         .into_iter()
         .map(|chunk| telegram_send_message_body(target, &chunk))
         .collect()
+}
+
+fn telegram_api_timeout(method: &str, poll_timeout_secs: u64) -> Duration {
+    if method == "getUpdates" {
+        Duration::from_secs(poll_timeout_secs).saturating_add(TELEGRAM_GET_UPDATES_TIMEOUT_GRACE)
+    } else {
+        TELEGRAM_API_REQUEST_TIMEOUT
+    }
 }
 
 fn telegram_send_message_body(target: &TelegramReplyTarget, text: &str) -> Value {
@@ -1171,6 +1191,18 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), TELEGRAM_MESSAGE_CHAR_LIMIT);
         assert_eq!(chunks[1], "你");
+    }
+
+    #[test]
+    fn api_timeout_keeps_long_polling_longer_than_regular_requests() {
+        assert_eq!(
+            telegram_api_timeout("getUpdates", 30),
+            Duration::from_secs(35)
+        );
+        assert_eq!(
+            telegram_api_timeout("sendMessage", 30),
+            TELEGRAM_API_REQUEST_TIMEOUT
+        );
     }
 
     #[tokio::test]

@@ -97,6 +97,29 @@ fn render_unsupported_slash_command(executor: &str, command: &ExecutorSlashComma
     format!("Active executor `{executor}` does not support slash command `{label}` passthrough.")
 }
 
+fn render_executor_failure_reply(executor: &str) -> String {
+    format!(
+        "Executor `{executor}` failed before returning a reply. Check agent-router logs for details."
+    )
+}
+
+async fn send_route_failure_reply(
+    output: &mut dyn RouterOutputSink,
+    executor_name: &str,
+    err: &anyhow::Error,
+) -> anyhow::Result<()> {
+    output.discard_reply_stream().await;
+    if let Err(reply_err) = output
+        .send_final_reply(render_executor_failure_reply(executor_name))
+        .await
+    {
+        anyhow::bail!(
+            "executor `{executor_name}` failed ({err}); also failed to send channel failure reply: {reply_err}"
+        );
+    }
+    Ok(())
+}
+
 fn render_unknown_router_slash_command(text: &str) -> String {
     let trimmed = text.trim();
     let command = trimmed.split_whitespace().next().unwrap_or("/");
@@ -2324,6 +2347,7 @@ Current user message:\n{}",
                     );
                     return Ok(());
                 }
+                send_route_failure_reply(output, &executor_name, &err).await?;
                 return Err(err);
             }
         };
@@ -2555,7 +2579,7 @@ Current user message:\n{}",
                     generation,
                     "router turn failed"
                 );
-                output.discard_reply_stream().await;
+                send_route_failure_reply(output, &executor_name, &err).await?;
                 Err(err)
             }
         }
@@ -5658,6 +5682,8 @@ mod tests {
                 HandoffFailurePhase::Prepare => assert_eq!(err.to_string(), "prepare failed"),
                 HandoffFailurePhase::Prompt => assert_eq!(err.to_string(), "prompt failed"),
             }
+            assert_eq!(output.final_reply(), render_executor_failure_reply("kimi"));
+            assert!(!router.turns.has_current(&session_key).await);
             let saved = store.load(&session_key).await.unwrap().unwrap();
             assert_eq!(saved.active_executor.as_deref(), Some("codex"));
             assert!(saved.active_executor_revision > initial_revision);
@@ -5707,6 +5733,8 @@ mod tests {
                     HandoffFailurePhase::Prepare => assert_eq!(err.to_string(), "prepare failed"),
                     HandoffFailurePhase::Prompt => assert_eq!(err.to_string(), "prompt failed"),
                 }
+                assert_eq!(output.final_reply(), render_executor_failure_reply("kimi"));
+                assert!(!router.turns.has_current(&session_key).await);
                 let saved = store.load(&session_key).await.unwrap().unwrap();
                 assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
                 assert!(saved.transcript.is_empty());

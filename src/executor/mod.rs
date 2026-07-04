@@ -413,7 +413,12 @@ pub(crate) fn summarize_json_rpc_error(error: &Value) -> String {
     } else {
         "absent"
     };
-    format!("code={code}, message={message_state}")
+    let data_state = if error.get("data").is_some() {
+        "present"
+    } else {
+        "absent"
+    };
+    format!("code={code}, message={message_state}, data={data_state}")
 }
 
 #[cfg(test)]
@@ -580,7 +585,7 @@ mod tests {
             "data": {"token": "secret-token"},
         }));
 
-        assert_eq!(summary, "code=-32000, message=omitted");
+        assert_eq!(summary, "code=-32000, message=omitted, data=present");
         assert!(!summary.contains("secret"));
         assert!(!summary.contains("token"));
     }
@@ -592,7 +597,7 @@ mod tests {
             "message": "",
         }));
 
-        assert_eq!(summary, "code=unknown, message=absent");
+        assert_eq!(summary, "code=unknown, message=absent, data=absent");
         assert!(!summary.contains("secret"));
     }
 }
