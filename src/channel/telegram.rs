@@ -310,8 +310,17 @@ impl TelegramBotChannel {
         target: &TelegramReplyTarget,
         text: &str,
     ) -> anyhow::Result<Option<String>> {
+        let html = telegram_markdown_to_html(text);
+        self.post_html_message(target, &html).await
+    }
+
+    async fn post_html_message(
+        &self,
+        target: &TelegramReplyTarget,
+        html: &str,
+    ) -> anyhow::Result<Option<String>> {
         let mut first_id = None;
-        for body in telegram_markdown_message_bodies(target, text) {
+        for body in telegram_html_message_bodies(target, html) {
             let sent: TelegramSentMessage = self.api_request("sendMessage", body).await?;
             first_id.get_or_insert_with(|| sent.message_id.to_string());
         }
@@ -391,12 +400,13 @@ impl TelegramBotChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        if text.chars().count() > TELEGRAM_MESSAGE_CHAR_LIMIT {
+        let html = telegram_markdown_to_html(text);
+        if telegram_html_visible_len(&html) > TELEGRAM_MESSAGE_CHAR_LIMIT {
             self.delete_message(target, message_id).await?;
-            self.post_markdown_message(target, text).await?;
+            self.post_html_message(target, &html).await?;
             return Ok(());
         }
-        let body = telegram_edit_markdown_message_text_body(target, message_id, text)?;
+        let body = telegram_edit_html_message_text_body(target, message_id, &html)?;
         let _: Value = self.api_request("editMessageText", body).await?;
         Ok(())
     }
@@ -807,9 +817,14 @@ fn telegram_send_message_bodies(target: &TelegramReplyTarget, text: &str) -> Vec
 }
 
 fn telegram_markdown_message_bodies(target: &TelegramReplyTarget, text: &str) -> Vec<Value> {
-    telegram_message_chunks(text)
+    let html = telegram_markdown_to_html(text);
+    telegram_html_message_bodies(target, &html)
+}
+
+fn telegram_html_message_bodies(target: &TelegramReplyTarget, html: &str) -> Vec<Value> {
+    telegram_html_message_chunks(html)
         .into_iter()
-        .map(|chunk| telegram_markdown_message_body(target, &chunk))
+        .map(|chunk| telegram_html_message_body(target, &chunk))
         .collect()
 }
 
@@ -834,6 +849,10 @@ fn telegram_send_message_body(target: &TelegramReplyTarget, text: &str) -> Value
 
 fn telegram_markdown_message_body(target: &TelegramReplyTarget, text: &str) -> Value {
     let html = telegram_markdown_to_html(text);
+    telegram_html_message_body(target, &html)
+}
+
+fn telegram_html_message_body(target: &TelegramReplyTarget, html: &str) -> Value {
     let mut body = telegram_send_message_body(target, &html);
     body["parse_mode"] = Value::String(TELEGRAM_PARSE_MODE_HTML.to_string());
     body
@@ -871,7 +890,15 @@ fn telegram_edit_markdown_message_text_body(
     text: &str,
 ) -> anyhow::Result<Value> {
     let html = telegram_markdown_to_html(text);
-    let mut body = telegram_edit_message_text_body(target, message_id, &html)?;
+    telegram_edit_html_message_text_body(target, message_id, &html)
+}
+
+fn telegram_edit_html_message_text_body(
+    target: &TelegramReplyTarget,
+    message_id: &str,
+    html: &str,
+) -> anyhow::Result<Value> {
+    let mut body = telegram_edit_message_text_body(target, message_id, html)?;
     body["parse_mode"] = Value::String(TELEGRAM_PARSE_MODE_HTML.to_string());
     Ok(body)
 }
@@ -912,6 +939,165 @@ fn telegram_message_chunks(text: &str) -> Vec<String> {
     chunks
 }
 
+fn telegram_html_message_chunks(html: &str) -> Vec<String> {
+    if telegram_html_visible_len(html) <= TELEGRAM_MESSAGE_CHAR_LIMIT {
+        return vec![html.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_visible_len = 0;
+    let mut active_tags = Vec::new();
+    let mut cursor = 0;
+    while cursor < html.len() {
+        if let Some(tag_end) = html[cursor..]
+            .strip_prefix('<')
+            .and_then(|_| html[cursor..].find('>').map(|offset| cursor + offset + 1))
+        {
+            let token = &html[cursor..tag_end];
+            if telegram_html_open_tag(token).is_some()
+                && current_visible_len == TELEGRAM_MESSAGE_CHAR_LIMIT
+            {
+                finish_telegram_html_chunk(
+                    &mut current,
+                    &mut current_visible_len,
+                    &active_tags,
+                    &mut chunks,
+                );
+            }
+            current.push_str(token);
+            if let Some(tag) = telegram_html_open_tag(token) {
+                active_tags.push(tag);
+            } else if let Some(kind) = telegram_html_close_tag_kind(token) {
+                pop_telegram_html_tag(&mut active_tags, kind);
+            }
+            cursor = tag_end;
+            continue;
+        }
+
+        if current_visible_len == TELEGRAM_MESSAGE_CHAR_LIMIT {
+            finish_telegram_html_chunk(
+                &mut current,
+                &mut current_visible_len,
+                &active_tags,
+                &mut chunks,
+            );
+        }
+        let token_end = telegram_html_text_token_end(html, cursor);
+        current.push_str(&html[cursor..token_end]);
+        current_visible_len += 1;
+        cursor = token_end;
+    }
+
+    if current_visible_len > 0 {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn telegram_html_visible_len(html: &str) -> usize {
+    let mut len = 0;
+    let mut cursor = 0;
+    while cursor < html.len() {
+        if let Some(tag_end) = html[cursor..]
+            .strip_prefix('<')
+            .and_then(|_| html[cursor..].find('>').map(|offset| cursor + offset + 1))
+        {
+            cursor = tag_end;
+            continue;
+        }
+        cursor = telegram_html_text_token_end(html, cursor);
+        len += 1;
+    }
+    len
+}
+
+fn telegram_html_text_token_end(html: &str, cursor: usize) -> usize {
+    for entity in ["&amp;", "&lt;", "&gt;", "&quot;"] {
+        if html[cursor..].starts_with(entity) {
+            return cursor + entity.len();
+        }
+    }
+    cursor
+        + html[cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0)
+}
+
+fn finish_telegram_html_chunk(
+    current: &mut String,
+    current_visible_len: &mut usize,
+    active_tags: &[TelegramHtmlTag],
+    chunks: &mut Vec<String>,
+) {
+    if *current_visible_len == 0 {
+        return;
+    }
+    for tag in active_tags.iter().rev() {
+        current.push_str(tag.close);
+    }
+    chunks.push(std::mem::take(current));
+    for tag in active_tags {
+        current.push_str(&tag.open);
+    }
+    *current_visible_len = 0;
+}
+
+#[derive(Debug, Clone)]
+struct TelegramHtmlTag {
+    kind: TelegramHtmlTagKind,
+    open: String,
+    close: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramHtmlTagKind {
+    Bold,
+    Italic,
+    Strikethrough,
+    Pre,
+    Code,
+    Link,
+}
+
+fn telegram_html_open_tag(token: &str) -> Option<TelegramHtmlTag> {
+    let (kind, close) = match token {
+        "<b>" => (TelegramHtmlTagKind::Bold, "</b>"),
+        "<i>" => (TelegramHtmlTagKind::Italic, "</i>"),
+        "<s>" => (TelegramHtmlTagKind::Strikethrough, "</s>"),
+        "<pre>" => (TelegramHtmlTagKind::Pre, "</pre>"),
+        "<code>" => (TelegramHtmlTagKind::Code, "</code>"),
+        _ if token.starts_with("<code class=\"language-") => (TelegramHtmlTagKind::Code, "</code>"),
+        _ if token.starts_with("<a href=\"") => (TelegramHtmlTagKind::Link, "</a>"),
+        _ => return None,
+    };
+    Some(TelegramHtmlTag {
+        kind,
+        open: token.to_string(),
+        close,
+    })
+}
+
+fn telegram_html_close_tag_kind(token: &str) -> Option<TelegramHtmlTagKind> {
+    match token {
+        "</b>" => Some(TelegramHtmlTagKind::Bold),
+        "</i>" => Some(TelegramHtmlTagKind::Italic),
+        "</s>" => Some(TelegramHtmlTagKind::Strikethrough),
+        "</pre>" => Some(TelegramHtmlTagKind::Pre),
+        "</code>" => Some(TelegramHtmlTagKind::Code),
+        "</a>" => Some(TelegramHtmlTagKind::Link),
+        _ => None,
+    }
+}
+
+fn pop_telegram_html_tag(active_tags: &mut Vec<TelegramHtmlTag>, kind: TelegramHtmlTagKind) {
+    if active_tags.last().is_some_and(|tag| tag.kind == kind) {
+        active_tags.pop();
+    }
+}
+
 fn telegram_nonempty_text(text: &str) -> &str {
     if text.is_empty() { " " } else { text }
 }
@@ -939,13 +1125,51 @@ fn telegram_markdown_to_html(markdown: &str) -> String {
 struct TelegramMarkdownRenderer {
     out: String,
     lists: Vec<TelegramListState>,
-    link_stack: Vec<bool>,
+    inline_stack: Vec<TelegramInlineScope>,
 }
 
 #[derive(Debug, Clone)]
 struct TelegramListState {
     next: u64,
     ordered: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TelegramInlineScope {
+    tag: Option<TelegramInlineTag>,
+    opened: bool,
+}
+
+#[derive(Debug, Clone)]
+enum TelegramInlineTag {
+    Bold,
+    Italic,
+    Strikethrough,
+    Link(String),
+}
+
+impl TelegramInlineTag {
+    fn open(&self, out: &mut String) {
+        match self {
+            Self::Bold => out.push_str("<b>"),
+            Self::Italic => out.push_str("<i>"),
+            Self::Strikethrough => out.push_str("<s>"),
+            Self::Link(href) => {
+                out.push_str("<a href=\"");
+                push_telegram_html_escaped(out, href, true);
+                out.push_str("\">");
+            }
+        }
+    }
+
+    fn close(&self, out: &mut String) {
+        match self {
+            Self::Bold => out.push_str("</b>"),
+            Self::Italic => out.push_str("</i>"),
+            Self::Strikethrough => out.push_str("</s>"),
+            Self::Link(_) => out.push_str("</a>"),
+        }
+    }
 }
 
 impl TelegramMarkdownRenderer {
@@ -957,8 +1181,9 @@ impl TelegramMarkdownRenderer {
                 self.push_escaped(&text);
             }
             Event::Code(code) => {
+                self.close_open_inline_tags();
                 self.out.push_str("<code>");
-                self.push_escaped(&code);
+                push_telegram_html_escaped(&mut self.out, &code, false);
                 self.out.push_str("</code>");
             }
             Event::SoftBreak | Event::HardBreak => self.out.push('\n'),
@@ -983,10 +1208,14 @@ impl TelegramMarkdownRenderer {
             Tag::Paragraph => self.start_block(),
             Tag::Heading { .. } => {
                 self.start_block();
-                self.out.push_str("<b>");
+                self.inline_stack.push(TelegramInlineScope {
+                    tag: Some(TelegramInlineTag::Bold),
+                    opened: false,
+                });
             }
             Tag::BlockQuote(_) => self.start_block(),
             Tag::CodeBlock(kind) => {
+                self.close_open_inline_tags();
                 self.start_block();
                 match code_block_language(&kind) {
                     Some(language) => {
@@ -1005,17 +1234,23 @@ impl TelegramMarkdownRenderer {
                 });
             }
             Tag::Item => self.start_list_item(),
-            Tag::Emphasis => self.out.push_str("<i>"),
-            Tag::Strong => self.out.push_str("<b>"),
-            Tag::Strikethrough => self.out.push_str("<s>"),
+            Tag::Emphasis => self.inline_stack.push(TelegramInlineScope {
+                tag: Some(TelegramInlineTag::Italic),
+                opened: false,
+            }),
+            Tag::Strong => self.inline_stack.push(TelegramInlineScope {
+                tag: Some(TelegramInlineTag::Bold),
+                opened: false,
+            }),
+            Tag::Strikethrough => self.inline_stack.push(TelegramInlineScope {
+                tag: Some(TelegramInlineTag::Strikethrough),
+                opened: false,
+            }),
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
-                let allowed = telegram_link_href_is_allowed(&dest_url);
-                if allowed {
-                    self.out.push_str("<a href=\"");
-                    self.push_attr_escaped(&dest_url);
-                    self.out.push_str("\">");
-                }
-                self.link_stack.push(allowed);
+                let tag = telegram_link_href_is_allowed(&dest_url)
+                    .then(|| TelegramInlineTag::Link(dest_url.to_string()));
+                self.inline_stack
+                    .push(TelegramInlineScope { tag, opened: false });
             }
             Tag::TableCell => {
                 if !self.out.ends_with('\n') && !self.out.ends_with(' ') {
@@ -1030,7 +1265,7 @@ impl TelegramMarkdownRenderer {
         match tag {
             TagEnd::Paragraph => self.end_block(),
             TagEnd::Heading(_) => {
-                self.out.push_str("</b>");
+                self.close_inline_scope();
                 self.end_block();
             }
             TagEnd::BlockQuote(_) => self.end_block(),
@@ -1043,13 +1278,12 @@ impl TelegramMarkdownRenderer {
                 self.end_block();
             }
             TagEnd::Item => self.end_block(),
-            TagEnd::Emphasis => self.out.push_str("</i>"),
-            TagEnd::Strong => self.out.push_str("</b>"),
-            TagEnd::Strikethrough => self.out.push_str("</s>"),
-            TagEnd::Link | TagEnd::Image => {
-                if self.link_stack.pop().unwrap_or(false) {
-                    self.out.push_str("</a>");
-                }
+            TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Link
+            | TagEnd::Image => {
+                self.close_inline_scope();
             }
             TagEnd::TableCell => {
                 if !self.out.ends_with('\n') {
@@ -1091,11 +1325,46 @@ impl TelegramMarkdownRenderer {
     }
 
     fn push_escaped(&mut self, text: &str) {
+        self.open_pending_inline_tags();
         push_telegram_html_escaped(&mut self.out, text, false);
     }
 
     fn push_attr_escaped(&mut self, text: &str) {
         push_telegram_html_escaped(&mut self.out, text, true);
+    }
+
+    fn open_pending_inline_tags(&mut self) {
+        for index in 0..self.inline_stack.len() {
+            let scope = &self.inline_stack[index];
+            if scope.opened {
+                continue;
+            }
+            if let Some(tag) = scope.tag.clone() {
+                tag.open(&mut self.out);
+                self.inline_stack[index].opened = true;
+            }
+        }
+    }
+
+    fn close_open_inline_tags(&mut self) {
+        for index in (0..self.inline_stack.len()).rev() {
+            if !self.inline_stack[index].opened {
+                continue;
+            }
+            if let Some(tag) = self.inline_stack[index].tag.clone() {
+                tag.close(&mut self.out);
+                self.inline_stack[index].opened = false;
+            }
+        }
+    }
+
+    fn close_inline_scope(&mut self) {
+        if let Some(scope) = self.inline_stack.pop()
+            && scope.opened
+            && let Some(tag) = scope.tag
+        {
+            tag.close(&mut self.out);
+        }
     }
 
     fn finish(self) -> String {
@@ -1662,6 +1931,88 @@ mod tests {
         assert_eq!(body["parse_mode"], TELEGRAM_PARSE_MODE_HTML);
         assert_eq!(body["text"], "final <i>reply</i>");
         assert!(body.get("message_thread_id").is_none());
+    }
+
+    #[test]
+    fn markdown_code_is_not_nested_inside_other_telegram_entities() {
+        assert_eq!(
+            telegram_markdown_to_html("**before `cmd` after**"),
+            "<b>before </b><code>cmd</code><b> after</b>"
+        );
+        assert_eq!(telegram_markdown_to_html("**`cmd`**"), "<code>cmd</code>");
+        assert_eq!(
+            telegram_markdown_to_html("[`cmd`](https://example.com)"),
+            "<code>cmd</code>"
+        );
+    }
+
+    #[test]
+    fn markdown_messages_are_chunked_after_rendering_html() {
+        let target = TelegramReplyTarget {
+            chat_id: "-100".to_string(),
+            message_thread_id: Some("77".to_string()),
+        };
+        let text = format!(
+            "[{}](https://example.com?a=1&b=2)",
+            "a".repeat(TELEGRAM_MESSAGE_CHAR_LIMIT + 1)
+        );
+
+        let bodies = telegram_markdown_message_bodies(&target, &text);
+
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            let html = body["text"].as_str().unwrap();
+            assert!(html.starts_with("<a href=\"https://example.com?a=1&amp;b=2\">"));
+            assert!(html.ends_with("</a>"));
+            assert_eq!(body["parse_mode"], TELEGRAM_PARSE_MODE_HTML);
+            assert_eq!(body["message_thread_id"], 77);
+            assert!(telegram_html_visible_len(html) <= TELEGRAM_MESSAGE_CHAR_LIMIT);
+        }
+        assert_eq!(
+            telegram_html_visible_len(bodies[0]["text"].as_str().unwrap()),
+            TELEGRAM_MESSAGE_CHAR_LIMIT
+        );
+        assert_eq!(
+            telegram_html_visible_len(bodies[1]["text"].as_str().unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn markdown_code_blocks_are_chunked_with_balanced_pre_code_tags() {
+        let target = TelegramReplyTarget {
+            chat_id: "-100".to_string(),
+            message_thread_id: Some("77".to_string()),
+        };
+        let text = format!(
+            "```rust\n{}\n```",
+            "a".repeat(TELEGRAM_MESSAGE_CHAR_LIMIT + 1)
+        );
+
+        let bodies = telegram_markdown_message_bodies(&target, &text);
+
+        assert_eq!(bodies.len(), 2);
+        for body in bodies {
+            let html = body["text"].as_str().unwrap();
+            assert!(html.starts_with("<pre><code class=\"language-rust\">"));
+            assert!(html.ends_with("</code></pre>"));
+            assert!(telegram_html_visible_len(html) <= TELEGRAM_MESSAGE_CHAR_LIMIT);
+        }
+    }
+
+    #[test]
+    fn rendered_html_length_ignores_tags_and_counts_entities_once() {
+        let html = telegram_markdown_to_html(&format!(
+            "[{}](https://example.com?a=1&b=2)",
+            "a".repeat(TELEGRAM_MESSAGE_CHAR_LIMIT)
+        ));
+
+        assert!(html.len() > TELEGRAM_MESSAGE_CHAR_LIMIT);
+        assert_eq!(
+            telegram_html_visible_len(&html),
+            TELEGRAM_MESSAGE_CHAR_LIMIT
+        );
+        assert_eq!(telegram_html_visible_len("&lt;&gt;&amp;&quot;"), 4);
     }
 
     #[test]
