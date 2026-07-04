@@ -272,9 +272,11 @@ impl TelegramBotChannel {
             .post(self.api_url(method))
             .json(&body)
             .send()
-            .await?
+            .await
+            .map_err(|err| TelegramTransportError::new(method, "request", err))?
             .json::<TelegramApiResponse<T>>()
-            .await?;
+            .await
+            .map_err(|err| TelegramTransportError::new(method, "response decode", err))?;
         if !resp.ok {
             return Err(TelegramApiError {
                 method,
@@ -465,8 +467,8 @@ fn parse_inbound_update(
     }
     let session_key = telegram_session_key(&message.chat, message.message_thread_id)?;
     let is_private = message.chat.kind == "private";
-    let raw_text = message.text.as_deref().unwrap_or("").trim();
-    if raw_text.is_empty() {
+    let raw_text = message.text.as_deref().unwrap_or("");
+    if raw_text.trim().is_empty() {
         return None;
     }
 
@@ -518,24 +520,24 @@ fn allowed_by_set(allowed: &BTreeSet<String>, value: Option<&str>) -> bool {
 }
 
 fn normalize_telegram_router_command_suffix(text: &str, bot_username: &str) -> String {
-    let trimmed = text.trim();
-    let Some((first, rest)) = split_first_token(trimmed) else {
+    let text = text.trim();
+    let Some((first, rest)) = split_first_token(text) else {
         return String::new();
     };
     let normalized = normalize_telegram_command_token(first, bot_username);
     if normalized == first {
-        return trimmed.to_string();
+        return text.to_string();
     }
     if rest.is_empty() {
         normalized
     } else {
-        format!("{normalized} {rest}")
+        format!("{normalized}{rest}")
     }
 }
 
 fn split_first_token(text: &str) -> Option<(&str, &str)> {
     let first = text.split_whitespace().next()?;
-    let rest = text.get(first.len()..).unwrap_or("").trim();
+    let rest = text.get(first.len()..).unwrap_or("");
     Some((first, rest))
 }
 
@@ -578,15 +580,37 @@ fn telegram_text_mentions_bot(text: &str, bot_username: &str) -> bool {
 
 fn strip_telegram_bot_mentions(text: &str, bot_username: &str) -> String {
     let mention = format!("@{bot_username}");
-    text.split_whitespace()
-        .filter(|token| {
-            let token = token.trim_matches(is_telegram_mention_punctuation);
-            !token.eq_ignore_ascii_case(&mention)
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
+    let mut stripped = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in non_whitespace_spans(text) {
+        stripped.push_str(&text[cursor..start]);
+        let token = &text[start..end];
+        let normalized = token.trim_matches(is_telegram_mention_punctuation);
+        if !normalized.eq_ignore_ascii_case(&mention) {
+            stripped.push_str(token);
+        }
+        cursor = end;
+    }
+    stripped.push_str(&text[cursor..]);
+    stripped.trim().to_string()
+}
+
+fn non_whitespace_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(token_start) = start.take() {
+                spans.push((token_start, idx));
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+    if let Some(token_start) = start {
+        spans.push((token_start, text.len()));
+    }
+    spans
 }
 
 fn is_telegram_mention_punctuation(ch: char) -> bool {
@@ -619,15 +643,11 @@ fn telegram_edit_message_text_body(
     let message_id = message_id
         .parse::<i64>()
         .map_err(|err| anyhow::anyhow!("Telegram message_id `{message_id}` is invalid: {err}"))?;
-    let mut body = json!({
+    Ok(json!({
         "chat_id": telegram_id_value(&target.chat_id),
         "message_id": message_id,
         "text": telegram_nonempty_text(text),
-    });
-    if let Some(message_thread_id) = &target.message_thread_id {
-        body["message_thread_id"] = telegram_id_value(message_thread_id);
-    }
-    Ok(body)
+    }))
 }
 
 fn telegram_delete_message_body(
@@ -637,14 +657,10 @@ fn telegram_delete_message_body(
     let message_id = message_id
         .parse::<i64>()
         .map_err(|err| anyhow::anyhow!("Telegram message_id `{message_id}` is invalid: {err}"))?;
-    let mut body = json!({
+    Ok(json!({
         "chat_id": telegram_id_value(&target.chat_id),
         "message_id": message_id,
-    });
-    if let Some(message_thread_id) = &target.message_thread_id {
-        body["message_thread_id"] = telegram_id_value(message_thread_id);
-    }
-    Ok(body)
+    }))
 }
 
 fn telegram_message_chunks(text: &str) -> Vec<String> {
@@ -701,6 +717,35 @@ impl std::fmt::Display for TelegramApiError {
 }
 
 impl std::error::Error for TelegramApiError {}
+
+#[derive(Debug)]
+struct TelegramTransportError {
+    method: &'static str,
+    phase: &'static str,
+    details: String,
+}
+
+impl TelegramTransportError {
+    fn new(method: &'static str, phase: &'static str, err: reqwest::Error) -> Self {
+        Self {
+            method,
+            phase,
+            details: err.without_url().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for TelegramTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Telegram {} {} failed: {}",
+            self.method, self.phase, self.details
+        )
+    }
+}
+
+impl std::error::Error for TelegramTransportError {}
 
 #[cfg(test)]
 mod tests {
@@ -864,6 +909,49 @@ mod tests {
     }
 
     #[test]
+    fn mention_stripping_preserves_multiline_text() {
+        let message = parse_inbound_update(
+            update(json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": -100, "type": "supergroup"},
+                    "from": {"id": 7, "is_bot": false},
+                    "text": "@router_bot please inspect:\n\n```rust\nfn main() {}\n```"
+                }
+            })),
+            &test_config(true),
+            &bot(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            message.text,
+            "please inspect:\n\n```rust\nfn main() {}\n```"
+        );
+    }
+
+    #[test]
+    fn unmentioned_text_preserves_internal_whitespace_when_routed() {
+        let message = parse_inbound_update(
+            update(json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": -100, "type": "supergroup"},
+                    "from": {"id": 7, "is_bot": false},
+                    "text": "line one\n\n    indented"
+                }
+            })),
+            &test_config(false),
+            &bot(),
+        )
+        .unwrap();
+
+        assert_eq!(message.text, "line one\n\n    indented");
+    }
+
+    #[test]
     fn reply_to_bot_routes_group_message_without_mention() {
         let message = parse_inbound_update(
             update(json!({
@@ -973,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn topic_send_edit_and_delete_bodies_include_message_thread_id() {
+    fn topic_send_body_includes_message_thread_id_but_edit_delete_do_not() {
         let target = TelegramReplyTarget {
             chat_id: "-100".to_string(),
             message_thread_id: Some("77".to_string()),
@@ -987,13 +1075,13 @@ mod tests {
         let edit = telegram_edit_message_text_body(&target, "5", "updated").unwrap();
         assert_eq!(edit["chat_id"], -100);
         assert_eq!(edit["message_id"], 5);
-        assert_eq!(edit["message_thread_id"], 77);
+        assert!(edit.get("message_thread_id").is_none());
         assert_eq!(edit["text"], "updated");
 
         let delete = telegram_delete_message_body(&target, "5").unwrap();
         assert_eq!(delete["chat_id"], -100);
         assert_eq!(delete["message_id"], 5);
-        assert_eq!(delete["message_thread_id"], 77);
+        assert!(delete.get("message_thread_id").is_none());
     }
 
     #[test]
@@ -1028,5 +1116,22 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), TELEGRAM_MESSAGE_CHAR_LIMIT);
         assert_eq!(chunks[1], "你");
+    }
+
+    #[tokio::test]
+    async fn transport_error_display_omits_bot_token_url() {
+        let client = Client::new();
+        let token = "123456:SECRET";
+        let err = client
+            .post(format!("http://127.0.0.1:9/bot{token}/getMe"))
+            .send()
+            .await
+            .unwrap_err();
+
+        let sanitized = TelegramTransportError::new("getMe", "request", err).to_string();
+
+        assert!(!sanitized.contains(token));
+        assert!(!sanitized.contains("/bot"));
+        assert!(sanitized.contains("Telegram getMe request failed"));
     }
 }

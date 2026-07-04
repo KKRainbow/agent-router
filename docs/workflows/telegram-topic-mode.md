@@ -69,14 +69,14 @@ text is empty, the message is ignored.
 ## Output Targeting
 
 Replies use the original `chat_id`. Topic replies include the original
-`message_thread_id` in every Telegram API call so replies remain inside the
-same forum topic.
+`message_thread_id` in `sendMessage` so new replies remain inside the same
+forum topic. `editMessageText` and `deleteMessage` identify an existing message
+with `chat_id` and `message_id`; they do not carry `message_thread_id`.
 
 The first implementation sends plain text only. `sendMessage`, `editMessageText`,
-and `deleteMessage` all target the chat and include `message_thread_id` when the
-session is a topic. Final replies longer than Telegram's 4096 character message
-limit are split into multiple plain-text messages, and every fragment keeps the
-same topic target.
+and `deleteMessage` all target the original chat. Final replies longer than
+Telegram's 4096 character message limit are split into multiple plain-text
+messages, and every `sendMessage` fragment keeps the same topic target.
 
 ## Configuration
 
