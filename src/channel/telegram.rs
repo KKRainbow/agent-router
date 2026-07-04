@@ -1,4 +1,11 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::Client;
@@ -32,18 +39,30 @@ const TELEGRAM_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
 const TELEGRAM_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
 struct TypingRefreshGuard {
+    active_typing: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
     handle: tokio::task::JoinHandle<()>,
+    session_key: String,
+    stop: Arc<AtomicBool>,
 }
 
 impl TypingRefreshGuard {
     fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
         self.handle.abort();
     }
 }
 
 impl Drop for TypingRefreshGuard {
     fn drop(&mut self) {
-        self.handle.abort();
+        self.stop();
+        if let Ok(mut active_typing) = self.active_typing.lock() {
+            if active_typing
+                .get(&self.session_key)
+                .is_some_and(|stop| Arc::ptr_eq(stop, &self.stop))
+            {
+                active_typing.remove(&self.session_key);
+            }
+        }
     }
 }
 
@@ -51,6 +70,7 @@ impl Drop for TypingRefreshGuard {
 pub struct TelegramBotChannel {
     cfg: TelegramConfig,
     approvals: SharedApprovalBroker,
+    active_typing: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
     http: Client,
     seen_updates: Arc<Mutex<EventDeduper>>,
 }
@@ -60,6 +80,7 @@ impl TelegramBotChannel {
         Self {
             cfg,
             approvals,
+            active_typing: Arc::new(StdMutex::new(BTreeMap::new())),
             http: telegram_http_client(),
             seen_updates: Arc::new(Mutex::new(EventDeduper::new(1024))),
         }
@@ -215,6 +236,7 @@ impl TelegramBotChannel {
                 if !prompt_channel.approvals.has_pending(&prompt.id).await {
                     continue;
                 }
+                prompt_channel.stop_typing_refresh(&prompt.session_key);
                 let text = prompt.render_text();
                 tokio::select! {
                     biased;
@@ -302,19 +324,41 @@ impl TelegramBotChannel {
         session_key: String,
     ) -> TypingRefreshGuard {
         let channel = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Ok(mut active_typing) = self.active_typing.lock() {
+            active_typing.insert(session_key.clone(), stop.clone());
+        }
+        let task_session_key = session_key.clone();
+        let task_stop = stop.clone();
         let handle = tokio::spawn(async move {
-            loop {
+            while !task_stop.load(Ordering::Acquire) {
                 if let Err(err) = channel.send_typing_action(&target).await {
                     tracing::debug!(
                         error = %err,
-                        session_key = %session_key,
+                        session_key = %task_session_key,
                         "failed to send Telegram typing action"
                     );
                 }
                 tokio::time::sleep(TELEGRAM_TYPING_REFRESH_INTERVAL).await;
             }
         });
-        TypingRefreshGuard { handle }
+        TypingRefreshGuard {
+            active_typing: self.active_typing.clone(),
+            handle,
+            session_key,
+            stop,
+        }
+    }
+
+    fn stop_typing_refresh(&self, session_key: &str) {
+        let stop = self
+            .active_typing
+            .lock()
+            .ok()
+            .and_then(|mut active_typing| active_typing.remove(session_key));
+        if let Some(stop) = stop {
+            stop.store(true, Ordering::Release);
+        }
     }
 
     async fn send_typing_action(&self, target: &TelegramReplyTarget) -> anyhow::Result<()> {
