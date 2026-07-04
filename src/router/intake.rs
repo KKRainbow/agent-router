@@ -359,7 +359,14 @@ mod tests {
 
     #[tokio::test]
     async fn router_and_agent_slash_commands_route_without_reservation() {
-        for text in ["/stop", "/agent status", "/yolo on", "//status", "/status"] {
+        for text in [
+            "/stop",
+            "/new",
+            "/agent status",
+            "/yolo on",
+            "//status",
+            "/status",
+        ] {
             let router = Arc::new(RecordingRouter::default());
 
             let outcome =

@@ -1818,7 +1818,10 @@ fn slack_payload_id(value: &Value) -> Option<&str> {
 fn normalize_slack_slash_command_text(command: &SlackSlashCommand) -> String {
     let name = command.command.trim();
     let text = command.text.trim();
-    if matches!(name, "/stop" | "/agent" | "/yolo" | "/approve" | "/deny") {
+    if matches!(
+        name,
+        "/stop" | "/agent" | "/new" | "/yolo" | "/approve" | "/deny"
+    ) {
         return format!("{name} {text}").trim().to_string();
     }
     if text.is_empty() {
@@ -2432,6 +2435,18 @@ mod tests {
             normalize_slack_slash_command_text(&command),
             "/agent status"
         );
+    }
+
+    #[test]
+    fn new_slack_platform_slash_command_keeps_command_name() {
+        let command = SlackSlashCommand {
+            command: "/new".to_string(),
+            text: " ".to_string(),
+            channel_id: "C1".to_string(),
+            user_id: "U1".to_string(),
+        };
+
+        assert_eq!(normalize_slack_slash_command_text(&command), "/new");
     }
 
     fn file_ref(id: &str) -> SlackFileRef {

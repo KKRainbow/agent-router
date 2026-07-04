@@ -67,8 +67,8 @@ Per-session commands should mutate only the current `session_key`:
 - `/yolo off` sets the current session override to `normal`.
 - `/yolo inherit` clears the override and returns to the global default.
 
-When `/new` is implemented, it must clear the session override so a reset
-session returns to the operator-configured default.
+`/new` resets the active agent conversation inside the current router session;
+it does not clear this session override.
 
 Slack slash commands should not be used to change a thread-specific YOLO mode in
 version 1 because Slack slash command payloads are channel-scoped, not
@@ -176,4 +176,5 @@ Integration-style router tests should cover:
 - `/yolo on` followed by an executor permission request in the same session is
   auto-approved.
 - A different session still receives a manual approval prompt.
-- The future `/new` session reset clears the session override.
+- `/new` preserves the session override because it only resets the active agent
+  conversation.

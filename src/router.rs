@@ -1116,6 +1116,12 @@ where
             return self.handle_stop_command(&input.session_key, output).await;
         }
 
+        if command == "/new" {
+            return self
+                .handle_new_command(&input.session_key, text, output)
+                .await;
+        }
+
         if command == "/agent" {
             let lock = self.session_lock(&input.session_key).await;
             let _guard = lock.lock().await;
@@ -1341,6 +1347,31 @@ where
                 .send_final_reply("No active turn for this session.".to_string())
                 .await
         }
+    }
+
+    async fn handle_new_command(
+        &self,
+        session_key: &str,
+        text: &str,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        let args = text.trim_start_matches("/new").trim();
+        if !args.is_empty() {
+            return output.send_final_reply("Usage: /new".to_string()).await;
+        }
+
+        if let Some(active) = self.turns.stop(session_key).await {
+            self.interrupt_turn(active).await;
+        }
+
+        let lock = self.session_lock(session_key).await;
+        let _guard = lock.lock().await;
+        let mut state = self.load_or_create_session_state(session_key).await?;
+        reset_agent_session_state(&mut state);
+        self.store.save(state).await?;
+        output
+            .send_final_reply("Started a new agent session.".to_string())
+            .await
     }
 
     async fn handle_agent_slash_command(
@@ -3194,6 +3225,15 @@ fn update_binding_after_slash_success(
     binding
 }
 
+fn reset_agent_session_state(state: &mut SessionState) {
+    state.transcript.clear();
+    for binding in state.executor_bindings.values_mut() {
+        binding.external_session_id = None;
+        binding.seen_context.clear();
+        binding.health = ExecutorHealth::Unknown;
+    }
+}
+
 fn binding_with_executor_cwd(mut binding: ExecutorBinding, cwd: Option<&str>) -> ExecutorBinding {
     if let Some(cwd) = cwd {
         binding.cwd = Some(cwd.to_string());
@@ -4788,6 +4828,119 @@ mod tests {
                 .seen_context
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn new_command_resets_agent_session_without_changing_workspace_or_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_key = "slack:C1:T1";
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone())
+            .with_workspace_root(Some(tmp.path().to_path_buf()));
+        let existing_cwd = tmp.path().join("existing-workspace");
+        let mut state = SessionState::new(session_key, "kimi");
+        state.set_active_executor(Some("kimi".to_string()));
+        state.routing_mode = AgentRoutingMode::Manual;
+        state.cwd = Some(existing_cwd.clone());
+        state.transcript.push(TranscriptMessage::user("old prompt"));
+        state.transcript.push(TranscriptMessage::assistant(
+            "old answer",
+            "kimi",
+            Some("old-ext".to_string()),
+        ));
+        state.executor_bindings.insert(
+            "kimi".to_string(),
+            ExecutorBinding {
+                protocol: "fake".to_string(),
+                machine_id: Some("local".to_string()),
+                external_session_id: Some("old-ext".to_string()),
+                cwd: Some("/tmp/executor-cwd".to_string()),
+                health: ExecutorHealth::Healthy,
+                seen_context: vec!["seen-old".to_string()],
+                metadata: BTreeMap::from([("keep".to_string(), json!("value"))]),
+            },
+        );
+        store.save(state).await.unwrap();
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "/new".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "Started a new agent session.");
+        let saved = store.load_or_create(session_key, "kimi").await.unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
+        assert_eq!(saved.routing_mode, AgentRoutingMode::Manual);
+        assert_eq!(saved.cwd.as_deref(), Some(existing_cwd.as_path()));
+        assert!(saved.transcript.is_empty());
+        let binding = saved.executor_bindings.get("kimi").unwrap();
+        assert_eq!(binding.external_session_id, None);
+        assert!(binding.seen_context.is_empty());
+        assert_eq!(binding.health, ExecutorHealth::Unknown);
+        assert_eq!(binding.cwd.as_deref(), Some("/tmp/executor-cwd"));
+        assert_eq!(binding.metadata["keep"], json!("value"));
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "fresh prompt".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        let prepared = executor.prepared.lock().await;
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].previous_session_id, None);
+        assert_eq!(prepared[0].cwd.as_deref(), Some(existing_cwd.as_path()));
+        drop(prepared);
+
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].prompt.contains("fresh prompt"));
+        assert!(!prompts[0].prompt.contains("old prompt"));
+        assert!(!prompts[0].prompt.contains("old answer"));
+    }
+
+    #[tokio::test]
+    async fn new_command_rejects_arguments() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(FakeExecutorBackend::default());
+        let router = AgentRouter::new("kimi", store.clone(), executor);
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "/new now".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "Usage: /new");
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
+        assert!(saved.transcript.is_empty());
+        assert!(saved.executor_bindings.is_empty());
     }
 
     #[tokio::test]

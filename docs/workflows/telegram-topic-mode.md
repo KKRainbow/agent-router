@@ -58,6 +58,7 @@ suffixes do not affect command parsing:
 ```text
 /agent@botname   -> /agent
 /stop@botname    -> /stop
+/new@botname     -> /new
 /yolo@botname    -> /yolo
 /approve@botname -> /approve
 /deny@botname    -> /deny

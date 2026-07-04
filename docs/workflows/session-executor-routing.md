@@ -103,8 +103,8 @@ explicit command path is stable.
 Slash commands have two semantic owners and must not be collapsed into one
 plain-text prompt path:
 
-- Router-owned commands, such as `/stop`, `/agent`, `/yolo`, `/approve`, and
-  `/deny`, are consumed by Agent Router.
+- Router-owned commands, such as `/stop`, `/new`, `/agent`, `/yolo`,
+  `/approve`, and `/deny`, are consumed by Agent Router.
 - Agent-owned slash commands use an explicit double-slash escape, such as
   `//status`, and belong to the current active executor after the router strips
   one leading `/`.

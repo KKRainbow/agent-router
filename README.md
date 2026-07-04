@@ -53,6 +53,8 @@ User commands:
 /agent status
 /agent <agent-name>
 /agent auto
+/new
+/stop
 ```
 
 For example:

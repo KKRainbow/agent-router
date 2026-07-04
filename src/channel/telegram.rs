@@ -585,7 +585,7 @@ fn telegram_text_starts_with_router_command(text: &str) -> bool {
 }
 
 fn is_router_command_name(name: &str) -> bool {
-    matches!(name, "agent" | "stop" | "yolo" | "approve" | "deny")
+    matches!(name, "agent" | "stop" | "new" | "yolo" | "approve" | "deny")
 }
 
 fn telegram_text_mentions_bot(text: &str, bot_username: &str) -> bool {
@@ -941,6 +941,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(message.text, "/agent codex");
+    }
+
+    #[test]
+    fn new_command_suffix_is_normalized_and_routes_group_message() {
+        let message = parse_inbound_update(
+            update(json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": -100, "type": "supergroup"},
+                    "from": {"id": 7, "is_bot": false},
+                    "text": "/new@router_bot"
+                }
+            })),
+            &test_config(true),
+            &bot(),
+        )
+        .unwrap();
+
+        assert_eq!(message.text, "/new");
     }
 
     #[test]
