@@ -12,11 +12,11 @@ use tokio::{
 
 use crate::{
     ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
-    approval::SharedApprovalBroker,
+    approval::{SharedApprovalBroker, is_approval_command},
     config::{ChannelEventMode, TuiConfig},
     router::{
         ChannelRouteTicket, RouterChannelEvent, RouterOutputSink, RouterService,
-        render_live_compact_channel_events,
+        is_slash_command_input, render_live_compact_channel_events,
     },
     text::append_reply_message_break,
 };
@@ -60,6 +60,7 @@ impl TerminalChatChannel {
             writer.clone(),
         );
         let mut turns = JoinSet::new();
+        let mut active_prompt_turns = 0usize;
         let mut input_closed = false;
         let mut abort_turns = false;
 
@@ -72,10 +73,20 @@ impl TerminalChatChannel {
                 event = rx.recv(), if !input_closed => {
                     match event {
                         Some(TerminalInput::Prompt(text)) => {
+                            let replaces_active_turn = prompt_replaces_active_turn(&text);
+                            let status_message = turn_status_message(
+                                &text,
+                                replaces_active_turn && active_prompt_turns > 0,
+                            );
+                            let status = TerminalStatus::start(writer.clone(), status_message);
                             let ticket = match begin_tui_text(router.clone(), session_key.clone(), text).await {
                                 Ok(Some(ticket)) => ticket,
-                                Ok(None) => continue,
+                                Ok(None) => {
+                                    drop(status);
+                                    continue;
+                                }
                                 Err(err) => {
+                                    drop(status);
                                     writer.write_str(&format!("\nerror> {err}\n> "))?;
                                     continue;
                                 }
@@ -83,11 +94,19 @@ impl TerminalChatChannel {
                             let writer = writer.clone();
                             let channel_events = self.cfg.channel_events;
                             let router = router.clone();
+                            if replaces_active_turn {
+                                active_prompt_turns += 1;
+                            }
                             turns.spawn(async move {
-                                let mut output = TerminalOutputSink::new(writer.clone(), channel_events);
+                                let mut output = TerminalOutputSink::new_with_status(
+                                    writer.clone(),
+                                    channel_events,
+                                    status,
+                                );
                                 if let Err(err) = finish_tui_text(router, ticket, &mut output).await {
                                     let _ = writer.write_str(&format!("\nerror> {err}\n"));
                                 }
+                                replaces_active_turn
                             });
                         }
                         Some(TerminalInput::EndOfInput) | None => {
@@ -104,7 +123,12 @@ impl TerminalChatChannel {
                 }
                 result = turns.join_next(), if !turns.is_empty() => {
                     match result {
-                        Some(Ok(())) => writer.write_str("\n> ")?,
+                        Some(Ok(replaces_active_turn)) => {
+                            if replaces_active_turn {
+                                active_prompt_turns = active_prompt_turns.saturating_sub(1);
+                            }
+                            writer.write_str("\n> ")?
+                        }
                         Some(Err(err)) if err.is_cancelled() => {}
                         Some(Err(err)) => writer.write_str(&format!("\nerror> terminal turn task failed: {err}\n> "))?,
                         None => {}
@@ -140,6 +164,34 @@ impl TerminalChatChannel {
 
 pub(crate) fn tui_session_key(session_id: &str) -> String {
     format!("tui:user:local:{}", session_id.trim())
+}
+
+fn turn_status_message(text: &str, replacing_active_turn: bool) -> String {
+    let command = text.trim().split_whitespace().next().unwrap_or("");
+    if is_approval_command(text) {
+        return "resolving approval".to_string();
+    }
+    if command == "/stop" {
+        return "stopping active turn".to_string();
+    }
+    if replacing_active_turn
+        && !matches!(command, "/agent" | "/yolo")
+        && !is_slash_command_input(text)
+    {
+        return "replacing active turn".to_string();
+    }
+    if is_slash_command_input(text) {
+        return "handling slash command".to_string();
+    }
+    "waiting for output".to_string()
+}
+
+fn prompt_replaces_active_turn(text: &str) -> bool {
+    let text = text.trim();
+    let command = text.split_whitespace().next().unwrap_or("");
+    !is_approval_command(text)
+        && !matches!(command, "/stop" | "/agent" | "/yolo")
+        && !is_slash_command_input(text)
 }
 
 #[cfg(test)]
@@ -234,6 +286,7 @@ where
 {
     writer: SharedTerminalWriter<W>,
     channel_events: ChannelEventMode,
+    status: Option<TerminalStatus<W>>,
     activity_events: Vec<RouterChannelEvent>,
     last_activity: Option<String>,
     streamed_text: String,
@@ -244,10 +297,12 @@ impl<W> TerminalOutputSink<W>
 where
     W: Write + Send + 'static,
 {
+    #[cfg(test)]
     pub(crate) fn new(writer: SharedTerminalWriter<W>, channel_events: ChannelEventMode) -> Self {
         Self {
             writer,
             channel_events,
+            status: None,
             activity_events: Vec::new(),
             last_activity: None,
             streamed_text: String::new(),
@@ -255,8 +310,31 @@ where
         }
     }
 
+    fn new_with_status(
+        writer: SharedTerminalWriter<W>,
+        channel_events: ChannelEventMode,
+        status: TerminalStatus<W>,
+    ) -> Self {
+        Self {
+            writer,
+            channel_events,
+            status: Some(status),
+            activity_events: Vec::new(),
+            last_activity: None,
+            streamed_text: String::new(),
+            reply_started: false,
+        }
+    }
+
+    fn stop_status(&mut self) {
+        if let Some(mut status) = self.status.take() {
+            status.stop();
+        }
+    }
+
     fn write_reply_prefix(&mut self) -> anyhow::Result<()> {
         if !self.reply_started {
+            self.stop_status();
             self.writer.write_str("\nassistant> ")?;
             self.reply_started = true;
         }
@@ -291,12 +369,14 @@ where
                 if self.last_activity.as_deref() == Some(summary.as_str()) {
                     return;
                 }
+                self.stop_status();
                 self.last_activity = Some(summary.clone());
                 if let Err(err) = self.write_activity(&summary) {
                     tracing::warn!(error = %err, "failed to write terminal activity summary");
                 }
             }
             ChannelEventMode::Verbose => {
+                self.stop_status();
                 if let Err(err) = self.write_activity(&event.render_text()) {
                     tracing::warn!(error = %err, "failed to write terminal activity event");
                 }
@@ -330,6 +410,7 @@ where
     }
 
     async fn discard_reply_stream(&mut self) {
+        self.stop_status();
         self.streamed_text.clear();
         self.reply_started = false;
         self.write_or_log("\n");
@@ -391,6 +472,37 @@ where
         writer.write_all(text.as_bytes())?;
         writer.flush()?;
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct TerminalStatus<W>
+where
+    W: Write + Send + 'static,
+{
+    _writer: SharedTerminalWriter<W>,
+}
+
+impl<W> TerminalStatus<W>
+where
+    W: Write + Send + 'static,
+{
+    fn start(writer: SharedTerminalWriter<W>, message: String) -> Self {
+        if let Err(err) = writer.write_str(&format!("working> {message}\n")) {
+            tracing::warn!(error = %err, "failed to write terminal status");
+        }
+        Self { _writer: writer }
+    }
+
+    fn stop(&mut self) {}
+}
+
+impl<W> Drop for TerminalStatus<W>
+where
+    W: Write + Send + 'static,
+{
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -459,6 +571,37 @@ mod tests {
             Some(TerminalInput::Prompt("/stop".to_string()))
         );
         assert_eq!(parse_terminal_input("   "), None);
+    }
+
+    #[test]
+    fn turn_status_message_describes_local_state() {
+        assert_eq!(turn_status_message("/stop", false), "stopping active turn");
+        assert_eq!(
+            turn_status_message("/approve 1", true),
+            "resolving approval"
+        );
+        assert_eq!(
+            turn_status_message("/agent status", true),
+            "handling slash command"
+        );
+        assert_eq!(
+            turn_status_message("new prompt", true),
+            "replacing active turn"
+        );
+        assert_eq!(
+            turn_status_message("new prompt", false),
+            "waiting for output"
+        );
+    }
+
+    #[test]
+    fn prompt_replacement_status_matches_router_intake_shape() {
+        assert!(prompt_replaces_active_turn("normal prompt"));
+        assert!(!prompt_replaces_active_turn("/stop"));
+        assert!(!prompt_replaces_active_turn("/agent codex"));
+        assert!(!prompt_replaces_active_turn("/yolo on"));
+        assert!(!prompt_replaces_active_turn("/approve 1"));
+        assert!(!prompt_replaces_active_turn("//agent-owned-command"));
     }
 
     #[tokio::test]
@@ -597,6 +740,21 @@ mod tests {
         output.send_final_reply("done".to_string()).await.unwrap();
 
         assert_eq!(writer_text(&handle), "\nassistant> done\n");
+    }
+
+    #[tokio::test]
+    async fn terminal_status_is_stable_text_before_final_reply() {
+        let writer = SharedTerminalWriter::new(Cursor::new(Vec::new()));
+        let handle = writer.inner.clone();
+        let status = TerminalStatus::start(writer.clone(), "sent to kimi".to_string());
+        let mut output = TerminalOutputSink::new_with_status(writer, ChannelEventMode::Off, status);
+
+        output.send_final_reply("done".to_string()).await.unwrap();
+
+        assert_eq!(
+            writer_text(&handle),
+            "working> sent to kimi\n\nassistant> done\n"
+        );
     }
 
     #[test]
