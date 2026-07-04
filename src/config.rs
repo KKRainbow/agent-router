@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub approval: ApprovalConfig,
     pub workspace: WorkspaceConfig,
     pub slack: SlackConfig,
+    pub telegram: TelegramConfig,
     pub qq: QqConfig,
     pub web: WebConfig,
     pub machines: BTreeMap<String, MachineConfig>,
@@ -73,6 +74,17 @@ pub struct SlackContextSyncConfig {
     pub max_file_bytes: usize,
     pub max_files_per_turn: usize,
     pub max_linked_threads_per_turn: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramConfig {
+    pub enabled: bool,
+    pub bot_token: String,
+    pub require_mention: bool,
+    pub channel_events: ChannelEventMode,
+    pub allowed_users: BTreeSet<String>,
+    pub allowed_chats: BTreeSet<String>,
+    pub poll_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +158,7 @@ struct FileConfig {
     workspace: Option<FileWorkspaceConfig>,
     machines: Option<BTreeMap<String, FileMachineConfig>>,
     slack: Option<FileSlackConfig>,
+    telegram: Option<FileTelegramConfig>,
     qq: Option<FileQqConfig>,
     web: Option<FileWebConfig>,
     executors: Option<BTreeMap<String, FileExecutorConfig>>,
@@ -212,6 +225,17 @@ struct FileSlackContextSyncConfig {
     max_file_bytes: Option<usize>,
     max_files_per_turn: Option<usize>,
     max_linked_threads_per_turn: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileTelegramConfig {
+    enabled: Option<bool>,
+    bot_token: Option<String>,
+    require_mention: Option<bool>,
+    channel_events: Option<String>,
+    allowed_users: Option<StringList>,
+    allowed_chats: Option<StringList>,
+    poll_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -363,6 +387,42 @@ impl AppConfig {
                 .unwrap_or_default(),
         };
 
+        let telegram_file = file_cfg.telegram.unwrap_or_default();
+        let telegram_bot_token = env_cfg
+            .telegram_bot_token
+            .or(telegram_file.bot_token)
+            .unwrap_or_default();
+        let telegram_enabled = env_cfg
+            .telegram_enabled
+            .or(telegram_file.enabled)
+            .unwrap_or(!telegram_bot_token.is_empty());
+        let telegram = TelegramConfig {
+            enabled: telegram_enabled,
+            bot_token: telegram_bot_token,
+            require_mention: env_cfg
+                .telegram_require_mention
+                .or(telegram_file.require_mention)
+                .unwrap_or(true),
+            channel_events: env_cfg
+                .telegram_channel_events
+                .or(telegram_file.channel_events)
+                .map(|value| parse_channel_event_mode("telegram.channel_events", &value))
+                .transpose()?
+                .unwrap_or(ChannelEventMode::Compact),
+            allowed_users: env_cfg
+                .telegram_allowed_users
+                .or_else(|| telegram_file.allowed_users.map(StringList::into_set))
+                .unwrap_or_default(),
+            allowed_chats: env_cfg
+                .telegram_allowed_chats
+                .or_else(|| telegram_file.allowed_chats.map(StringList::into_set))
+                .unwrap_or_default(),
+            poll_timeout_secs: env_cfg
+                .telegram_poll_timeout_secs
+                .or(telegram_file.poll_timeout_secs)
+                .unwrap_or(30),
+        };
+
         let qq_file = file_cfg.qq.unwrap_or_default();
         let qq_app_id = env_cfg.qq_app_id.or(qq_file.app_id).unwrap_or_default();
         let qq_client_secret = env_cfg
@@ -489,6 +549,7 @@ impl AppConfig {
             approval,
             workspace,
             slack,
+            telegram,
             qq,
             web,
             machines,
@@ -511,6 +572,13 @@ struct EnvConfig {
     slack_context_sync_max_file_bytes: Option<usize>,
     slack_allowed_channels: Option<BTreeSet<String>>,
     slack_free_response_channels: Option<BTreeSet<String>>,
+    telegram_enabled: Option<bool>,
+    telegram_bot_token: Option<String>,
+    telegram_require_mention: Option<bool>,
+    telegram_channel_events: Option<String>,
+    telegram_allowed_users: Option<BTreeSet<String>>,
+    telegram_allowed_chats: Option<BTreeSet<String>>,
+    telegram_poll_timeout_secs: Option<u64>,
     qq_enabled: Option<bool>,
     qq_app_id: Option<String>,
     qq_client_secret: Option<String>,
@@ -542,6 +610,13 @@ impl EnvConfig {
             slack_context_sync_max_file_bytes: env_usize("SLACK_CONTEXT_SYNC_MAX_FILE_BYTES"),
             slack_allowed_channels: env_set("SLACK_ALLOWED_CHANNELS"),
             slack_free_response_channels: env_set("SLACK_FREE_RESPONSE_CHANNELS"),
+            telegram_enabled: env_bool("TELEGRAM_ENABLED"),
+            telegram_bot_token: nonempty_env("TELEGRAM_BOT_TOKEN"),
+            telegram_require_mention: env_bool("TELEGRAM_REQUIRE_MENTION"),
+            telegram_channel_events: nonempty_env("TELEGRAM_CHANNEL_EVENTS"),
+            telegram_allowed_users: env_set("TELEGRAM_ALLOWED_USERS"),
+            telegram_allowed_chats: env_set("TELEGRAM_ALLOWED_CHATS"),
+            telegram_poll_timeout_secs: env_u64("TELEGRAM_POLL_TIMEOUT_SECS"),
             qq_enabled: env_bool("QQ_ENABLED").or_else(|| env_bool("QQBOT_ENABLED")),
             qq_app_id: nonempty_env("QQ_APP_ID").or_else(|| nonempty_env("QQBOT_APP_ID")),
             qq_client_secret: nonempty_env("QQ_CLIENT_SECRET")
@@ -832,6 +907,13 @@ mod tests {
         assert_eq!(cfg.approval.default_mode, ApprovalMode::Normal);
         assert!(!cfg.slack.enabled);
         assert!(cfg.slack.owner_user_ids.is_empty());
+        assert!(!cfg.telegram.enabled);
+        assert!(cfg.telegram.bot_token.is_empty());
+        assert!(cfg.telegram.require_mention);
+        assert_eq!(cfg.telegram.channel_events, ChannelEventMode::Compact);
+        assert!(cfg.telegram.allowed_users.is_empty());
+        assert!(cfg.telegram.allowed_chats.is_empty());
+        assert_eq!(cfg.telegram.poll_timeout_secs, 30);
         assert!(!cfg.qq.enabled);
         assert_eq!(cfg.slack.channel_events, ChannelEventMode::Compact);
         assert!(!cfg.slack.context_sync.enabled);
@@ -1119,6 +1201,109 @@ qq:
             cfg.qq.allowed_groups,
             ["g1", "g2", "g3"].into_iter().map(str::to_string).collect()
         );
+    }
+
+    #[test]
+    fn parses_telegram_config() {
+        let raw = r#"
+telegram:
+  enabled: true
+  bot_token: token
+  require_mention: false
+  channel_events: off
+  allowed_users: "100,101"
+  allowed_chats: ["-100", "200,201"]
+  poll_timeout_secs: 45
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+
+        assert!(cfg.telegram.enabled);
+        assert_eq!(cfg.telegram.bot_token, "token");
+        assert!(!cfg.telegram.require_mention);
+        assert_eq!(cfg.telegram.channel_events, ChannelEventMode::Off);
+        assert_eq!(
+            cfg.telegram.allowed_users,
+            ["100", "101"].into_iter().map(str::to_string).collect()
+        );
+        assert_eq!(
+            cfg.telegram.allowed_chats,
+            ["-100", "200", "201"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(cfg.telegram.poll_timeout_secs, 45);
+    }
+
+    #[test]
+    fn telegram_bot_token_auto_enables_channel_unless_disabled() {
+        let cfg = AppConfig::from_file_config(
+            FileConfig::default(),
+            EnvConfig {
+                telegram_bot_token: Some("token".to_string()),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cfg.telegram.enabled);
+        assert_eq!(cfg.telegram.bot_token, "token");
+
+        let cfg = AppConfig::from_file_config(
+            FileConfig::default(),
+            EnvConfig {
+                telegram_enabled: Some(false),
+                telegram_bot_token: Some("token".to_string()),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!cfg.telegram.enabled);
+    }
+
+    #[test]
+    fn env_telegram_config_overrides_file_config() {
+        let raw = r#"
+telegram:
+  enabled: false
+  bot_token: file-token
+  require_mention: true
+  channel_events: compact
+  allowed_users: ["file-user"]
+  allowed_chats: ["file-chat"]
+  poll_timeout_secs: 10
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(
+            file_cfg,
+            EnvConfig {
+                telegram_enabled: Some(true),
+                telegram_bot_token: Some("env-token".to_string()),
+                telegram_require_mention: Some(false),
+                telegram_channel_events: Some("verbose".to_string()),
+                telegram_allowed_users: Some(["env-user".to_string()].into_iter().collect()),
+                telegram_allowed_chats: Some(["env-chat".to_string()].into_iter().collect()),
+                telegram_poll_timeout_secs: Some(5),
+                ..EnvConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cfg.telegram.enabled);
+        assert_eq!(cfg.telegram.bot_token, "env-token");
+        assert!(!cfg.telegram.require_mention);
+        assert_eq!(cfg.telegram.channel_events, ChannelEventMode::Verbose);
+        assert_eq!(
+            cfg.telegram.allowed_users,
+            ["env-user".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            cfg.telegram.allowed_chats,
+            ["env-chat".to_string()].into_iter().collect()
+        );
+        assert_eq!(cfg.telegram.poll_timeout_secs, 5);
     }
 
     #[test]

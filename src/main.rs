@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_router::{
     approval::ApprovalBroker,
-    channel::{qq::QqBotChannel, slack::SlackSocketModeChannel, web::WebChannel},
+    channel::{
+        qq::QqBotChannel, slack::SlackSocketModeChannel, telegram::TelegramBotChannel,
+        web::WebChannel,
+    },
     config::{AppConfig, default_config_path, load_dotenv},
     executor::registry::ExecutorRegistry,
     machine::MachineRegistry,
@@ -114,6 +117,19 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut channels: JoinSet<(&'static str, anyhow::Result<()>)> = JoinSet::new();
+    if config.telegram.enabled {
+        tracing::info!("starting Telegram channel");
+        let router = router.clone();
+        let approvals = approvals.clone();
+        channels.spawn(async move {
+            (
+                "telegram",
+                TelegramBotChannel::new(config.telegram, approvals)
+                    .run(router)
+                    .await,
+            )
+        });
+    }
     if config.slack.enabled {
         tracing::info!("starting Slack channel");
         let router = router.clone();
@@ -145,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
     }
     anyhow::ensure!(
         !channels.is_empty(),
-        "no channels enabled; configure Slack, QQ, or web credentials, or set a channel's enabled flag"
+        "no channels enabled; configure Slack, Telegram, QQ, or web credentials, or set a channel's enabled flag"
     );
 
     while let Some(result) = channels.join_next().await {
