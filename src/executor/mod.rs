@@ -430,14 +430,15 @@ pub mod test_support {
 
     use super::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
-        ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorResponse, ExecutorUpdate,
-        PreparedExecutor, TurnCancellation,
+        ExecutorPromptOutcome, ExecutorPromptRequest, ExecutorResponse, ExecutorTurnRef,
+        ExecutorUpdate, PreparedExecutor, TurnCancellation,
     };
 
     #[derive(Debug, Default)]
     pub struct FakeExecutorBackend {
         pub prompts: Arc<Mutex<Vec<ExecutorRequest>>>,
         pub prepared: Arc<Mutex<Vec<ExecutorPrepareRequest>>>,
+        pub discarded: Arc<Mutex<Vec<ExecutorTurnRef>>>,
         pub force_started_new_session: bool,
     }
 
@@ -533,6 +534,15 @@ pub mod test_support {
             ExecutorPromptOutcome::Completed(ExecutorResponse {
                 final_text: "fake response".to_string(),
             })
+        }
+
+        async fn discard_session(
+            &self,
+            turn: ExecutorTurnRef,
+            _reason: &str,
+        ) -> anyhow::Result<()> {
+            self.discarded.lock().await.push(turn);
+            Ok(())
         }
     }
 

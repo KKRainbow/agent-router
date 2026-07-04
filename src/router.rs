@@ -1383,13 +1383,32 @@ where
             return output.send_final_reply("Usage: /new".to_string()).await;
         }
 
-        if let Some(active) = self.turns.stop(session_key).await {
+        let turn_start_lock = self.turn_start_lock(session_key).await;
+        let _turn_start_guard = turn_start_lock.lock().await;
+        let active_turn_ref = if let Some(active) = self.turns.stop(session_key).await {
+            let turn_ref = active.executor_turn_ref();
             self.interrupt_turn(active).await;
-        }
+            turn_ref
+        } else {
+            None
+        };
 
         let lock = self.session_lock(session_key).await;
         let _guard = lock.lock().await;
         let mut state = self.load_or_create_session_state(session_key).await?;
+        let discard_turns = new_command_discard_turns(session_key, &state, active_turn_ref);
+        for turn in discard_turns {
+            self.executor
+                .discard_session(turn.clone(), "router /new reset")
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "discard executor `{}` session for `/new`: {}",
+                        turn.executor,
+                        err
+                    )
+                })?;
+        }
         reset_agent_session_state(&mut state);
         self.store.save(state).await?;
         output
@@ -3258,6 +3277,31 @@ fn reset_agent_session_state(state: &mut SessionState) {
     }
 }
 
+fn new_command_discard_turns(
+    session_key: &str,
+    state: &SessionState,
+    active_turn_ref: Option<ExecutorTurnRef>,
+) -> Vec<ExecutorTurnRef> {
+    let mut seen = BTreeSet::new();
+    let mut turns = Vec::new();
+    if let Some(turn) = active_turn_ref {
+        if seen.insert((turn.session_key.clone(), turn.executor.clone())) {
+            turns.push(turn);
+        }
+    }
+    for executor in state.executor_bindings.keys() {
+        let key = (session_key.to_string(), executor.clone());
+        if seen.insert(key.clone()) {
+            turns.push(ExecutorTurnRef {
+                session_key: key.0,
+                executor: key.1,
+                generation: 0,
+            });
+        }
+    }
+    turns
+}
+
 fn binding_with_executor_cwd(mut binding: ExecutorBinding, cwd: Option<&str>) -> ExecutorBinding {
     if let Some(cwd) = cwd {
         binding.cwd = Some(cwd.to_string());
@@ -3483,6 +3527,21 @@ mod tests {
         slash_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
 
+    #[derive(Debug)]
+    struct BlockingPromptExecutorBackend {
+        prompt_started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        discarded: Arc<Mutex<Vec<ExecutorTurnRef>>>,
+    }
+
+    impl BlockingPromptExecutorBackend {
+        fn new(prompt_started: tokio::sync::oneshot::Sender<()>) -> Self {
+            Self {
+                prompt_started: tokio::sync::Mutex::new(Some(prompt_started)),
+                discarded: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
     impl DuringActiveSlashExecutorBackend {
         fn new(
             prompt_started: tokio::sync::oneshot::Sender<()>,
@@ -3496,6 +3555,57 @@ mod tests {
                 slash_started: tokio::sync::Mutex::new(Some(slash_started)),
                 slash_release: tokio::sync::Mutex::new(Some(slash_release)),
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for BlockingPromptExecutorBackend {
+        fn get(&self, name: &str) -> Option<ExecutorDescriptor> {
+            (name == "kimi").then(|| ExecutorDescriptor {
+                name: "kimi".to_string(),
+                protocol: "blocking-test".to_string(),
+                machine_id: "local".to_string(),
+            })
+        }
+
+        fn list(&self) -> Vec<ExecutorDescriptor> {
+            self.get("kimi").into_iter().collect()
+        }
+
+        async fn prepare(
+            &self,
+            _request: ExecutorPrepareRequest,
+            _cancel: TurnCancellation,
+        ) -> anyhow::Result<PreparedExecutor> {
+            Ok(PreparedExecutor {
+                external_session_id: Some("active-session".to_string()),
+                started_new_session: true,
+                machine_id: Some("local".to_string()),
+                cwd: None,
+                machine_workspace: None,
+            })
+        }
+
+        async fn prompt(
+            &self,
+            _request: ExecutorPromptRequest,
+            _events: &mut dyn ExecutorEventSink,
+            cancel: TurnCancellation,
+        ) -> ExecutorPromptOutcome {
+            if let Some(started) = self.prompt_started.lock().await.take() {
+                let _ = started.send(());
+            }
+            let _ = cancel.cancelled().await;
+            ExecutorPromptOutcome::Cancelled
+        }
+
+        async fn discard_session(
+            &self,
+            turn: ExecutorTurnRef,
+            _reason: &str,
+        ) -> anyhow::Result<()> {
+            self.discarded.lock().await.push(turn);
+            Ok(())
         }
     }
 
@@ -4912,6 +5022,11 @@ mod tests {
         assert_eq!(binding.health, ExecutorHealth::Unknown);
         assert_eq!(binding.cwd.as_deref(), Some("/tmp/executor-cwd"));
         assert_eq!(binding.metadata["keep"], json!("value"));
+        let discarded = executor.discarded.lock().await;
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].session_key, session_key);
+        assert_eq!(discarded[0].executor, "kimi");
+        drop(discarded);
 
         let mut output = CollectingRouterOutputSink::default();
         router
@@ -4937,6 +5052,65 @@ mod tests {
         assert!(prompts[0].prompt.contains("fresh prompt"));
         assert!(!prompts[0].prompt.contains("old prompt"));
         assert!(!prompts[0].prompt.contains("old answer"));
+    }
+
+    #[tokio::test]
+    async fn new_command_discards_active_uncommitted_executor_session() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let (prompt_started_tx, prompt_started_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(BlockingPromptExecutorBackend::new(prompt_started_tx));
+        let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor.clone()));
+        let session_key = "slack:dm:D1:111.000";
+
+        let prompt_router = router.clone();
+        let prompt = tokio::spawn(async move {
+            let mut output = CollectingRouterOutputSink::default();
+            prompt_router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.to_string(),
+                        text: "work".to_string(),
+                        user_id: None,
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            output
+        });
+        tokio::time::timeout(Duration::from_secs(1), prompt_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: session_key.to_string(),
+                    text: "/new".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "Started a new agent session.");
+        let prompt_output = tokio::time::timeout(Duration::from_secs(1), prompt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prompt_output.events.is_empty());
+        assert!(prompt_output.discarded_reply_stream);
+        let discarded = executor.discarded.lock().await;
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].session_key, session_key);
+        assert_eq!(discarded[0].executor, "kimi");
+        drop(discarded);
+        let saved = store.load_or_create(session_key, "kimi").await.unwrap();
+        assert!(saved.transcript.is_empty());
+        assert!(saved.executor_bindings.is_empty());
     }
 
     #[tokio::test]
