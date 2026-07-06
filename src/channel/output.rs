@@ -60,6 +60,7 @@ impl PostedMessage {
 pub(crate) enum ChannelReplyStyle {
     StreamingDraft,
     CheckpointMessages,
+    FinalOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,12 @@ impl ChannelOutputPolicy {
             checkpoint_preview_chars: 240,
             checkpoint_prefix: "Still generating reply:\n",
         }
+    }
+
+    pub(crate) fn final_only(activity_mode: ChannelEventMode) -> Self {
+        let mut policy = Self::streaming_draft(activity_mode);
+        policy.reply_style = ChannelReplyStyle::FinalOnly;
+        policy
     }
 }
 
@@ -218,6 +225,7 @@ where
                     checkpoint,
                 );
             }
+            ChannelReplyStyle::FinalOnly => {}
         }
     }
 
@@ -225,6 +233,7 @@ where
         match self.policy.reply_style {
             ChannelReplyStyle::StreamingDraft => self.reply.draft.break_message(),
             ChannelReplyStyle::CheckpointMessages => self.reply.checkpoints.break_message(),
+            ChannelReplyStyle::FinalOnly => {}
         }
     }
 
@@ -242,6 +251,7 @@ where
                 self.reply.checkpoint_poster.abort().await;
                 self.reply.checkpoints.finish();
             }
+            ChannelReplyStyle::FinalOnly => {}
         }
     }
 
@@ -270,6 +280,21 @@ where
                     .post_markdown(&self.target, &text)
                     .await
                     .map(|_| ())
+            }
+            ChannelReplyStyle::FinalOnly => {
+                let compact_activity_id = self.flush_activity().await;
+                let result = self
+                    .port
+                    .post_markdown(&self.target, &text)
+                    .await
+                    .map(|_| ());
+                if result.is_ok()
+                    && let Some(id) = compact_activity_id
+                    && let Err(err) = self.port.delete(&self.target, &id).await
+                {
+                    tracing::warn!(error = %err, "failed to delete final channel activity message");
+                }
+                result
             }
         }
     }
@@ -1163,6 +1188,38 @@ mod tests {
         let deliveries = port.deliveries().await;
         assert!(deliveries.iter().any(
             |delivery| matches!(delivery, Delivery::UpdateMarkdown { text, .. } if text == "final")
+        ));
+        assert!(
+            deliveries
+                .iter()
+                .any(|delivery| matches!(delivery, Delivery::Delete { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn final_only_ignores_reply_chunks_and_deletes_compact_activity() {
+        let port = RecordingPort::default();
+        let mut sink = ChannelOutputSink::new(
+            port.clone(),
+            "target".to_string(),
+            ChannelOutputPolicy::final_only(ChannelEventMode::Compact),
+        );
+
+        sink.send_channel_event(progress_event("thinking"));
+        sink.send_reply_chunk("draft".to_string());
+        tokio::task::yield_now().await;
+        sink.send_final_reply("final".to_string()).await.unwrap();
+
+        let deliveries = port.deliveries().await;
+        assert!(deliveries.iter().any(
+            |delivery| matches!(delivery, Delivery::PostText { text, .. } if text == "[pi] Activity\nProgress:\n- thinking")
+        ));
+        assert!(deliveries.iter().any(
+            |delivery| matches!(delivery, Delivery::PostMarkdown { text, .. } if text == "final")
+        ));
+        assert!(deliveries.iter().all(
+            |delivery| !matches!(delivery, Delivery::PostText { text, .. } if text.contains("draft"))
+                && !matches!(delivery, Delivery::UpdateText { text, .. } if text.contains("draft"))
         ));
         assert!(
             deliveries

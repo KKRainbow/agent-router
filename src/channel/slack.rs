@@ -13,10 +13,9 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-const SLACK_REPLY_DRAFT_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
-const SLACK_REPLY_DRAFT_UPDATE_GROWTH: usize = 500;
-const SLACK_REPLY_DRAFT_INITIAL_MIN_LEN: usize = 40;
+#[cfg(test)]
 const SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES: usize = 8_000;
+#[cfg(test)]
 const SLACK_REPLY_DRAFT_TRUNCATED_PREFIX: &str = "...\n";
 const SLACK_REPLY_DRAFT_MARKER: &str = "[router-draft]";
 
@@ -1257,14 +1256,7 @@ struct SlackReplyPort {
 }
 
 fn slack_output_policy(activity_mode: ChannelEventMode) -> ChannelOutputPolicy {
-    let mut policy = ChannelOutputPolicy::streaming_draft(activity_mode);
-    policy.draft_update_interval = SLACK_REPLY_DRAFT_UPDATE_INTERVAL;
-    policy.draft_update_growth = SLACK_REPLY_DRAFT_UPDATE_GROWTH;
-    policy.draft_initial_min_len = SLACK_REPLY_DRAFT_INITIAL_MIN_LEN;
-    policy.draft_preview_max_bytes = SLACK_REPLY_DRAFT_PREVIEW_MAX_BYTES;
-    policy.draft_truncated_prefix = SLACK_REPLY_DRAFT_TRUNCATED_PREFIX;
-    policy.draft_marker = SLACK_REPLY_DRAFT_MARKER;
-    policy
+    ChannelOutputPolicy::final_only(activity_mode)
 }
 
 fn should_log_unmentioned_approval_route(input: &ChannelInput) -> bool {
@@ -2113,6 +2105,20 @@ mod tests {
             allowed_channels: Default::default(),
             free_response_channels: Default::default(),
         }
+    }
+
+    #[test]
+    fn slack_output_policy_uses_final_only_replies_with_live_activity() {
+        let policy = slack_output_policy(ChannelEventMode::Compact);
+
+        assert_eq!(
+            policy.reply_style,
+            crate::channel::output::ChannelReplyStyle::FinalOnly
+        );
+        assert_eq!(
+            policy.compact_activity_style,
+            crate::channel::output::CompactActivityStyle::LiveUpdate
+        );
     }
 
     fn channel_input(text: impl Into<String>, intent: ChannelInputIntent) -> ChannelInput {
