@@ -3,6 +3,7 @@ mod turns;
 
 use std::{
     collections::{BTreeSet, HashMap},
+    fmt,
     future::Future,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -788,6 +789,29 @@ struct RawRouteDecision {
     executor: Option<String>,
     reason: Option<String>,
 }
+
+#[derive(Debug)]
+enum RouteDecisionParseError {
+    Json(serde_json::Error),
+    Invalid(String),
+}
+
+impl RouteDecisionParseError {
+    fn is_format_error(&self) -> bool {
+        matches!(self, Self::Json(err) if err.is_syntax() || err.is_eof())
+    }
+}
+
+impl fmt::Display for RouteDecisionParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json(err) => err.fmt(f),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RouteDecisionParseError {}
 
 struct SuppressedExecutorEventSink;
 
@@ -1816,7 +1840,7 @@ where
         cancel: TurnCancellation,
     ) -> anyhow::Result<RouteDecision> {
         let policy = load_orchestrator_policy(orchestrator)?;
-        let prompt = self.build_orchestrator_prompt(orchestrator, state, input, &policy);
+        let routing_prompt = self.build_orchestrator_prompt(orchestrator, state, input, &policy);
         let cleanup_turn = turn.clone();
         let work = async {
             let prepared = self
@@ -1841,7 +1865,7 @@ where
                 .prompt(
                     ExecutorPromptRequest {
                         turn: turn.clone(),
-                        prompt,
+                        prompt: routing_prompt.clone(),
                         user_id: None,
                     },
                     &mut events,
@@ -1849,7 +1873,103 @@ where
                 )
                 .await
                 .into_result()?;
-            parse_route_decision(&response.final_text)
+            match parse_route_decision(&response.final_text) {
+                Ok(decision) => Ok(decision),
+                Err(err) if err.is_format_error() => {
+                    tracing::warn!(
+                        error = %err,
+                        session_key = %turn.session_key,
+                        orchestrator = %orchestrator.executor,
+                        generation = turn.generation,
+                        original_output = %orchestrator_log_text(&response.final_text),
+                        routing_prompt = %orchestrator_log_text(&routing_prompt),
+                        user_prompt = %orchestrator_log_text(&input.text),
+                        "orchestrator route decision output was not valid JSON; requesting repair"
+                    );
+                    let original_output = response.final_text;
+                    let repair_prompt =
+                        build_orchestrator_decision_repair_prompt(&original_output, &err);
+                    let repair_response = match self
+                        .executor
+                        .prompt(
+                            ExecutorPromptRequest {
+                                turn: turn.clone(),
+                                prompt: repair_prompt.clone(),
+                                user_id: None,
+                            },
+                            &mut events,
+                            cancel.clone(),
+                        )
+                        .await
+                        .into_result()
+                    {
+                        Ok(response) => response,
+                        Err(repair_prompt_err) => {
+                            tracing::warn!(
+                                error = %repair_prompt_err,
+                                original_error = %err,
+                                session_key = %turn.session_key,
+                                orchestrator = %orchestrator.executor,
+                                generation = turn.generation,
+                                original_output = %orchestrator_log_text(&original_output),
+                                routing_prompt = %orchestrator_log_text(&routing_prompt),
+                                user_prompt = %orchestrator_log_text(&input.text),
+                                repair_prompt = %orchestrator_log_text(&repair_prompt),
+                                "orchestrator route decision repair prompt failed"
+                            );
+                            return Err(repair_prompt_err
+                                .context("orchestrator route decision repair prompt failed"));
+                        }
+                    };
+                    match parse_route_decision(&repair_response.final_text) {
+                        Ok(decision) => {
+                            tracing::info!(
+                                session_key = %turn.session_key,
+                                orchestrator = %orchestrator.executor,
+                                generation = turn.generation,
+                                original_error = %err,
+                                original_output = %orchestrator_log_text(&original_output),
+                                routing_prompt = %orchestrator_log_text(&routing_prompt),
+                                user_prompt = %orchestrator_log_text(&input.text),
+                                repair_prompt = %orchestrator_log_text(&repair_prompt),
+                                repaired_output = %orchestrator_log_text(&repair_response.final_text),
+                                "repaired orchestrator route decision output"
+                            );
+                            Ok(decision)
+                        }
+                        Err(repair_err) => {
+                            tracing::warn!(
+                                error = %repair_err,
+                                original_error = %err,
+                                session_key = %turn.session_key,
+                                orchestrator = %orchestrator.executor,
+                                generation = turn.generation,
+                                original_output = %orchestrator_log_text(&original_output),
+                                routing_prompt = %orchestrator_log_text(&routing_prompt),
+                                user_prompt = %orchestrator_log_text(&input.text),
+                                repair_output = %orchestrator_log_text(&repair_response.final_text),
+                                repair_prompt = %orchestrator_log_text(&repair_prompt),
+                                "orchestrator route decision repair failed"
+                            );
+                            Err(anyhow::Error::new(repair_err)
+                                .context("orchestrator route decision repair failed"))
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        session_key = %turn.session_key,
+                        orchestrator = %orchestrator.executor,
+                        generation = turn.generation,
+                        original_output = %orchestrator_log_text(&response.final_text),
+                        routing_prompt = %orchestrator_log_text(&routing_prompt),
+                        user_prompt = %orchestrator_log_text(&input.text),
+                        "orchestrator route decision failed validation; not repairing"
+                    );
+                    Err(err.into())
+                }
+            }
         };
 
         match tokio::time::timeout(orchestrator.decision_timeout, work).await {
@@ -2703,22 +2823,55 @@ fn load_orchestrator_policy(orchestrator: &OrchestratorSettings) -> anyhow::Resu
     Ok(policy)
 }
 
-fn parse_route_decision(text: &str) -> anyhow::Result<RouteDecision> {
-    let raw: RawRouteDecision = serde_json::from_str(text.trim())?;
+const ORCHESTRATOR_LOG_TEXT_CHARS: usize = 12_000;
+const ORCHESTRATOR_REPAIR_OUTPUT_CHARS: usize = 8_000;
+const ORCHESTRATOR_REPAIR_PROMPT_PREFIX: &str =
+    "Your previous route decision response was invalid JSON.";
+
+fn parse_route_decision(text: &str) -> Result<RouteDecision, RouteDecisionParseError> {
+    let raw: RawRouteDecision =
+        serde_json::from_str(text.trim()).map_err(RouteDecisionParseError::Json)?;
     match raw.action.as_str() {
         "stay" => Ok(RouteDecision::Stay { reason: raw.reason }),
         "handoff" => {
             let executor = raw
                 .executor
                 .filter(|executor| !executor.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("route decision handoff missing executor"))?;
+                .ok_or_else(|| {
+                    RouteDecisionParseError::Invalid(
+                        "route decision handoff missing executor".to_string(),
+                    )
+                })?;
             Ok(RouteDecision::Handoff {
                 executor,
                 reason: raw.reason,
             })
         }
-        other => anyhow::bail!("unsupported route decision action `{other}`"),
+        other => Err(RouteDecisionParseError::Invalid(format!(
+            "unsupported route decision action `{other}`"
+        ))),
     }
+}
+
+fn build_orchestrator_decision_repair_prompt(
+    invalid_output: &str,
+    error: &RouteDecisionParseError,
+) -> String {
+    let invalid_output = truncate_chars(invalid_output, ORCHESTRATOR_REPAIR_OUTPUT_CHARS);
+    format!(
+        "{ORCHESTRATOR_REPAIR_PROMPT_PREFIX}\n\
+Do not make a new routing decision. Convert the previous response into exactly one JSON object.\n\
+Do not call tools. Do not wrap the JSON in Markdown or code fences.\n\n\
+Parse error:\n{error}\n\n\
+Route decision schema examples:\n\
+{{\"action\":\"stay\",\"reason\":\"short reason\"}}\n\
+{{\"action\":\"handoff\",\"executor\":\"executor-name\",\"reason\":\"short reason\"}}\n\n\
+Previous response:\n{invalid_output}"
+    )
+}
+
+fn orchestrator_log_text(text: &str) -> String {
+    truncate_chars(text, ORCHESTRATOR_LOG_TEXT_CHARS)
 }
 
 fn orchestrator_should_route(orchestrator: &OrchestratorSettings, state: &SessionState) -> bool {
@@ -3975,6 +4128,7 @@ mod tests {
     #[derive(Debug)]
     struct OrchestratorTestBackend {
         decision_text: String,
+        repair_text: Option<String>,
         prompts: Arc<Mutex<Vec<crate::executor::test_support::ExecutorRequest>>>,
         prepared: Arc<Mutex<Vec<ExecutorPrepareRequest>>>,
         discarded: Arc<Mutex<Vec<ExecutorTurnRef>>>,
@@ -3984,10 +4138,16 @@ mod tests {
         fn new(decision_text: impl Into<String>) -> Self {
             Self {
                 decision_text: decision_text.into(),
+                repair_text: None,
                 prompts: Arc::new(Mutex::new(Vec::new())),
                 prepared: Arc::new(Mutex::new(Vec::new())),
                 discarded: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_repair(mut self, repair_text: impl Into<String>) -> Self {
+            self.repair_text = Some(repair_text.into());
+            self
         }
     }
 
@@ -4037,6 +4197,9 @@ mod tests {
             }
             let executor = request.turn.executor.clone();
             let session_key = request.turn.session_key.clone();
+            let is_repair_prompt = request
+                .prompt
+                .starts_with(ORCHESTRATOR_REPAIR_PROMPT_PREFIX);
             self.prompts
                 .lock()
                 .await
@@ -4053,7 +4216,13 @@ mod tests {
             let final_text = if executor == "route-planner"
                 && session_key.starts_with("__agent_router_orchestrator__:")
             {
-                self.decision_text.clone()
+                if is_repair_prompt {
+                    self.repair_text
+                        .clone()
+                        .unwrap_or_else(|| self.decision_text.clone())
+                } else {
+                    self.decision_text.clone()
+                }
             } else {
                 format!("{executor} response")
             };
@@ -6397,6 +6566,56 @@ mod tests {
         assert_eq!(saved.active_executor.as_deref(), Some("kimi"));
         assert!(saved.executor_bindings.contains_key("kimi"));
         assert!(!saved.executor_bindings.contains_key("route-planner"));
+    }
+
+    #[tokio::test]
+    async fn fenced_orchestrator_decision_is_repaired_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySessionStore::default());
+        let executor = Arc::new(
+            OrchestratorTestBackend::new(
+                "```json\n{\"action\":\"handoff\",\"executor\":\"codex\",\"reason\":\"code work\"}\n```",
+            )
+            .with_repair(r#"{"action":"handoff","executor":"codex","reason":"code work"}"#),
+        );
+        let router = AgentRouter::new("kimi", store.clone(), executor.clone()).with_orchestrator(
+            Some(test_orchestrator_settings(write_orchestrator_policy(&tmp))),
+        );
+
+        let mut output = CollectingRouterOutputSink::default();
+        router
+            .handle(
+                RouterInput {
+                    session_key: "slack:dm:D1:111.000".to_string(),
+                    text: "please edit this repo".to_string(),
+                    user_id: None,
+                },
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_reply(), "codex response");
+        let saved = store
+            .load_or_create("slack:dm:D1:111.000", "kimi")
+            .await
+            .unwrap();
+        assert_eq!(saved.active_executor.as_deref(), Some("codex"));
+
+        let prompts = executor.prompts.lock().await;
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts[0].executor, "route-planner");
+        assert_eq!(prompts[1].executor, "route-planner");
+        assert_eq!(prompts[0].session_key, prompts[1].session_key);
+        assert!(
+            prompts[1]
+                .prompt
+                .starts_with(ORCHESTRATOR_REPAIR_PROMPT_PREFIX)
+        );
+        assert!(prompts[1].prompt.contains("Previous response:"));
+        assert!(prompts[1].prompt.contains("```json"));
+        assert!(!prompts[1].prompt.contains("Current user message:"));
+        assert_eq!(prompts[2].executor, "codex");
     }
 
     #[tokio::test]
