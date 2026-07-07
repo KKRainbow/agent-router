@@ -1305,8 +1305,8 @@ impl SlackSocketModeChannel {
         linked_channel: &str,
     ) -> bool {
         linked_channel == current_channel
-            || (!self.cfg.allowed_channels.is_empty()
-                && self.cfg.allowed_channels.contains(linked_channel))
+            || self.cfg.allowed_channels.is_empty()
+            || self.cfg.allowed_channels.contains(linked_channel)
     }
 
     fn should_sync_context(&self) -> bool {
@@ -2760,20 +2760,22 @@ mod tests {
     }
 
     #[test]
-    fn linked_threads_default_to_same_channel_unless_explicitly_allowed() {
+    fn linked_threads_follow_allowed_channels_semantics() {
         let channel = SlackSocketModeChannel::new(
             test_slack_config(true),
             Arc::new(ApprovalBroker::default()),
         );
 
         assert!(channel.should_accept_linked_thread_channel("C1", "C1"));
-        assert!(!channel.should_accept_linked_thread_channel("C1", "C2"));
+        assert!(channel.should_accept_linked_thread_channel("C1", "C2"));
 
         let mut cfg = test_slack_config(true);
         cfg.allowed_channels.insert("C2".to_string());
         let channel = SlackSocketModeChannel::new(cfg, Arc::new(ApprovalBroker::default()));
 
+        assert!(channel.should_accept_linked_thread_channel("C1", "C1"));
         assert!(channel.should_accept_linked_thread_channel("C1", "C2"));
+        assert!(!channel.should_accept_linked_thread_channel("C1", "C3"));
     }
 
     fn approval_request(session_key: &str) -> ApprovalRequest {
