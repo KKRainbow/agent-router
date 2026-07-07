@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use reqwest::{Client, StatusCode, Url, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +42,8 @@ use crate::{
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const SLACK_SOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
+const SLACK_SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const SLACK_MARKDOWN_BLOCK_CHAR_LIMIT: usize = 12_000;
 const SLACK_MARKDOWN_SNIPPET_FILENAME: &str = "agent-router-reply.md";
 const SLACK_MARKDOWN_SNIPPET_TYPE: &str = "markdown";
@@ -71,6 +73,12 @@ enum SlackRouteContext {
         bot_user_id: String,
     },
     None,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlackSocketLoopTimings {
+    ping_interval: Duration,
+    idle_timeout: Duration,
 }
 
 impl SlackSocketModeChannel {
@@ -111,43 +119,103 @@ impl SlackSocketModeChannel {
         tracing::info!("connecting Slack Socket Mode");
         let (stream, _) = connect_async(url).await?;
         tracing::info!(bot_user_id = %bot_user_id, "connected Slack Socket Mode");
-        let (mut sink, mut stream) = stream.split();
+        let (sink, stream) = stream.split();
+        self.run_socket_loop(
+            router,
+            bot_user_id,
+            sink,
+            stream,
+            SlackSocketLoopTimings {
+                ping_interval: SLACK_SOCKET_PING_INTERVAL,
+                idle_timeout: SLACK_SOCKET_IDLE_TIMEOUT,
+            },
+        )
+        .await
+    }
 
-        while let Some(frame) = stream.next().await {
-            let frame = frame?;
-            match frame {
-                Message::Text(text) => {
-                    let envelope: SlackEnvelope = serde_json::from_str(&text)?;
-                    if envelope.kind == "hello" {
-                        continue;
-                    }
-                    if let Some(envelope_id) = &envelope.envelope_id {
-                        sink.send(Message::Text(
-                            json!({"envelope_id": envelope_id}).to_string().into(),
-                        ))
-                        .await?;
-                    }
-                    let channel_ref = self.clone();
-                    let router_ref = router.clone();
-                    let bot_user_id = bot_user_id.to_string();
-                    tokio::spawn(async move {
-                        if let Err(err) = channel_ref
-                            .handle_envelope(envelope, router_ref, &bot_user_id)
-                            .await
-                        {
-                            tracing::warn!(error = %err, "failed to handle Slack envelope");
+    async fn run_socket_loop<S, St>(
+        self: Arc<Self>,
+        router: Arc<dyn RouterService>,
+        bot_user_id: &str,
+        mut sink: S,
+        mut stream: St,
+        timings: SlackSocketLoopTimings,
+    ) -> anyhow::Result<()>
+    where
+        S: Sink<Message> + Unpin,
+        S::Error: std::fmt::Display + Send + Sync + 'static,
+        St: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let now = tokio::time::Instant::now();
+        let mut heartbeat =
+            tokio::time::interval_at(now + timings.ping_interval, timings.ping_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_frame_at = now;
+
+        loop {
+            tokio::select! {
+                frame = stream.next() => {
+                    let Some(frame) = frame else {
+                        return Ok(());
+                    };
+                    let frame = frame?;
+                    last_frame_at = tokio::time::Instant::now();
+                    match frame {
+                        Message::Text(text) => {
+                            let envelope: SlackEnvelope = serde_json::from_str(&text)?;
+                            if envelope.kind == "hello" {
+                                continue;
+                            }
+                            if envelope.kind == "disconnect" {
+                                tracing::warn!(
+                                    reason = ?envelope.reason.as_deref(),
+                                    "Slack Socket Mode requested reconnect"
+                                );
+                                return Ok(());
+                            }
+                            if let Some(envelope_id) = &envelope.envelope_id {
+                                sink.send(Message::Text(
+                                    json!({"envelope_id": envelope_id}).to_string().into(),
+                                ))
+                                .await
+                                .map_err(|err| anyhow::anyhow!("failed to acknowledge Slack envelope: {err}"))?;
+                            }
+                            let channel_ref = self.clone();
+                            let router_ref = router.clone();
+                            let bot_user_id = bot_user_id.to_string();
+                            tokio::spawn(async move {
+                                if let Err(err) = channel_ref
+                                    .handle_envelope(envelope, router_ref, &bot_user_id)
+                                    .await
+                                {
+                                    tracing::warn!(error = %err, "failed to handle Slack envelope");
+                                }
+                            });
                         }
-                    });
+                        Message::Ping(payload) => sink
+                            .send(Message::Pong(payload))
+                            .await
+                            .map_err(|err| anyhow::anyhow!("failed to send Slack pong: {err}"))?,
+                        Message::Close(close) => {
+                            tracing::warn!(?close, "Slack Socket Mode closed");
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
-                Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
-                Message::Close(close) => {
-                    tracing::warn!(?close, "Slack Socket Mode closed");
-                    break;
+                _ = heartbeat.tick() => {
+                    if slack_socket_idle_timeout_expired(last_frame_at, timings.idle_timeout) {
+                        anyhow::bail!(
+                            "Slack Socket Mode idle for at least {}ms",
+                            timings.idle_timeout.as_millis()
+                        );
+                    }
+                    sink.send(Message::Ping(Vec::new().into()))
+                        .await
+                        .map_err(|err| anyhow::anyhow!("failed to send Slack ping: {err}"))?;
                 }
-                _ => {}
             }
         }
-        Ok(())
     }
 
     async fn auth_test_until_ready(&self) -> anyhow::Result<String> {
@@ -1600,6 +1668,8 @@ struct SlackEnvelope {
     kind: String,
     envelope_id: Option<String>,
     #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
     payload: Value,
 }
 
@@ -1960,6 +2030,13 @@ fn slack_socket_error_is_fatal(err: &anyhow::Error) -> bool {
     })
 }
 
+fn slack_socket_idle_timeout_expired(
+    last_frame_at: tokio::time::Instant,
+    idle_timeout: Duration,
+) -> bool {
+    last_frame_at.elapsed() >= idle_timeout
+}
+
 fn cached_thread_fetch_after_error(
     err: &anyhow::Error,
     current_cache: impl FnOnce() -> Vec<SlackThreadMessage>,
@@ -2259,6 +2336,65 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(*router.finished.lock().await, expected);
+    }
+
+    #[tokio::test]
+    async fn socket_loop_reconnects_on_slack_disconnect_envelope() {
+        let channel = Arc::new(SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        ));
+        let router = Arc::new(RecordingRouter::default());
+        let stream = futures_util::stream::iter([Ok(Message::Text(
+            json!({
+                "type": "disconnect",
+                "reason": "refresh_requested"
+            })
+            .to_string()
+            .into(),
+        ))]);
+
+        channel
+            .run_socket_loop(
+                router,
+                "U_BOT",
+                futures_util::sink::drain::<Message>(),
+                stream,
+                SlackSocketLoopTimings {
+                    ping_interval: Duration::from_secs(1),
+                    idle_timeout: Duration::from_secs(3),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_loop_exits_after_idle_timeout() {
+        let channel = Arc::new(SlackSocketModeChannel::new(
+            test_slack_config(true),
+            Arc::new(ApprovalBroker::default()),
+        ));
+        let router = Arc::new(RecordingRouter::default());
+        let stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+
+        let err = channel
+            .run_socket_loop(
+                router,
+                "U_BOT",
+                futures_util::sink::drain::<Message>(),
+                stream,
+                SlackSocketLoopTimings {
+                    ping_interval: Duration::from_millis(5),
+                    idle_timeout: Duration::from_millis(15),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Slack Socket Mode idle"));
     }
 
     #[test]
