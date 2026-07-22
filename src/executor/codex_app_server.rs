@@ -2234,14 +2234,14 @@ impl CodexReplyText {
     fn should_break_before(&self, update: &ExecutorUpdate) -> bool {
         self.started
             && matches!(
-                (&self.last_message_id, &update.reply_message_id),
+                (&self.last_message_id, &update.message_id),
                 (Some(last), Some(next)) if last != next
             )
     }
 
     fn observe(&mut self, update: &ExecutorUpdate) {
         self.started = true;
-        if let Some(id) = &update.reply_message_id {
+        if let Some(id) = &update.message_id {
             self.last_message_id = Some(id.clone());
         }
     }
@@ -2297,7 +2297,7 @@ fn collect_codex_notification(
             if phase != "commentary"
                 && let Some(id) = reply_message_id
             {
-                update = update.with_reply_message_id(id);
+                update = update.with_message_id(id);
             }
             if phase == "commentary" {
                 update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text));
@@ -2799,10 +2799,7 @@ mod tests {
 
         assert_eq!(final_text.as_str(), "done");
         assert_eq!(collected.updates.len(), 1);
-        assert_eq!(
-            collected.updates[0].reply_message_id.as_deref(),
-            Some("msg-1")
-        );
+        assert_eq!(collected.updates[0].message_id.as_deref(), Some("msg-1"));
         assert!(collected.updates[0].channel_event.is_none());
     }
 

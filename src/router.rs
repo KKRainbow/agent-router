@@ -3333,14 +3333,14 @@ impl RouterReplyStreamState {
     fn should_break_before(&self, update: &ExecutorUpdate) -> bool {
         self.started
             && matches!(
-                (&self.last_message_id, &update.reply_message_id),
+                (&self.last_message_id, &update.message_id),
                 (Some(last), Some(next)) if last != next
             )
     }
 
     fn observe(&mut self, update: &ExecutorUpdate) {
         self.started = true;
-        if let Some(id) = &update.reply_message_id {
+        if let Some(id) = &update.message_id {
             self.last_message_id = Some(id.clone());
         }
     }
@@ -9206,20 +9206,17 @@ mod tests {
         let mut sink = RouterExecutorEventSink::new(begun.guard, "codex", &mut output);
 
         sink.send(
-            ExecutorUpdate::new("agent_message_chunk", "", "first", "")
-                .with_reply_message_id("msg-1"),
+            ExecutorUpdate::new("agent_message_chunk", "", "first", "").with_message_id("msg-1"),
         )
         .await
         .unwrap();
         sink.send(
-            ExecutorUpdate::new("agent_message_chunk", "", " more", "")
-                .with_reply_message_id("msg-1"),
+            ExecutorUpdate::new("agent_message_chunk", "", " more", "").with_message_id("msg-1"),
         )
         .await
         .unwrap();
         sink.send(
-            ExecutorUpdate::new("agent_message_chunk", "", "second", "")
-                .with_reply_message_id("msg-2"),
+            ExecutorUpdate::new("agent_message_chunk", "", "second", "").with_message_id("msg-2"),
         )
         .await
         .unwrap();

@@ -862,7 +862,7 @@ impl AcpSession {
             return ExecutorPromptOutcome::Cancelled;
         }
         if let Err(err) = pending_message_chunks
-            .flush_as_final(events, &mut text_parts)
+            .flush_at_turn_end(events, &mut text_parts)
             .await
         {
             let outcome = self
@@ -938,7 +938,8 @@ async fn collect_update(
     text_parts: &mut ReplyTextParts,
     pending_message_chunks: &mut PendingAcpMessageChunks,
 ) -> anyhow::Result<()> {
-    if PendingAcpMessageChunks::should_buffer(&update) {
+    let should_buffer = PendingAcpMessageChunks::should_buffer(&update);
+    if should_buffer && pending_message_chunks.can_append(&update) {
         pending_message_chunks.push(update);
         return Ok(());
     }
@@ -949,7 +950,12 @@ async fn collect_update(
             .flush_as_final(events, text_parts)
             .await?;
     }
-    collect_ready_update(update, events, text_parts).await
+    if should_buffer {
+        pending_message_chunks.push(update);
+        Ok(())
+    } else {
+        collect_ready_update(update, events, text_parts).await
+    }
 }
 
 async fn collect_ready_update(
@@ -970,9 +976,27 @@ struct PendingAcpMessageChunks {
 
 impl PendingAcpMessageChunks {
     fn should_buffer(update: &ExecutorUpdate) -> bool {
+        Self::is_unphased_message(update) || Self::is_identified_progress(update)
+    }
+
+    fn is_unphased_message(update: &ExecutorUpdate) -> bool {
         update.kind == "agent_message_chunk"
             && update.channel_event.is_none()
-            && update.reply_message_id.is_none()
+            && update.message_id.is_none()
+    }
+
+    fn is_identified_progress(update: &ExecutorUpdate) -> bool {
+        update.kind == "agent_progress" && update.message_id.is_some()
+    }
+
+    fn can_append(&self, update: &ExecutorUpdate) -> bool {
+        let Some(first) = self.updates.first() else {
+            return true;
+        };
+        if Self::is_unphased_message(first) {
+            return Self::is_unphased_message(update);
+        }
+        Self::is_identified_progress(update) && first.message_id == update.message_id
     }
 
     fn push(&mut self, update: ExecutorUpdate) {
@@ -980,27 +1004,37 @@ impl PendingAcpMessageChunks {
     }
 
     fn should_flush_as_progress_before(&self, update: &ExecutorUpdate) -> bool {
-        !self.updates.is_empty() && update_starts_activity(update)
+        !self.updates.is_empty() && (self.holds_progress() || update_starts_activity(update))
     }
 
     fn should_flush_as_final_before(&self, update: &ExecutorUpdate) -> bool {
-        !self.updates.is_empty() && update.kind == "agent_message_chunk"
+        !self.updates.is_empty() && !self.holds_progress() && update.kind == "agent_message_chunk"
+    }
+
+    fn holds_progress(&self) -> bool {
+        self.updates
+            .first()
+            .is_some_and(|update| update.kind == "agent_progress")
     }
 
     async fn flush_as_progress(
         &mut self,
         events: &mut dyn ExecutorEventSink,
     ) -> anyhow::Result<()> {
+        let message_id = self
+            .updates
+            .first()
+            .and_then(|update| update.message_id.clone());
         let text = self.take_text();
         if text.trim().is_empty() {
             return Ok(());
         }
-        events
-            .send(
-                ExecutorUpdate::new("agent_progress", "", text.clone(), "")
-                    .with_channel_event(ExecutorChannelEvent::agent_progress(text)),
-            )
-            .await
+        let mut update = ExecutorUpdate::new("agent_progress", "", text.clone(), "")
+            .with_channel_event(ExecutorChannelEvent::agent_progress(text));
+        if let Some(message_id) = message_id {
+            update = update.with_message_id(message_id);
+        }
+        events.send(update).await
     }
 
     async fn flush_as_final(
@@ -1013,6 +1047,18 @@ impl PendingAcpMessageChunks {
             collect_ready_update(update, events, text_parts).await?;
         }
         Ok(())
+    }
+
+    async fn flush_at_turn_end(
+        &mut self,
+        events: &mut dyn ExecutorEventSink,
+        text_parts: &mut ReplyTextParts,
+    ) -> anyhow::Result<()> {
+        if self.holds_progress() {
+            self.flush_as_progress(events).await
+        } else {
+            self.flush_as_final(events, text_parts).await
+        }
     }
 
     fn take_text(&mut self) -> String {
@@ -1068,14 +1114,14 @@ impl ReplyTextParts {
     fn should_break_before(&self, update: &ExecutorUpdate) -> bool {
         self.started
             && matches!(
-                (&self.last_message_id, &update.reply_message_id),
+                (&self.last_message_id, &update.message_id),
                 (Some(last), Some(next)) if last != next
             )
     }
 
     fn observe(&mut self, update: &ExecutorUpdate) {
         self.started = true;
-        if let Some(id) = &update.reply_message_id {
+        if let Some(id) = &update.message_id {
             self.last_message_id = Some(id.clone());
         }
     }
@@ -1924,7 +1970,7 @@ fn project_acp_update_with_state(
         .or_else(|| params.get("sessionUpdate"))
         .unwrap_or(params);
     let update = acp_logical_update(raw_update);
-    let reply_message_id = acp_reply_message_id(raw_update, update);
+    let message_id = acp_message_id(raw_update, update);
     let tool_call_id = tool_call_id(update);
     let kind = update
         .get("sessionUpdate")
@@ -2006,11 +2052,10 @@ fn project_acp_update_with_state(
         None
     };
     let is_agent_progress = normalized_kind == "agent_progress";
-    let is_final_agent_message = !is_agent_progress && normalized_kind == "agent_message_chunk";
     let mut update =
         ExecutorUpdate::new(normalized_kind, title.clone(), text.clone(), status.clone());
-    if is_final_agent_message && let Some(id) = reply_message_id {
-        update = update.with_reply_message_id(id);
+    if is_agent_message && let Some(id) = message_id {
+        update = update.with_message_id(id);
     }
     if is_agent_progress && !text.trim().is_empty() {
         update = update.with_channel_event(ExecutorChannelEvent::agent_progress(text.clone()));
@@ -2035,15 +2080,15 @@ fn acp_logical_update(update: &Value) -> &Value {
     update
 }
 
-fn acp_reply_message_id(raw_update: &Value, update: &Value) -> Option<String> {
+fn acp_message_id(raw_update: &Value, update: &Value) -> Option<String> {
     raw_update
         .get("payload")
-        .and_then(reply_message_id_field)
-        .or_else(|| reply_message_id_field(update))
-        .or_else(|| reply_message_id_field(raw_update))
+        .and_then(message_id_field)
+        .or_else(|| message_id_field(update))
+        .or_else(|| message_id_field(raw_update))
 }
 
-fn reply_message_id_field(value: &Value) -> Option<String> {
+fn message_id_field(value: &Value) -> Option<String> {
     ["messageId", "message_id", "itemId", "item_id", "id"]
         .into_iter()
         .find_map(|field| {
@@ -2877,6 +2922,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_identified_commentary_chunks_flush_as_single_progress() {
+        let mut events = CollectingExecutorEventSink::default();
+        let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
+
+        for chunk in ["补", "了", "哪", "一", "层", "。"] {
+            collect_update(
+                project_acp_update(&json!({
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "msg-progress",
+                            "content": {"type": "text", "text": chunk},
+                            "_meta": {"codex": {"phase": "commentary"}}
+                        }
+                    }
+                }))
+                .unwrap(),
+                &mut events,
+                &mut text_parts,
+                &mut pending_message_chunks,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(events.updates.is_empty());
+        collect_update(
+            project_acp_update(&json!({
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-1",
+                        "title": "Bash",
+                        "rawInput": {"command": "cargo test"},
+                        "status": "pending"
+                    }
+                }
+            }))
+            .unwrap(),
+            &mut events,
+            &mut text_parts,
+            &mut pending_message_chunks,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.updates.len(), 2);
+        let progress = events.updates[0].channel_event.as_ref().unwrap();
+        assert_eq!(progress.kind, ExecutorChannelEventKind::AgentProgress);
+        assert_eq!(progress.text, "补了哪一层。");
+        assert_eq!(
+            events.updates[1].channel_event.as_ref().unwrap().kind,
+            ExecutorChannelEventKind::ToolCall
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_distinct_commentary_message_ids_remain_separate() {
+        let mut events = CollectingExecutorEventSink::default();
+        let mut text_parts = ReplyTextParts::default();
+        let mut pending_message_chunks = PendingAcpMessageChunks::default();
+
+        for (message_id, chunk) in [
+            ("msg-1", "First"),
+            ("msg-1", " step."),
+            ("msg-2", "Second"),
+            ("msg-2", " step."),
+        ] {
+            collect_update(
+                project_acp_update(&json!({
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": message_id,
+                            "content": {"type": "text", "text": chunk},
+                            "_meta": {"codex": {"phase": "commentary"}}
+                        }
+                    }
+                }))
+                .unwrap(),
+                &mut events,
+                &mut text_parts,
+                &mut pending_message_chunks,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(events.updates.len(), 1);
+        pending_message_chunks
+            .flush_at_turn_end(&mut events, &mut text_parts)
+            .await
+            .unwrap();
+
+        let progress = events
+            .updates
+            .iter()
+            .map(|update| update.channel_event.as_ref().unwrap().text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(progress, ["First step.", "Second step."]);
+        assert!(text_parts.is_empty());
+    }
+
+    #[tokio::test]
     async fn acp_unphased_chunks_flush_to_final_text_at_turn_end() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = ReplyTextParts::default();
@@ -2976,7 +3129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_distinct_reply_message_ids_separate_final_text() {
+    async fn acp_distinct_message_ids_separate_final_text() {
         let mut events = CollectingExecutorEventSink::default();
         let mut text_parts = ReplyTextParts::default();
         let mut pending_message_chunks = PendingAcpMessageChunks::default();
@@ -3003,8 +3156,8 @@ mod tests {
         }
 
         assert_eq!(text_parts.join(), "first\n\nsecond");
-        assert_eq!(events.updates[0].reply_message_id.as_deref(), Some("msg-1"));
-        assert_eq!(events.updates[1].reply_message_id.as_deref(), Some("msg-2"));
+        assert_eq!(events.updates[0].message_id.as_deref(), Some("msg-1"));
+        assert_eq!(events.updates[1].message_id.as_deref(), Some("msg-2"));
     }
 
     #[tokio::test]
@@ -3051,8 +3204,8 @@ mod tests {
 
         assert_eq!(text_parts.join(), "hello world");
         assert_eq!(events.updates.len(), 2);
-        assert_eq!(events.updates[0].reply_message_id, None);
-        assert_eq!(events.updates[1].reply_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(events.updates[0].message_id, None);
+        assert_eq!(events.updates[1].message_id.as_deref(), Some("msg-1"));
     }
 
     #[tokio::test]
@@ -3088,8 +3241,8 @@ mod tests {
         }
 
         assert_eq!(text_parts.join(), "first chunk");
-        assert_eq!(events.updates[0].reply_message_id.as_deref(), Some("msg-1"));
-        assert_eq!(events.updates[1].reply_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(events.updates[0].message_id.as_deref(), Some("msg-1"));
+        assert_eq!(events.updates[1].message_id.as_deref(), Some("msg-1"));
     }
 
     #[tokio::test]
