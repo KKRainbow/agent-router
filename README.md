@@ -217,7 +217,8 @@ executors:
   pi:
     protocol: pi_rpc
     command: pi
-    model: openai/gpt-5.1-codex
+    provider: openai
+    model: gpt-5.1-codex
     thinking_effort: high
 
 slack:

@@ -284,6 +284,7 @@ struct FileExecutorConfig {
     machine: Option<String>,
     command: Option<String>,
     args: Option<Vec<String>>,
+    provider: Option<String>,
     model: Option<String>,
     thinking_effort: Option<String>,
     cwd: Option<PathBuf>,
@@ -703,29 +704,28 @@ fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Resul
         None if protocol == ExecutorProtocol::AppServer => vec!["app-server".to_string()],
         None => Vec::new(),
     };
+    let provider = raw.provider.filter(|value| !value.trim().is_empty());
     let model = raw.model.filter(|value| !value.trim().is_empty());
     let thinking_effort = raw.thinking_effort.filter(|value| !value.trim().is_empty());
     anyhow::ensure!(
-        protocol == ExecutorProtocol::PiRpc || (model.is_none() && thinking_effort.is_none()),
-        "executors.{name}.model and thinking_effort are only supported for pi_rpc executors"
+        protocol == ExecutorProtocol::PiRpc
+            || (provider.is_none() && model.is_none() && thinking_effort.is_none()),
+        "executors.{name}.provider, model, and thinking_effort are only supported for pi_rpc executors"
     );
-    if let Some(model) = model {
-        anyhow::ensure!(
-            !args
-                .iter()
-                .any(|arg| arg == "--model" || arg.starts_with("--model=")),
-            "executors.{name}.model conflicts with --model in args"
-        );
-        args.extend(["--model".to_string(), model]);
-    }
-    if let Some(thinking_effort) = thinking_effort {
-        anyhow::ensure!(
-            !args
-                .iter()
-                .any(|arg| arg == "--thinking" || arg.starts_with("--thinking=")),
-            "executors.{name}.thinking_effort conflicts with --thinking in args"
-        );
-        args.extend(["--thinking".to_string(), thinking_effort]);
+    for (field, flag, value) in [
+        ("provider", "--provider", provider),
+        ("model", "--model", model),
+        ("thinking_effort", "--thinking", thinking_effort),
+    ] {
+        if let Some(value) = value {
+            anyhow::ensure!(
+                !args
+                    .iter()
+                    .any(|arg| arg == flag || arg.starts_with(&format!("{flag}="))),
+                "executors.{name}.{field} conflicts with {flag} in args"
+            );
+            args.extend([flag.to_string(), value]);
+        }
     }
     Ok(ExecutorConfig {
         name,
@@ -1563,7 +1563,7 @@ executors:
     }
 
     #[test]
-    fn parses_pi_rpc_model_and_thinking_effort() {
+    fn parses_pi_rpc_provider_model_and_thinking_effort() {
         let raw = r#"
 router:
   default_executor: pi
@@ -1571,7 +1571,8 @@ executors:
   pi:
     protocol: pi_rpc
     args: ["--offline"]
-    model: openai/gpt-5.1-codex
+    provider: openai
+    model: gpt-5.1-codex
     thinking_effort: high
 "#;
         let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
@@ -1585,8 +1586,10 @@ executors:
             pi.args,
             [
                 "--offline",
+                "--provider",
+                "openai",
                 "--model",
-                "openai/gpt-5.1-codex",
+                "gpt-5.1-codex",
                 "--thinking",
                 "high"
             ]
@@ -1610,6 +1613,26 @@ executors:
         assert!(
             err.to_string()
                 .contains("executors.pi.model conflicts with --model in args")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_pi_provider_config() {
+        let raw = r#"
+router:
+  default_executor: pi
+executors:
+  pi:
+    protocol: pi_rpc
+    args: ["--provider=openai"]
+    provider: anthropic
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("executors.pi.provider conflicts with --provider in args")
         );
     }
 

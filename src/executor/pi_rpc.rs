@@ -2408,8 +2408,10 @@ while True:
         assert_eq!(
             pi_rpc_args(
                 &[
+                    "--provider".to_string(),
+                    "openai".to_string(),
                     "--model".to_string(),
-                    "openai/gpt-5.1-codex".to_string(),
+                    "gpt-5.1-codex".to_string(),
                     "--thinking".to_string(),
                     "high".to_string(),
                 ],
@@ -2417,8 +2419,10 @@ while True:
             )
             .unwrap(),
             [
+                "--provider",
+                "openai",
                 "--model",
-                "openai/gpt-5.1-codex",
+                "gpt-5.1-codex",
                 "--thinking",
                 "high",
                 "--mode",
