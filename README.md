@@ -214,6 +214,12 @@ executors:
   codex:
     protocol: app_server
     command: codex
+  pi:
+    protocol: pi_rpc
+    command: pi
+    provider: openai
+    model: gpt-5.1-codex
+    thinking_effort: high
 
 slack:
   require_mention: true

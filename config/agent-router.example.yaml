@@ -55,6 +55,10 @@ executors:
     machine: local
     command: pi
     args: []
+    # provider: openai
+    # model: gpt-5.1-codex
+    # Supported values: off, minimal, low, medium, high, xhigh, max.
+    # thinking_effort: high
   # route-planner:
   #   protocol: acp
   #   machine: local

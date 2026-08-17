@@ -2405,6 +2405,31 @@ while True:
             pi_rpc_args(&[], Some("session-file")).unwrap(),
             ["--mode", "rpc", "--approve", "--session", "session-file"]
         );
+        assert_eq!(
+            pi_rpc_args(
+                &[
+                    "--provider".to_string(),
+                    "openai".to_string(),
+                    "--model".to_string(),
+                    "gpt-5.1-codex".to_string(),
+                    "--thinking".to_string(),
+                    "high".to_string(),
+                ],
+                None,
+            )
+            .unwrap(),
+            [
+                "--provider",
+                "openai",
+                "--model",
+                "gpt-5.1-codex",
+                "--thinking",
+                "high",
+                "--mode",
+                "rpc",
+                "--approve"
+            ]
+        );
     }
 
     #[test]

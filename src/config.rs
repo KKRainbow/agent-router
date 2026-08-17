@@ -284,6 +284,9 @@ struct FileExecutorConfig {
     machine: Option<String>,
     command: Option<String>,
     args: Option<Vec<String>>,
+    provider: Option<String>,
+    model: Option<String>,
+    thinking_effort: Option<String>,
     cwd: Option<PathBuf>,
     env: Option<BTreeMap<String, String>>,
 }
@@ -696,11 +699,34 @@ fn parse_executor_config(name: String, raw: FileExecutorConfig) -> anyhow::Resul
         .or_else(|| (protocol == ExecutorProtocol::ClaudeStreamJson).then(|| "claude".to_string()))
         .or_else(|| (protocol == ExecutorProtocol::PiRpc).then(|| "pi".to_string()))
         .ok_or_else(|| anyhow::anyhow!("executors.{name}.command is required"))?;
-    let args = match raw.args {
+    let mut args = match raw.args {
         Some(args) => args,
         None if protocol == ExecutorProtocol::AppServer => vec!["app-server".to_string()],
         None => Vec::new(),
     };
+    let provider = raw.provider.filter(|value| !value.trim().is_empty());
+    let model = raw.model.filter(|value| !value.trim().is_empty());
+    let thinking_effort = raw.thinking_effort.filter(|value| !value.trim().is_empty());
+    anyhow::ensure!(
+        protocol == ExecutorProtocol::PiRpc
+            || (provider.is_none() && model.is_none() && thinking_effort.is_none()),
+        "executors.{name}.provider, model, and thinking_effort are only supported for pi_rpc executors"
+    );
+    for (field, flag, value) in [
+        ("provider", "--provider", provider),
+        ("model", "--model", model),
+        ("thinking_effort", "--thinking", thinking_effort),
+    ] {
+        if let Some(value) = value {
+            anyhow::ensure!(
+                !args
+                    .iter()
+                    .any(|arg| arg == flag || arg.starts_with(&format!("{flag}="))),
+                "executors.{name}.{field} conflicts with {flag} in args"
+            );
+            args.extend([flag.to_string(), value]);
+        }
+    }
     Ok(ExecutorConfig {
         name,
         protocol,
@@ -1534,6 +1560,80 @@ executors:
         assert_eq!(pi.protocol, ExecutorProtocol::PiRpc);
         assert_eq!(pi.command, "pi");
         assert!(pi.args.is_empty());
+    }
+
+    #[test]
+    fn parses_pi_rpc_provider_model_and_thinking_effort() {
+        let raw = r#"
+router:
+  default_executor: pi
+executors:
+  pi:
+    protocol: pi_rpc
+    args: ["--offline"]
+    provider: openai
+    model: gpt-5.1-codex
+    thinking_effort: high
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let cfg = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap();
+        let pi = cfg.executors.get("pi").unwrap();
+
+        assert_eq!(cfg.router.default_executor, "pi");
+        assert_eq!(pi.protocol, ExecutorProtocol::PiRpc);
+        assert_eq!(pi.command, "pi");
+        assert_eq!(
+            pi.args,
+            [
+                "--offline",
+                "--provider",
+                "openai",
+                "--model",
+                "gpt-5.1-codex",
+                "--thinking",
+                "high"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_pi_model_config() {
+        let raw = r#"
+router:
+  default_executor: pi
+executors:
+  pi:
+    protocol: pi_rpc
+    args: ["--model=default"]
+    model: openai/gpt-5.1-codex
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("executors.pi.model conflicts with --model in args")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_pi_provider_config() {
+        let raw = r#"
+router:
+  default_executor: pi
+executors:
+  pi:
+    protocol: pi_rpc
+    args: ["--provider=openai"]
+    provider: anthropic
+"#;
+        let file_cfg = serde_yaml::from_str::<FileConfig>(raw).unwrap();
+        let err = AppConfig::from_file_config(file_cfg, EnvConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("executors.pi.provider conflicts with --provider in args")
+        );
     }
 
     #[test]
