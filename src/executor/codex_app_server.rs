@@ -2176,13 +2176,11 @@ fn is_json_rpc_like(message: &Value) -> bool {
     if map.contains_key("id") {
         return map.get("method").and_then(Value::as_str).is_some();
     }
-    map.get("method")
-        .and_then(Value::as_str)
-        .is_some_and(is_codex_notification_method)
-}
-
-fn is_codex_notification_method(method: &str) -> bool {
-    matches!(method, "item/started" | "item/completed" | "turn/completed")
+    // Server-initiated notifications (e.g. `configWarning`) carry a method
+    // name and no id. Accept every method name here: dispatch drops the ones
+    // no subscriber waits for, and codex may add new notifications in any
+    // release. Strict mode still rejects non-JSON-RPC-shaped JSON.
+    map.get("method").and_then(Value::as_str).is_some()
 }
 
 async fn write_json(stdin: &SharedStdin, value: Value) -> anyhow::Result<()> {
@@ -2702,11 +2700,18 @@ mod tests {
         assert!(is_json_rpc_like(
             &json!({"method": "item/started", "params": {"item": {"type": "fileChange"}}})
         ));
+        // codex 0.151.x emits these server notifications before the client
+        // finishes handshaking; they must not kill strict-stdout sessions.
+        assert!(is_json_rpc_like(
+            &json!({"method": "configWarning", "params": {"summary": "bwrap"}})
+        ));
+        assert!(is_json_rpc_like(
+            &json!({"method": "remoteControl/status/changed", "params": {}})
+        ));
         assert!(is_json_rpc_like(
             &json!({"id": 1, "method": "client/request"})
         ));
         assert!(!is_json_rpc_like(&json!({"id": 1, "message": "startup"})));
-        assert!(!is_json_rpc_like(&json!({"method": "startup"})));
         assert!(!is_json_rpc_like(&json!({"hello": "world"})));
         assert!(!is_json_rpc_like(&json!("banner")));
     }
