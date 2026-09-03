@@ -1,0 +1,74 @@
+# agent-router 运行配置。Slack / QQ 凭证不入库，由 dotenv 自动加载
+# （候选路径含 ../.env，即 /data/project/hermes/.env），凭证齐全时对应
+# 渠道自动启用。
+router:
+  default_executor: codex
+
+approval:
+  default_mode: normal
+
+workspace:
+  root: /data/project/agent-router-workspaces/
+
+machines:
+  local:
+    type: local
+    workspace_root: /data/project/agent-router-workspaces/
+    skill_roots:
+      - /home/admin/.codex/skills
+  # 远程执行机。executor 通过 `machine` 字段引用；PATH 注入 nvm，让
+  # `codex` 可直接解析。$PATH 由 build_remote_exec_script 特判展开。
+  zbs-dev:
+    type: ssh
+    host: admin@172.17.0.2
+    workspace_root: /data/project/agent-router-workspaces/
+    env:
+      PATH: /home/admin/.nvm/versions/node/v24.14.0/bin:$PATH
+    skill_roots:
+      - /home/admin/.codex/skills
+
+executors:
+  codex:
+    protocol: app_server
+    machine: local
+    command: codex
+  kimi:
+    protocol: acp
+    machine: local
+    command: kimi
+    args: ["acp"]
+  claude:
+    protocol: claude_stream_json
+    machine: local
+    command: claude
+    args: []
+  # 远程 codex：app_server 经 ssh machine 运行，机器层负责包装命令，
+  # 与协议无关。
+  codex-remote:
+    protocol: app_server
+    machine: zbs-dev
+    command: codex
+
+slack:
+  require_mention: true
+  channel_events: compact
+  owner_user_ids: []
+  allowed_channels: []
+  free_response_channels: []
+
+qq:
+  channel_events: compact
+  sandbox: false
+  allowed_users: []
+  allowed_groups: []
+
+web:
+  enabled: false
+
+tui:
+  enabled: false
+
+telegram:
+  # hermes env 中同样存在 TELEGRAM_BOT_TOKEN，会触发自动启用；
+  # 本配置只启用 QQ 与 Slack，显式关闭。
+  enabled: false
