@@ -19,3 +19,5 @@
 - `/agent <name>`、`/new`、`/stop` 等命令由路由器直接处理，不会进入
   本决策。
 - 只输出一个 JSON 对象，不要输出其他内容；`reason` 用一句话简述。
+- `omp-router` 是路由器自身，不是任务 executor，永远不要 handoff
+  到它。
