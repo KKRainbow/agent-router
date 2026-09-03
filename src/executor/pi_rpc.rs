@@ -1697,8 +1697,12 @@ fn reject_lifecycle_args(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn has_trust_flag(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--approve" | "-a" | "--no-approve" | "-na"))
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--approve" | "-a" | "--no-approve" | "-na" | "--auto-approve"
+        ) || arg.starts_with("--approval-mode=")
+    })
 }
 
 fn command_response<'a>(message: &'a Value, request_id: &str, command: &str) -> Option<&'a Value> {
@@ -2494,6 +2498,15 @@ while True:
         assert_eq!(
             pi_rpc_args(&["-a".to_string()], None).unwrap(),
             ["-a", "--mode", "rpc"]
+        );
+        // OMP lineage CLIs reject pi's --approve; these are its equivalents.
+        assert_eq!(
+            pi_rpc_args(&["--auto-approve".to_string()], None).unwrap(),
+            ["--auto-approve", "--mode", "rpc"]
+        );
+        assert_eq!(
+            pi_rpc_args(&["--approval-mode=yolo".to_string()], None).unwrap(),
+            ["--approval-mode=yolo", "--mode", "rpc"]
         );
     }
 
