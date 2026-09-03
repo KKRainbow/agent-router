@@ -3,6 +3,14 @@
 # 渠道自动启用。
 router:
   default_executor: codex
+  # 路由器：omp (glm-5.3-flash)，per_turn 每条消息重新决策，规则见
+  # config/agent-routing.md：显式点名 agent 优先，其次 Slack 一律
+  # codex-zbs，否则 stay。
+  orchestrator:
+    enabled: true
+    mode: per_turn
+    executor: omp
+    policy_file: config/agent-routing.md
 
 approval:
   default_mode: normal
@@ -44,15 +52,22 @@ executors:
     args: []
   # 远程 codex：app_server 经 ssh machine 运行，机器层负责包装命令，
   # 与协议无关。
-  codex-remote:
+  codex-zbs:
     protocol: app_server
     machine: zbs-dev
     command: codex
+  # 路由/对话 executor：omp 与 pi 同源，pi_rpc 协议经 --mode rpc 对接；
+  # --auto-approve 使 pi_rpc_args 跳过注入 pi 专用的 --approve。
+  omp:
+    protocol: pi_rpc
+    machine: local
+    command: omp
+    args: ["--auto-approve", "--model", "zhipu-coding-plan/glm-5.3-flash"]
 
 slack:
   require_mention: true
   channel_events: compact
-  owner_user_ids: []
+  owner_user_ids: [U03LA0JQ491]
   allowed_channels: []
   free_response_channels: []
 
