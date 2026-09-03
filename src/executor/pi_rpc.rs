@@ -1700,7 +1700,7 @@ fn has_trust_flag(args: &[String]) -> bool {
     args.iter().any(|arg| {
         matches!(
             arg.as_str(),
-            "--approve" | "-a" | "--no-approve" | "-na" | "--auto-approve"
+            "--approve" | "-a" | "--no-approve" | "-na" | "--auto-approve" | "--approval-mode"
         ) || arg.starts_with("--approval-mode=")
     })
 }
@@ -2507,6 +2507,14 @@ while True:
         assert_eq!(
             pi_rpc_args(&["--approval-mode=yolo".to_string()], None).unwrap(),
             ["--approval-mode=yolo", "--mode", "rpc"]
+        );
+        assert_eq!(
+            pi_rpc_args(
+                &["--approval-mode".to_string(), "always-ask".to_string()],
+                None
+            )
+            .unwrap(),
+            ["--approval-mode", "always-ask", "--mode", "rpc"]
         );
     }
 
