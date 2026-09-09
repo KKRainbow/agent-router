@@ -35,7 +35,7 @@ machines:
   #   host: admin@172.17.0.2
   #   workspace_root: /data/project/agent-router-workspaces/
   #   env:
-  #     PATH: /home/admin/.nvm/versions/node/v24.14.0/bin:$PATH
+  #     PATH: /home/admin/.local/bin:$PATH
   #   skill_roots:
   #     - /home/admin/.codex/skills
   #     - /data/project/ai/skills
@@ -70,11 +70,13 @@ executors:
   #   machine: local
   #   command: kimi
   #   args: ["acp", "--profile", "route-planner"]
-  # Remote ACP over SSH. SSH details live on the Machine, not in command args.
+
+  # Remote codex over SSH. SSH details live on the Machine, not in command
+  # args; PATH from the machine env makes `codex` resolvable remotely.
   # codex-zbs:
-  #   protocol: acp
+  #   protocol: app_server
   #   machine: zbs-dev
-  #   command: /home/admin/.nvm/versions/node/v24.14.0/bin/codex-acp
+  #   command: codex
   # Claude Code CLI via stream-json stdio protocol.
   # Requires `claude` installed and ANTHROPIC_API_KEY available.
   claude:
