@@ -2384,9 +2384,16 @@ fn validate_turn_completed(notification: &Value) -> anyhow::Result<bool> {
     if matches!(status, "interrupted" | "cancelled" | "canceled") {
         return Ok(true);
     }
+    // Turn errors are codex infrastructure diagnostics (HTTP status,
+    // upstream URL, request id), not echoed prompt text, so surface the
+    // message directly; protocol-level errors stay redacted via
+    // summarize_json_rpc_error.
     let error = turn
         .get("error")
-        .map(summarize_json_rpc_error)
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(|message| truncate_text(message.to_string(), 1_000))
         .unwrap_or_else(|| "no error details".to_string());
     anyhow::bail!("codex app-server turn ended with status `{status}`: {error}")
 }
@@ -2849,6 +2856,19 @@ mod tests {
         }
 
         assert_eq!(final_text.as_str(), "first\n\nsecond");
+    }
+
+    #[test]
+    fn codex_failed_turn_without_error_reports_no_details() {
+        let err = validate_turn_completed(&json!({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "failed"}},
+        }))
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("status `failed`"));
+        assert!(message.contains("no error details"));
     }
 
     #[test]
@@ -4255,8 +4275,7 @@ for line in sys.stdin:
 
         let message = err.to_string();
         assert!(message.contains("status `failed`"));
-        assert!(message.contains("code=123"));
-        assert!(!message.contains("secret error detail"));
+        assert!(message.contains("secret error detail"));
     }
 
     #[tokio::test]
