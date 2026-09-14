@@ -46,6 +46,12 @@ executors:
     machine: local
     command: kimi
     args: ["acp"]
+  # Devin CLI ACP server. Run `devin auth login` first so the spawned process can reuse stored credentials.
+  devin:
+    protocol: acp
+    machine: local
+    command: devin
+    args: ["acp"]
   codex:
     protocol: app_server
     machine: local
