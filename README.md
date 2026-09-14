@@ -41,6 +41,7 @@ Planned/supporting implementation targets:
 Agent integrations:
 
 - Kimi through ACP, for example `kimi acp`
+- Devin through ACP, for example `devin acp`
 - Codex through app-server
 - Claude Code through stream-json stdio
 
@@ -61,6 +62,7 @@ For example:
 
 ```text
 /agent kimi
+/agent devin
 /agent codex
 ```
 
@@ -210,6 +212,10 @@ executors:
   kimi:
     protocol: acp
     command: kimi
+    args: ["acp"]
+  devin:
+    protocol: acp
+    command: devin
     args: ["acp"]
   codex:
     protocol: app_server

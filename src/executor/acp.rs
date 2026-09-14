@@ -1535,6 +1535,12 @@ fn is_json_rpc_like(message: &Value) -> bool {
     let Some(map) = message.as_object() else {
         return false;
     };
+    // Agents may emit vendor-specific JSON-RPC traffic, such as Devin's `_cognition.ai/*` notifications. It is
+    // valid protocol traffic, so it must not trip the strict stdout guard; dispatch_message ignores unknown
+    // notifications and rejects unknown client methods with -32601.
+    if map.get("jsonrpc").and_then(Value::as_str) == Some("2.0") {
+        return true;
+    }
     map.get("method")
         .and_then(Value::as_str)
         .is_some_and(is_acp_protocol_method)
@@ -1804,8 +1810,21 @@ fn permission_body(params: &Value, tool_call: &Value) -> String {
         .or_else(|| extract_text(tool_call.get("raw_input")))
         .or_else(|| extract_text(params.get("toolCall")))
         .or_else(|| extract_text(params.get("tool_call")))
+        .or_else(|| permission_meta_command(tool_call))
+        .or_else(|| permission_meta_command(params))
         .unwrap_or_default();
     truncate_text(content, 2_000)
+}
+
+/// Some ACP agents, such as Devin, carry the command under review only in `_meta`. Surface it in the approval prompt
+/// so the user can see what will run.
+fn permission_meta_command(value: &Value) -> Option<String> {
+    value
+        .get("_meta")
+        .and_then(|meta| meta.get("cognition.ai/editableCommand"))
+        .and_then(Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn permission_options(params: &Value) -> Vec<ApprovalOption> {
@@ -3187,12 +3206,52 @@ mod tests {
         assert!(is_json_rpc_like(&json!({"id": 1, "result": {}})));
         assert!(is_json_rpc_like(&json!({"id": 1, "error": {"code": -1}})));
         assert!(is_json_rpc_like(
+            &json!({"jsonrpc": "2.0", "method": "session/update", "params": {}})
+        ));
+        assert!(is_json_rpc_like(
+            &json!({"jsonrpc": "2.0", "method": "_cognition.ai/turn_stats", "params": {}})
+        ));
+        assert!(is_json_rpc_like(
+            &json!({"jsonrpc": "2.0", "id": 7, "method": "_cognition.ai/unhandled"})
+        ));
+        assert!(is_json_rpc_like(
             &json!({"method": "session/update", "params": {}})
         ));
         assert!(!is_json_rpc_like(&json!({"id": 1, "message": "startup"})));
         assert!(!is_json_rpc_like(&json!({"method": "startup"})));
         assert!(!is_json_rpc_like(&json!({"hello": "world"})));
         assert!(!is_json_rpc_like(&json!("banner")));
+    }
+
+    #[test]
+    fn devin_permission_request_shows_meta_command() {
+        let message = json!({
+            "params": {
+                "sessionId": "session-1",
+                "toolCall": {
+                    "toolCallId": "exec_0",
+                    "_meta": {"cognition.ai/editableCommand": "printf hello-devin"}
+                },
+                "options": [
+                    {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                ]
+            }
+        });
+
+        let request = approval_request_from_permission_message(
+            &message,
+            "session-1",
+            "devin",
+            Some("U1".to_string()),
+        );
+
+        assert_eq!(request.title, "Tool permission");
+        assert_eq!(request.body, "printf hello-devin");
+        assert_eq!(
+            request.allow_once_option_id(),
+            Some("allow_once".to_string())
+        );
     }
 
     #[tokio::test]
