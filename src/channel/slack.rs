@@ -39,6 +39,7 @@ use crate::{
         ContextFileContent, ContextFileInput, ContextSyncIssueInput, ContextSyncRequest,
         sanitize_path_segment,
     },
+    text::truncate_chars,
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -46,6 +47,8 @@ const SLACK_MARKDOWN_BLOCK_CHAR_LIMIT: usize = 12_000;
 const SLACK_MARKDOWN_SNIPPET_FILENAME: &str = "agent-router-reply.md";
 const SLACK_MARKDOWN_SNIPPET_TYPE: &str = "markdown";
 const SLACK_ACTIONS_BLOCK_MAX_ELEMENTS: usize = 25;
+const SLACK_BUTTON_TEXT_MAX_CHARS: usize = 75;
+const SLACK_SECTION_TEXT_MAX_CHARS: usize = 3_000;
 const SLACK_APPROVAL_APPROVE_ACTION_ID_PREFIX: &str = "agent_router_approval_approve";
 const SLACK_APPROVAL_DENY_ACTION_ID: &str = "agent_router_approval_deny";
 const SLACK_OWNER_APPROVAL_PERMALINK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1413,7 +1416,7 @@ fn slack_approval_message_body(
                 "type": "button",
                 "text": {
                     "type": "plain_text",
-                    "text": approval_button_label(prompt, option),
+                    "text": slack_button_text(approval_button_label(prompt, option)),
                     "emoji": true,
                 },
                 "action_id": slack_approval_approve_action_id(index),
@@ -1445,7 +1448,7 @@ fn slack_approval_message_body(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": text,
+                "text": truncate_chars(text, SLACK_SECTION_TEXT_MAX_CHARS),
             },
         },
         {
@@ -1470,6 +1473,15 @@ fn approval_button_label<'a>(
     } else {
         &option.name
     }
+}
+
+/// Slack rejects the whole block payload when button text is empty or longer than 75 characters.
+fn slack_button_text(label: &str) -> String {
+    let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    if label.is_empty() {
+        return "Option".to_string();
+    }
+    truncate_chars(&label, SLACK_BUTTON_TEXT_MAX_CHARS)
 }
 
 fn slack_approval_button_value(
@@ -2766,6 +2778,60 @@ mod tests {
         let second_value: Value =
             serde_json::from_str(elements[1]["value"].as_str().unwrap()).unwrap();
         assert_eq!(second_value["option_id"], "second");
+
+        broker
+            .resolve_action(
+                "slack:channel:C1:111.000",
+                &prompt.id,
+                ApprovalResolveAction::Deny,
+                Some("U1"),
+            )
+            .await;
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[test]
+    fn slack_button_text_enforces_api_limits() {
+        assert_eq!(slack_button_text("   "), "Option");
+        assert_eq!(slack_button_text("  Allow\n  once "), "Allow once");
+
+        let long = format!(
+            "Yes, always allow `printf x` commands in `{}`",
+            "a".repeat(64)
+        );
+        let truncated = slack_button_text(&long);
+
+        assert_eq!(truncated.chars().count(), SLACK_BUTTON_TEXT_MAX_CHARS);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn slack_approval_message_body_truncates_long_option_labels() {
+        let long_name = format!(
+            "Yes, always allow `printf x` commands in `{}`",
+            "a".repeat(64)
+        );
+        let mut request = multi_option_approval_request("slack:channel:C1:111.000");
+        request.options[0].name = long_name.clone();
+        let (broker, prompt, pending) = prompt_for_request(request).await;
+        let target = SlackReplyTarget {
+            channel: "C1".to_string(),
+            thread_ts: Some("111.000".to_string()),
+        };
+        let text = format!("{}\n{}", prompt.render_text(), "line\n".repeat(1_500));
+
+        let body = slack_approval_message_body(&target, &prompt, &text).unwrap();
+
+        let elements = body["blocks"][1]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements[0]["text"]["text"],
+            truncate_chars(&long_name, SLACK_BUTTON_TEXT_MAX_CHARS)
+        );
+        let section_text = body["blocks"][0]["text"]["text"].as_str().unwrap();
+        assert_eq!(section_text.chars().count(), SLACK_SECTION_TEXT_MAX_CHARS);
 
         broker
             .resolve_action(
