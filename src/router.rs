@@ -1574,6 +1574,24 @@ where
         }
         drop(idle_turn_start_guard);
 
+        let environment = if let (Some(turn), Some(api)) = (&idle_turn, &self.agent_api) {
+            let Some(environment) = turn
+                .while_current(|| {
+                    api.environment(
+                        &session_key,
+                        &session_key,
+                        &executor_name,
+                        input.user_id.clone(),
+                    )
+                })
+                .await
+            else {
+                return Ok(());
+            };
+            environment
+        } else {
+            Default::default()
+        };
         let outcome = {
             let mut executor_events = RouterExecutorEventSink::for_slash_command(
                 idle_turn.as_ref().cloned(),
@@ -1583,6 +1601,7 @@ where
             self.executor
                 .slash_command(
                     ExecutorSlashCommandRequest {
+                        environment,
                         session_key: session_key.clone(),
                         executor: executor_name.clone(),
                         cwd: session_cwd,
@@ -3199,32 +3218,44 @@ where
         let session_key = task.session_key();
         self.approvals
             .set_session_origin(session_key.clone(), task.owner_session_key.clone());
-        {
-            let lock = self.session_lock(&session_key).await;
-            let _guard = lock.lock().await;
-            let mut state = self
-                .store
-                .load_or_create(&session_key, &task.executor)
-                .await?;
-            state.set_active_executor(Some(task.executor.clone()));
-            state.routing_mode = AgentRoutingMode::Manual;
-            self.store.save(state).await?;
+        // Register cancellation before awaiting session persistence, so a
+        // timeout during setup cannot start an executor after /stop returns.
+        let reserved = self.turns.reserve_replacement(&session_key).await;
+        if let Some(interrupted) = reserved.interrupted {
+            self.interrupt_turn(interrupted).await;
         }
-        self.route_to_active_executor(
-            RouterInput {
-                session_key,
-                text: format!(
-                    "Run scheduled task “{}” ({}).\n\n{}",
-                    task.name, task.id, task.prompt
-                ),
-                user_id: task.requester_user_id.clone(),
-            },
-            None,
-            None,
-            output,
-            Some(task),
-        )
-        .await
+        let reservation = reserved.reservation;
+        let result = async {
+            {
+                let lock = self.session_lock(&session_key).await;
+                let _guard = lock.lock().await;
+                let mut state = self
+                    .store
+                    .load_or_create(&session_key, &task.executor)
+                    .await?;
+                state.set_active_executor(Some(task.executor.clone()));
+                state.routing_mode = AgentRoutingMode::Manual;
+                self.store.save(state).await?;
+            }
+            self.route_to_active_executor(
+                RouterInput {
+                    session_key,
+                    text: format!(
+                        "Run scheduled task “{}” ({}).\n\n{}",
+                        task.name, task.id, task.prompt
+                    ),
+                    user_id: task.requester_user_id.clone(),
+                },
+                Some(reservation.clone()),
+                None,
+                output,
+                Some(task),
+            )
+            .await
+        }
+        .await;
+        let _ = reservation.abandon_if_current().await;
+        result
     }
 
     async fn append_notification(&self, notification: SessionNotification) -> anyhow::Result<()> {

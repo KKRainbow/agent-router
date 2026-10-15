@@ -80,6 +80,8 @@ pub enum ExecutorSlashCommandSupport {
 
 #[derive(Debug, Clone)]
 pub struct ExecutorSlashCommandRequest {
+    /// Immutable caller environment for commands that start an executor turn.
+    pub environment: std::collections::BTreeMap<String, String>,
     pub session_key: String,
     pub executor: String,
     pub cwd: Option<PathBuf>,

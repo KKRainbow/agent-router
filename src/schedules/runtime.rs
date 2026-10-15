@@ -108,29 +108,25 @@ impl Scheduler {
         timeout_secs: u64,
     ) -> anyhow::Result<()> {
         let mut output = ScheduledOutput::default();
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            router.run_scheduled(&task, &mut output),
-        )
-        .await;
-        let error = match result {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("{error:#}")),
-            Err(_) => {
-                let mut ignored = ScheduledOutput::default();
-                let _ = router
-                    .handle(
-                        RouterInput {
-                            session_key: task.session_key(),
-                            text: "/stop".into(),
-                            user_id: task.requester_user_id.clone(),
-                        },
-                        &mut ignored,
-                    )
-                    .await;
-                Some(format!(
-                    "Task exceeded its {timeout_secs}s execution timeout."
-                ))
+        let error = {
+            let execution = router.run_scheduled(&task, &mut output);
+            tokio::pin!(execution);
+            tokio::select! {
+                biased;
+                result = &mut execution => result.err().map(|error| format!("{error:#}")),
+                _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                    let mut ignored = ScheduledOutput::default();
+                    let stop = router.handle(RouterInput {
+                        session_key: task.session_key(),
+                        text: "/stop".into(),
+                        user_id: task.requester_user_id.clone(),
+                    }, &mut ignored);
+                    // Protocol adapters complete cancellation inside the prompt
+                    // future. Keep polling it while requesting stop, and retain
+                    // the running claim until that cleanup has completed.
+                    let _ = tokio::join!(stop, &mut execution);
+                    Some(format!("Task exceeded its {timeout_secs}s execution timeout."))
+                }
             }
         };
         let status = if error.is_some() {

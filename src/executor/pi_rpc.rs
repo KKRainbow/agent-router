@@ -552,12 +552,14 @@ impl ExecutorBackend for PiRpcExecutorManager {
         let Some(cfg) = self.executors.get(&request.executor) else {
             return ExecutorSlashCommandOutcome::Unsupported;
         };
+        let mut cfg = cfg.clone();
+        cfg.env.extend(request.environment.clone());
         let cancel = request.cancel.clone();
         let published_session = match self
             .get_or_publish_session(
                 &request.session_key,
                 &request.executor,
-                cfg,
+                &cfg,
                 request.cwd.as_deref(),
                 request.previous_session_id.clone(),
                 &cancel,
@@ -2119,7 +2121,7 @@ def wait_for_extension_response_or_abort():
             agent_end("")
             return {"cancelled": True}
 
-log({"argv": sys.argv[1:]})
+log({"argv": sys.argv[1:], "caller_token": os.environ.get("AGENT_ROUTER_API_TOKEN")})
 
 while True:
     cmd = read_json_line()
@@ -3793,6 +3795,76 @@ while True:
     }
 
     #[tokio::test]
+    async fn router_slash_commands_keep_caller_credentials_and_rotate_for_new_users() {
+        use crate::{
+            agent_api::AgentApi,
+            router::{
+                AgentRouter, RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
+            },
+            session::store::InMemorySessionStore,
+        };
+        struct Output;
+        #[async_trait]
+        impl RouterOutputSink for Output {
+            fn send_channel_event(&mut self, _: RouterChannelEvent) {}
+            async fn send_final_reply(&mut self, _: String) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let fake = FakePi::new();
+        let (mut manager, approvals) = fake.manager("stream");
+        manager.machines = MachineRegistry::local_default()
+            .with_agent_api_url(Some("http://127.0.0.1:8790".into()));
+        let api = AgentApi::new(vec!["pi".into()]);
+        let router = AgentRouter::with_approvals(
+            "pi",
+            Arc::new(InMemorySessionStore::default()),
+            Arc::new(manager),
+            approvals,
+        )
+        .with_workspace_root(Some(fake._tmp.path().join("workspaces")))
+        .with_agent_api(Some(api.clone()));
+        for (text, user) in [
+            ("hello", "U1"),
+            ("//status", "U1"),
+            ("//status", "U2"),
+            ("hello again", "U2"),
+        ] {
+            router
+                .handle(
+                    RouterInput {
+                        session_key: "tui:identity".into(),
+                        text: text.into(),
+                        user_id: Some(user.into()),
+                    },
+                    &mut Output,
+                )
+                .await
+                .unwrap();
+        }
+        let tokens = fake
+            .log_entries()
+            .into_iter()
+            .filter(|entry| entry.get("argv").is_some())
+            .map(|entry| entry["caller_token"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens.len(),
+            2,
+            "only a new user should restart the executor process"
+        );
+        assert_ne!(tokens[0], tokens[1]);
+        assert!(api.authenticate(&tokens[0]).is_none());
+        assert_eq!(
+            api.authenticate(&tokens[1])
+                .unwrap()
+                .requester_user_id
+                .as_deref(),
+            Some("U2")
+        );
+    }
+
+    #[tokio::test]
     async fn slash_command_uses_pi_prompt_command_path() {
         let fake = FakePi::new();
         let (manager, _) = fake.manager("stream");
@@ -3801,6 +3873,7 @@ while True:
         let outcome = manager
             .slash_command(
                 ExecutorSlashCommandRequest {
+                    environment: Default::default(),
                     session_key: "session-1".to_string(),
                     executor: "pi".to_string(),
                     cwd: None,
@@ -3854,6 +3927,7 @@ while True:
         let outcome = manager
             .slash_command(
                 ExecutorSlashCommandRequest {
+                    environment: Default::default(),
                     session_key: "session-1".to_string(),
                     executor: "pi".to_string(),
                     cwd: None,

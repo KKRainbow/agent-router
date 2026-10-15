@@ -453,6 +453,10 @@ async fn scheduled_execution_uses_its_own_session_and_saves_result_before_delive
 #[derive(Default)]
 struct HangingRouter {
     stopped: std::sync::atomic::AtomicBool,
+    drained: std::sync::atomic::AtomicBool,
+    stop_requested: Notify,
+    cancelled: Notify,
+    release_cleanup: Notify,
 }
 #[async_trait]
 impl RouterService for HangingRouter {
@@ -461,13 +465,19 @@ impl RouterService for HangingRouter {
         _: &ScheduledTask,
         _: &mut dyn RouterOutputSink,
     ) -> anyhow::Result<()> {
-        std::future::pending().await
+        self.cancelled.notified().await;
+        self.release_cleanup.notified().await;
+        self.drained
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("cancelled")
     }
     async fn handle(&self, input: RouterInput, _: &mut dyn RouterOutputSink) -> anyhow::Result<()> {
         assert!(input.session_key.starts_with("schedule:"));
         assert_eq!(input.text, "/stop");
         self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled.notify_one();
+        self.stop_requested.notify_one();
         Ok(())
     }
     async fn observe(&self, _: RouterInput) -> anyhow::Result<()> {
@@ -479,7 +489,7 @@ impl RouterService for HangingRouter {
 }
 
 #[tokio::test]
-async fn execution_timeout_stops_only_the_background_session() {
+async fn execution_timeout_drains_cancellation_before_releasing_the_task() {
     let (_root, scheduler, api, token) = scheduler();
     create(&scheduler, &api, &token).await;
     let (task, run) = scheduler
@@ -488,17 +498,42 @@ async fn execution_timeout_stops_only_the_background_session() {
         .unwrap()
         .remove(0);
     let router = Arc::new(HangingRouter::default());
-    scheduler
-        .execute(
-            router.clone(),
-            Arc::new(FailedDelivery),
-            task.clone(),
-            run,
-            0,
-        )
-        .await
-        .unwrap();
+    let execution = tokio::spawn({
+        let scheduler = scheduler.clone();
+        let router = router.clone();
+        let task = task.clone();
+        async move {
+            scheduler
+                .execute(router, Arc::new(FailedDelivery), task, run, 0)
+                .await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        router.stop_requested.notified(),
+    )
+    .await
+    .unwrap();
     assert!(router.stopped.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        scheduler.state.lock().await.tasks[&task.id].runs[0].status,
+        RunStatus::Running
+    );
+    assert!(
+        scheduler
+            .claim_ready(now_ms() + 600_000, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!execution.is_finished());
+    router.release_cleanup.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(router.drained.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
         scheduler.state.lock().await.tasks[&task.id].runs[0].status,
         RunStatus::Failed
@@ -510,6 +545,69 @@ struct ConcurrentExecutor {
     fake: FakeExecutorBackend,
     started: Notify,
     release: Notify,
+}
+
+#[derive(Default)]
+struct DelayedSessionStore {
+    inner: InMemorySessionStore,
+    saving: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl SessionStore for DelayedSessionStore {
+    async fn load(&self, key: &str) -> anyhow::Result<Option<crate::session::SessionState>> {
+        self.inner.load(key).await
+    }
+    async fn load_or_create(
+        &self,
+        key: &str,
+        executor: &str,
+    ) -> anyhow::Result<crate::session::SessionState> {
+        self.inner.load_or_create(key, executor).await
+    }
+    async fn save(&self, state: crate::session::SessionState) -> anyhow::Result<()> {
+        if state.session_key.starts_with("schedule:") {
+            self.saving.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.save(state).await
+    }
+}
+
+#[tokio::test]
+async fn stop_during_scheduled_session_setup_prevents_executor_start() {
+    let (_root, scheduler, api, token) = scheduler();
+    let task = create(&scheduler, &api, &token).await;
+    let store = Arc::new(DelayedSessionStore::default());
+    let executor = Arc::new(FakeExecutorBackend::default());
+    let router = Arc::new(AgentRouter::new("kimi", store.clone(), executor.clone()));
+    let execution = tokio::spawn({
+        let router = router.clone();
+        let task = task.clone();
+        async move { router.run_scheduled(&task, &mut SilentOutput).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), store.saving.notified())
+        .await
+        .unwrap();
+    router
+        .handle(
+            RouterInput {
+                session_key: task.session_key(),
+                text: "/stop".into(),
+                user_id: None,
+            },
+            &mut SilentOutput,
+        )
+        .await
+        .unwrap();
+    store.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(executor.prepared.lock().await.is_empty());
 }
 
 #[async_trait]
