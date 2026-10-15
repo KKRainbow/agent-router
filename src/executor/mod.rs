@@ -35,6 +35,8 @@ pub struct ExecutorTurnRef {
 #[derive(Debug, Clone)]
 pub struct ExecutorPrepareRequest {
     pub turn: ExecutorTurnRef,
+    /// Router-owned environment for this caller; included in process identity.
+    pub environment: std::collections::BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
     /// Last committed Backend Session id from the Executor Binding.
     pub previous_session_id: Option<String>,

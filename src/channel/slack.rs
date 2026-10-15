@@ -864,6 +864,18 @@ impl SlackSocketModeChannel {
             .ok_or_else(|| anyhow::anyhow!("Slack conversations.open response omitted channel id"))
     }
 
+    pub(crate) async fn send_notification(
+        &self,
+        session_key: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let target = SlackReplyTarget::from_session_key(session_key)
+            .ok_or_else(|| anyhow::anyhow!("invalid Slack session key"))?;
+        self.post_markdown_message_with_ts(&target, text)
+            .await
+            .map(|_| ())
+    }
+
     async fn post_message(&self, target: &SlackReplyTarget, text: &str) -> anyhow::Result<()> {
         self.post_message_with_ts(target, text).await.map(|_| ())
     }

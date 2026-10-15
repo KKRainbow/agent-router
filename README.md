@@ -24,6 +24,71 @@ internal workflows, and early integrations.
 - Lets users switch agents inside the same chat session.
 - Projects conversation context when a session switches agents.
 - Sends normalized replies back to the originating channel.
+- Runs persistent scheduled tasks that agents can manage through a skill and REST API.
+
+## Scheduled tasks
+
+Enable scheduling in your configuration:
+
+```yaml
+workspace:
+  root: /path/to/router-workspaces
+agent_api:
+  enabled: true
+  bind: 127.0.0.1:8790
+schedules:
+  enabled: true
+  max_concurrent: 4
+  timeout_secs: 3600
+```
+
+Ask an agent to create a reminder, recurring report, or periodic check. Router
+installs [the scheduling skill](skills/agent-router/SKILL.md) in each executor's
+working directory at `.agents/skills/agent-router/SKILL.md`, with a relative
+`.claude/skills/agent-router` link. Windows without symlink privileges receives
+a generated copy. Existing unrelated skills are preserved. There is no MCP
+configuration or separate client package to install.
+
+The agent receives `AGENT_ROUTER_API_URL` and a session-scoped
+`AGENT_ROUTER_API_TOKEN` in its environment. It can create, inspect, update,
+pause, resume, delete, and immediately run tasks belonging to that conversation.
+During a scheduled run, `AGENT_ROUTER_TASK_ID` lets it manage its own task, for
+example pausing a CI check once the run finishes. The API supports one-time
+timestamps, intervals, and five-field cron with an explicit IANA timezone.
+
+Each task has its own persistent session and workspace, uses the selected
+executor, and returns results and approval requests to the original
+conversation. Include necessary URLs and absolute project paths in the task
+prompt; the original conversation and synced files are not copied. Web chat
+refreshes background results while idle; terminal chat displays notifications
+while open. Slack and Telegram receive outbound messages. QQ delivery requires
+the bot's platform permissions and quota for proactive messages; rejections
+are recorded as delivery errors. Original session permission policy still
+applies to tool approval.
+
+Router must remain running. Missed recurring occurrences are skipped on
+restart; an overdue one-time task runs once. Interrupted runs are recorded
+without automatic replay. A task never overlaps itself; pausing or deleting
+it stops future runs while allowing the current run to finish. The last 20
+execution records are stored with the task. Notification failures do not rerun
+the agent's work. State lives in `workspace.root/.agent-router/schedules.json`,
+with a separate process lock to prevent two routers from executing it.
+
+For SSH executors, configure `machines.<name>.env.AGENT_ROUTER_API_URL` with an
+address reachable from that machine and bind the API to the appropriate Router
+interface. Use a trusted private network or a TLS proxy for remote access:
+the API uses bearer credentials. The local loopback URL is never assumed to be
+reachable from a remote machine.
+
+The shared Agent API is independent of scheduling. Its authentication,
+credentials, `/api/context` endpoint, and skill installation live in
+`src/agent_api`; scheduling registers its routes under `/api/schedules`.
+To add another HTTP capability, supply an Axum router with its own state,
+merge it at startup, and document it in a skill. The common entry point applies
+authentication to all registered routes and provides `AgentScope` to handlers;
+each feature checks ownership of its own resources. No scheduler or executor
+protocol changes are needed. `agent_api.enabled` controls the HTTP service;
+`schedules.enabled` controls only the task scheduler and its routes.
 
 ## Supported Today
 

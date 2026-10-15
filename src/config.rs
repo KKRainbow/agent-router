@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub router: RouterConfig,
     pub approval: ApprovalConfig,
     pub workspace: WorkspaceConfig,
+    pub schedules: crate::schedules::SchedulesConfig,
+    pub agent_api: crate::agent_api::AgentApiConfig,
     pub slack: SlackConfig,
     pub telegram: TelegramConfig,
     pub qq: QqConfig,
@@ -215,6 +217,8 @@ struct FileConfig {
     router: Option<FileRouterConfig>,
     approval: Option<FileApprovalConfig>,
     workspace: Option<FileWorkspaceConfig>,
+    schedules: Option<crate::schedules::SchedulesConfig>,
+    agent_api: Option<crate::agent_api::AgentApiConfig>,
     machines: Option<BTreeMap<String, FileMachineConfig>>,
     slack: Option<FileSlackConfig>,
     telegram: Option<FileTelegramConfig>,
@@ -410,6 +414,30 @@ impl AppConfig {
                 .filter(|root| !root.as_os_str().is_empty()),
         };
         let machines = parse_machine_configs(file_cfg.machines, workspace.root.as_deref())?;
+        let agent_api = file_cfg.agent_api.unwrap_or_default();
+        anyhow::ensure!(
+            !agent_api.enabled || workspace.root.is_some(),
+            "agent_api.enabled requires workspace.root"
+        );
+        let schedules = file_cfg.schedules.unwrap_or_default();
+        if schedules.enabled {
+            anyhow::ensure!(
+                agent_api.enabled,
+                "schedules.enabled requires agent_api.enabled"
+            );
+            anyhow::ensure!(
+                workspace.root.is_some(),
+                "schedules.enabled requires workspace.root"
+            );
+            anyhow::ensure!(
+                schedules.max_concurrent > 0,
+                "schedules.max_concurrent must be positive"
+            );
+            anyhow::ensure!(
+                schedules.timeout_secs > 0,
+                "schedules.timeout_secs must be positive"
+            );
+        }
 
         let slack_file = file_cfg.slack.unwrap_or_default();
         let slack_context_file = slack_file.context_sync.unwrap_or_default();
@@ -644,6 +672,8 @@ impl AppConfig {
             },
             approval,
             workspace,
+            schedules,
+            agent_api,
             slack,
             telegram,
             qq,
@@ -1232,6 +1262,33 @@ executors:
             err.to_string()
                 .contains("no supported agent executors found in PATH")
         );
+    }
+
+    #[test]
+    fn agent_api_can_run_without_schedules_and_schedules_require_it() {
+        let base = "router:\n  default_executor: kimi\nexecutors:\n  kimi:\n    protocol: acp\n    command: kimi\n";
+        let load = |extra: &str| {
+            let file_cfg = serde_yaml::from_str::<FileConfig>(&format!("{base}{extra}")).unwrap();
+            app_config_from_file(file_cfg, EnvConfig::default())
+        };
+        let config = load("workspace:\n  root: workspaces\nagent_api:\n  enabled: true\n").unwrap();
+        assert!(config.agent_api.enabled);
+        assert!(!config.schedules.enabled);
+        assert!(
+            load("agent_api:\n  enabled: true\n")
+                .unwrap_err()
+                .to_string()
+                .contains("workspace.root")
+        );
+        assert!(
+            load("workspace:\n  root: workspaces\nschedules:\n  enabled: true\n")
+                .unwrap_err()
+                .to_string()
+                .contains("agent_api.enabled")
+        );
+        for invalid in ["max_concurrent: 0", "timeout_secs: 0"] {
+            assert!(load(&format!("workspace:\n  root: workspaces\nagent_api:\n  enabled: true\nschedules:\n  enabled: true\n  {invalid}\n")).is_err());
+        }
     }
 
     #[test]

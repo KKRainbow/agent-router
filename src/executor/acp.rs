@@ -331,6 +331,8 @@ impl ExecutorBackend for AcpExecutorManager {
         let cfg = self.executors.get(&request.turn.executor).ok_or_else(|| {
             anyhow::anyhow!("executor `{}` is not configured", request.turn.executor)
         })?;
+        let mut cfg = cfg.clone();
+        cfg.env.extend(request.environment.clone());
         tracing::info!(
             executor = %request.turn.executor,
             session_key = %request.turn.session_key,
@@ -343,7 +345,7 @@ impl ExecutorBackend for AcpExecutorManager {
             .get_or_create_session(
                 &request.turn.session_key,
                 &request.turn.executor,
-                cfg,
+                &cfg,
                 request.cwd.as_deref(),
                 &cancel,
             )
@@ -3458,6 +3460,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: Some(session_cwd.clone()),
                     previous_session_id: None,
@@ -3543,6 +3546,7 @@ for line in sys.stdin:
             prepare_manager
                 .prepare(
                     ExecutorPrepareRequest {
+                        environment: Default::default(),
                         turn: turn_ref("session-1", "kimi", 1),
                         cwd: None,
                         previous_session_id: None,
@@ -3584,6 +3588,7 @@ for line in sys.stdin:
         let prepared = manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 2),
                     cwd: None,
                     previous_session_id: None,
@@ -3703,6 +3708,7 @@ for line in sys.stdin:
             prepare_manager
                 .prepare(
                     ExecutorPrepareRequest {
+                        environment: Default::default(),
                         turn: turn_ref("session-1", "kimi", 1),
                         cwd: None,
                         previous_session_id: None,
@@ -3810,6 +3816,7 @@ for line in sys.stdin:
             prepare_manager
                 .prepare(
                     ExecutorPrepareRequest {
+                        environment: Default::default(),
                         turn: turn_ref("session-1", "kimi", 1),
                         cwd: None,
                         previous_session_id: None,
@@ -3839,6 +3846,7 @@ for line in sys.stdin:
         let prepared = manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 2),
                     cwd: None,
                     previous_session_id: None,
@@ -4082,6 +4090,7 @@ for line in sys.stdin:
         let prepared = manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -4185,6 +4194,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -4358,6 +4368,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -4556,6 +4567,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -4714,6 +4726,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -4796,6 +4809,7 @@ for line in sys.stdin:
         let prepared = manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 3),
                     cwd: None,
                     previous_session_id: None,
@@ -4876,6 +4890,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -4996,6 +5011,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 2),
                     cwd: None,
                     previous_session_id: None,
@@ -5102,6 +5118,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -5193,6 +5210,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -5326,6 +5344,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,
@@ -5413,6 +5432,7 @@ for line in sys.stdin:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn_ref("session-1", "kimi", 1),
                     cwd: None,
                     previous_session_id: None,

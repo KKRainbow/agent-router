@@ -69,6 +69,7 @@ impl TerminalChatChannel {
         let mut active_prompt_turns = 0usize;
         let mut input_closed = false;
         let mut abort_turns = false;
+        let mut notifications = router.subscribe_notifications();
 
         writer.write_str("> ")?;
         loop {
@@ -76,6 +77,16 @@ impl TerminalChatChannel {
                 break;
             }
             tokio::select! {
+                notification = async { notifications.as_mut().unwrap().recv().await }, if notifications.is_some() => {
+                    match notification {
+                        Ok(notification) if notification.session_key == session_key => {
+                            writer.write_str(&format!("\n{}\n", notification.text))?;
+                            write_ready_prompt(&writer, active_prompt_turns)?;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => notifications = None,
+                        _ => {}
+                    }
+                }
                 event = rx.recv(), if !input_closed => {
                     match event {
                         Some(TerminalInput::Prompt(text)) => {

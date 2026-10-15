@@ -125,9 +125,9 @@ export default function App() {
     if (activeRunRef.current?.sessionId === currentSessionId) return;
 
     let cancelled = false;
-    fetchTranscript(currentSessionId, authToken || undefined)
+    const refresh = () => fetchTranscript(currentSessionId, authToken || undefined)
       .then((transcript) => {
-        if (cancelled) return;
+        if (cancelled || activeRunRef.current?.sessionId === currentSessionId) return;
         const committed = transcriptToMessages(transcript);
         if (committed.length) {
           setMessagesBySession((previous) =>
@@ -144,7 +144,10 @@ export default function App() {
           setConnectionLabel("Auth");
         }
       });
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 5000);
     return () => {
+      window.clearInterval(interval);
       cancelled = true;
     };
   }, [authToken, currentSessionId, isRunning]);

@@ -425,6 +425,16 @@ impl TelegramBotChannel {
         Ok(())
     }
 
+    pub(crate) async fn send_notification(
+        &self,
+        session_key: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let target = TelegramReplyTarget::from_session_key(session_key)
+            .ok_or_else(|| anyhow::anyhow!("invalid Telegram session key"))?;
+        self.post_markdown_message(&target, text).await.map(|_| ())
+    }
+
     async fn post_text_message(
         &self,
         target: &TelegramReplyTarget,

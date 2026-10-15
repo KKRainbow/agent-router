@@ -13,9 +13,10 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::{
+    agent_api::AgentApi,
     approval::{
         ApprovalBroker, ApprovalPolicy, ApprovalRequest, ApprovalSelection, SharedApprovalBroker,
     },
@@ -26,6 +27,7 @@ use crate::{
         ExecutorTurnRef, ExecutorUpdate, InterruptReason, TurnCancellation,
     },
     machine::session_workspace_dir_name,
+    schedules::ScheduledTask,
     session::{
         AgentRoutingMode, ApprovalMode, ContextArtifactRecord, ContextSyncRequest, ExecutorBinding,
         ExecutorHealth, MessageRole, SessionState, TranscriptMessage,
@@ -54,6 +56,13 @@ pub struct RouterInput {
     pub session_key: String,
     pub text: String,
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionNotification {
+    pub session_key: String,
+    pub executor: String,
+    pub text: String,
 }
 
 pub fn is_agent_slash_command(text: &str) -> bool {
@@ -528,6 +537,22 @@ pub trait RouterOutputSink: Send {
 
 #[async_trait]
 pub trait RouterService: Send + Sync + 'static {
+    async fn run_scheduled(
+        &self,
+        _task: &ScheduledTask,
+        _output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("scheduled execution is not supported")
+    }
+
+    async fn append_notification(&self, _notification: SessionNotification) -> anyhow::Result<()> {
+        anyhow::bail!("session notifications are not supported")
+    }
+
+    fn subscribe_notifications(&self) -> Option<broadcast::Receiver<SessionNotification>> {
+        None
+    }
+
     async fn begin_channel_input(
         &self,
         input: ChannelInput,
@@ -689,6 +714,8 @@ where
     executor: Arc<E>,
     approvals: SharedApprovalBroker,
     workspace_root: Option<PathBuf>,
+    agent_api: Option<Arc<AgentApi>>,
+    notifications: broadcast::Sender<SessionNotification>,
     owner_user_ids_by_source: HashMap<String, BTreeSet<String>>,
     #[cfg(test)]
     before_task_adopt_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -953,6 +980,8 @@ where
             executor,
             approvals,
             workspace_root: None,
+            agent_api: None,
+            notifications: broadcast::channel(256).0,
             owner_user_ids_by_source: HashMap::new(),
             #[cfg(test)]
             before_task_adopt_hook: None,
@@ -966,6 +995,11 @@ where
 
     pub fn with_workspace_root(mut self, workspace_root: Option<PathBuf>) -> Self {
         self.workspace_root = workspace_root;
+        self
+    }
+
+    pub fn with_agent_api(mut self, agent_api: Option<Arc<AgentApi>>) -> Self {
+        self.agent_api = agent_api;
         self
     }
 
@@ -1199,7 +1233,7 @@ where
                 .send_final_reply(render_unknown_router_slash_command(text))
                 .await;
         }
-        self.route_to_active_executor(input, reserved_turn, context, output)
+        self.route_to_active_executor(input, reserved_turn, context, output, None)
             .await
     }
 
@@ -1847,6 +1881,7 @@ where
                 .executor
                 .prepare(
                     ExecutorPrepareRequest {
+                        environment: Default::default(),
                         turn: turn.clone(),
                         cwd: None,
                         previous_session_id: None,
@@ -2106,6 +2141,7 @@ Current user message:\n{}",
         reserved_turn: Option<TurnReservation>,
         mut context: Option<ContextSyncRequest>,
         output: &mut dyn RouterOutputSink,
+        scheduled_task: Option<&ScheduledTask>,
     ) -> anyhow::Result<()> {
         let session_key = input.session_key.clone();
         let needs_turn_start_gate = reserved_turn.is_none();
@@ -2395,10 +2431,36 @@ Current user message:\n{}",
             "routing turn to active executor"
         );
 
+        let environment = if let Some(agent_api) = &self.agent_api {
+            let Some(environment) = turn
+                .while_current(|| {
+                    let owner = scheduled_task
+                        .map(|task| task.owner_session_key.as_str())
+                        .unwrap_or(&session_key);
+                    let mut environment = agent_api.environment(
+                        &executor_turn.session_key,
+                        owner,
+                        &executor_name,
+                        input.user_id.clone(),
+                    );
+                    if let Some(task) = scheduled_task {
+                        environment.insert("AGENT_ROUTER_TASK_ID".into(), task.id.clone());
+                    }
+                    environment
+                })
+                .await
+            else {
+                return Ok(());
+            };
+            environment
+        } else {
+            Default::default()
+        };
         let prepared = self
             .executor
             .prepare(
                 ExecutorPrepareRequest {
+                    environment,
                     turn: executor_turn.clone(),
                     cwd: session_cwd.clone(),
                     previous_session_id: binding.external_session_id.clone(),
@@ -2649,6 +2711,10 @@ Current user message:\n{}",
                     generation,
                     current,
                     "router turn cancelled"
+                );
+                anyhow::ensure!(
+                    scheduled_task.is_none(),
+                    "scheduled execution was cancelled"
                 );
                 Ok(())
             }
@@ -3121,6 +3187,67 @@ where
     S: SessionStore,
     E: ExecutorBackend,
 {
+    async fn run_scheduled(
+        &self,
+        task: &ScheduledTask,
+        output: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.executor.get(&task.executor).is_some(),
+            "scheduled executor is not configured"
+        );
+        let session_key = task.session_key();
+        self.approvals
+            .set_session_origin(session_key.clone(), task.owner_session_key.clone());
+        {
+            let lock = self.session_lock(&session_key).await;
+            let _guard = lock.lock().await;
+            let mut state = self
+                .store
+                .load_or_create(&session_key, &task.executor)
+                .await?;
+            state.set_active_executor(Some(task.executor.clone()));
+            state.routing_mode = AgentRoutingMode::Manual;
+            self.store.save(state).await?;
+        }
+        self.route_to_active_executor(
+            RouterInput {
+                session_key,
+                text: format!(
+                    "Run scheduled task “{}” ({}).\n\n{}",
+                    task.name, task.id, task.prompt
+                ),
+                user_id: task.requester_user_id.clone(),
+            },
+            None,
+            None,
+            output,
+            Some(task),
+        )
+        .await
+    }
+
+    async fn append_notification(&self, notification: SessionNotification) -> anyhow::Result<()> {
+        let lock = self.session_lock(&notification.session_key).await;
+        let _guard = lock.lock().await;
+        let mut state = self
+            .store
+            .load_or_create(&notification.session_key, &self.default_executor)
+            .await?;
+        state.transcript.push(TranscriptMessage::assistant(
+            &notification.text,
+            &notification.executor,
+            None,
+        ));
+        self.store.save(state).await?;
+        let _ = self.notifications.send(notification);
+        Ok(())
+    }
+
+    fn subscribe_notifications(&self) -> Option<broadcast::Receiver<SessionNotification>> {
+        Some(self.notifications.subscribe())
+    }
+
     async fn has_pending_approval(&self, session_key: &str) -> anyhow::Result<bool> {
         Ok(self.approvals.has_pending_for_session(session_key).await)
     }

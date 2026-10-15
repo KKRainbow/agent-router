@@ -140,6 +140,40 @@ orchestration layers.
 
 ## Dependency Direction
 
+### Agent-callable HTTP capabilities
+
+`agent_api` owns the HTTP entry point, bearer authentication, process
+credentials, `/api/context`, and workspace skill installation. It does not
+depend on scheduled tasks. Feature modules supply Axum routes with their own
+state; startup merges these routes before applying the common authentication
+layer. Handlers receive `AgentScope` through `Extension` and enforce resource
+ownership in their own domain. New HTTP capabilities should follow this
+boundary without adding methods to each executor protocol.
+
+The Router supplies an immutable caller environment through
+`ExecutorPrepareRequest`. A credential identifies the execution session,
+originating conversation, executor, and requesting user. Reusing that identity
+reuses the credential; changing it revokes the old credential and changes the
+process command identity, so cached executor processes cannot silently acquire
+another caller's authority. Machine supplies the reachable API URL and installs
+the skill in the actual execution directory. Credentials are not written into
+skill files, prompts, or persisted task definitions.
+
+`schedules` is the first feature module, registered under `/api/schedules`.
+It owns task validation, persistence, claiming, and execution history. Claimed
+runs are persisted before execution and interrupted runs are not replayed after
+restart. Background runs use separate `schedule:<id>` sessions and a fixed
+executor; their results are appended to the original transcript under its
+session lock before channel delivery. Approval identity maps back to the
+originating session before applying its approval policy.
+
+`agent_api.enabled` controls the shared service independently of
+`schedules.enabled`. The scheduler requires the API, but other HTTP capabilities
+can run with scheduling disabled. There is no dynamic plugin registry: startup
+composition and the existing Axum router are sufficient extension points.
+
+### Existing routing dependencies
+
 Channel adapters depend on router-core abstractions.
 
 Router core depends on no channel-specific crates.

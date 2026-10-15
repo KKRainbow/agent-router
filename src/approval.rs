@@ -302,6 +302,7 @@ pub struct ApprovalBroker {
     prompts: broadcast::Sender<ApprovalPrompt>,
     auto_selections: broadcast::Sender<ApprovalAutoSelection>,
     policy: Arc<dyn ApprovalPolicy>,
+    session_origins: StdMutex<HashMap<String, String>>,
 }
 
 impl fmt::Debug for ApprovalBroker {
@@ -333,11 +334,19 @@ impl ApprovalBroker {
             prompts,
             auto_selections,
             policy,
+            session_origins: StdMutex::new(HashMap::new()),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ApprovalPrompt> {
         self.prompts.subscribe()
+    }
+
+    pub fn set_session_origin(&self, session_key: String, origin_session_key: String) {
+        self.session_origins
+            .lock()
+            .unwrap()
+            .insert(session_key, origin_session_key);
     }
 
     pub fn subscribe_auto_selections(&self) -> broadcast::Receiver<ApprovalAutoSelection> {
@@ -383,9 +392,17 @@ impl ApprovalBroker {
 
     pub async fn request_resolution_until_cancelled(
         &self,
-        request: ApprovalRequest,
+        mut request: ApprovalRequest,
         cancel: ApprovalCancellation,
     ) -> Option<ApprovalResolution> {
+        if let Some(origin) = self
+            .session_origins
+            .lock()
+            .unwrap()
+            .get(&request.session_key)
+        {
+            request.session_key = origin.clone();
+        }
         let auto_selection = tokio::select! {
             biased;
             _ = cancel.cancelled() => return None,
@@ -1204,6 +1221,41 @@ mod tests {
         assert_eq!(
             pending.await.unwrap(),
             ApprovalSelection::Selected("deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_approval_returns_to_origin_and_preserves_requester() {
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        broker.set_session_origin("schedule:task".into(), "slack:dm:D1:123".into());
+        let mut prompts = broker.subscribe();
+        let pending_broker = broker.clone();
+        let pending =
+            tokio::spawn(async move { pending_broker.request(request("schedule:task")).await });
+        let prompt = prompts.recv().await.unwrap();
+        assert_eq!(prompt.session_key, "slack:dm:D1:123");
+        assert!(broker.has_pending_for_session("slack:dm:D1:123").await);
+        assert!(!broker.has_pending_for_session("schedule:task").await);
+        let rejected = broker
+            .resolve_command(
+                &prompt.session_key,
+                &format!("/approve {}", prompt.id),
+                Some("U2"),
+            )
+            .await
+            .unwrap();
+        assert!(rejected.text.contains("requester"));
+        broker
+            .resolve_command(
+                &prompt.session_key,
+                &format!("/approve {}", prompt.id),
+                Some("U1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.await.unwrap(),
+            ApprovalSelection::Selected("allow_once".into())
         );
     }
 

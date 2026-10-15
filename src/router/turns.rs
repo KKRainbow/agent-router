@@ -296,6 +296,15 @@ impl TurnGuard {
         self.remove_if_current().await
     }
 
+    pub(crate) async fn while_current<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let active = self.registry.active.lock().await;
+        let current = active.get(&self.session_key)?;
+        if current.generation != self.generation || self.cancel.is_cancelled_now() {
+            return None;
+        }
+        Some(action())
+    }
+
     pub(crate) async fn commit_if_current<F, Fut, T>(&self, commit: F) -> Option<T>
     where
         F: FnOnce() -> Fut,
@@ -436,6 +445,21 @@ mod tests {
             InterruptReason::UserStop
         );
         assert!(!turns.has_current("session").await);
+    }
+
+    #[tokio::test]
+    async fn current_action_preserves_turn_and_stale_action_cannot_run() {
+        let turns = TurnRegistry::new();
+        let first = turns.begin("session", "kimi".into()).await.guard;
+        assert_eq!(first.while_current(|| 7).await, Some(7));
+        assert!(turns.has_current("session").await);
+        let second = turns.begin("session", "kimi".into()).await.guard;
+        assert_eq!(
+            first.while_current(|| panic!("stale action ran")).await,
+            None
+        );
+        assert_eq!(second.while_current(|| 9).await, Some(9));
+        assert!(second.abandon_if_current().await);
     }
 
     #[tokio::test]

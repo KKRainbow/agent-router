@@ -23,6 +23,18 @@ workspace:
   # Optional. When set, each router session runs under a stable child directory.
   root: /data/project/agent-router-workspaces/
 
+agent_api:
+  # Shared authenticated HTTP entry point for agent-callable capabilities.
+  # Requires workspace.root. Remote agents need a reachable API URL below.
+  enabled: false
+  bind: 127.0.0.1:8790
+
+schedules:
+  # Requires agent_api.enabled; keep Router running to execute scheduled work.
+  enabled: false
+  max_concurrent: 4
+  timeout_secs: 3600
+
 machines:
   local:
     type: local
@@ -36,6 +48,7 @@ machines:
   #   workspace_root: /data/project/agent-router-workspaces/
   #   env:
   #     PATH: /home/admin/.local/bin:$PATH
+  #     AGENT_ROUTER_API_URL: http://router-host:8790
   #   skill_roots:
   #     - /home/admin/.codex/skills
   #     - /data/project/ai/skills

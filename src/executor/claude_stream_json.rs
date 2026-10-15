@@ -654,6 +654,8 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
         let cfg = self.executors.get(&request.turn.executor).ok_or_else(|| {
             anyhow::anyhow!("executor `{}` is not configured", request.turn.executor)
         })?;
+        let mut cfg = cfg.clone();
+        cfg.env.extend(request.environment.clone());
         tracing::info!(
             executor = %request.turn.executor,
             session_key = %request.turn.session_key,
@@ -666,7 +668,7 @@ impl ExecutorBackend for ClaudeStreamJsonManager {
             .get_or_create_session(
                 &request.turn.session_key,
                 &request.turn.executor,
-                cfg,
+                &cfg,
                 request.cwd.as_deref(),
                 previous_session_id.clone(),
                 &cancel,
@@ -1660,6 +1662,7 @@ done
         let first = manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: ExecutorTurnRef {
                         session_key: "session-1".to_string(),
                         executor: "claude".to_string(),
@@ -1681,6 +1684,7 @@ done
         let second = manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: ExecutorTurnRef {
                         session_key: "session-1".to_string(),
                         executor: "claude".to_string(),
@@ -1751,6 +1755,7 @@ done
             prepare_manager
                 .prepare(
                     ExecutorPrepareRequest {
+                        environment: Default::default(),
                         turn: ExecutorTurnRef {
                             session_key: "session-1".to_string(),
                             executor: "claude".to_string(),
@@ -1797,6 +1802,7 @@ done
         let prepared = manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: ExecutorTurnRef {
                         session_key: "session-1".to_string(),
                         executor: "claude".to_string(),

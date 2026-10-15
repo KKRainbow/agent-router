@@ -4,6 +4,7 @@ use std::{
 };
 
 use agent_router::{
+    agent_api::{self, AgentApi},
     approval::ApprovalBroker,
     channel::{
         qq::QqBotChannel, slack::SlackSocketModeChannel, telegram::TelegramBotChannel,
@@ -13,6 +14,7 @@ use agent_router::{
     executor::registry::ExecutorRegistry,
     machine::MachineRegistry,
     router::{AgentRouter, RouterService, SessionApprovalPolicy},
+    schedules::Scheduler,
     session::store::{ConfiguredExecutor, ProductionSessionStore},
 };
 use clap::{Parser, Subcommand};
@@ -68,13 +70,94 @@ async fn main() -> anyhow::Result<()> {
     }
     let config = AppConfig::load(config_path.as_deref())?;
 
-    let (approvals, router) = build_router(&config);
-    match mode {
-        RunMode::Chat => run_chat_mode(config, router, approvals, chat_log_path, None).await,
-        RunMode::Serve => run_serve_mode(config, router, approvals).await,
-        RunMode::ChatAndServe => {
-            run_chat_and_serve_mode(config, router, approvals, chat_log_path).await
+    let agent_api = config
+        .agent_api
+        .enabled
+        .then(|| AgentApi::new(config.executors.keys().cloned().collect()));
+    let schedules = if config.schedules.enabled {
+        let executors = config
+            .executors
+            .keys()
+            .filter(|name| {
+                !config
+                    .router
+                    .orchestrator
+                    .as_ref()
+                    .is_some_and(|orchestrator| {
+                        orchestrator.enabled && orchestrator.executor == **name
+                    })
+            })
+            .cloned()
+            .collect();
+        Some(Scheduler::open(
+            config.workspace.root.as_ref().unwrap(),
+            executors,
+        )?)
+    } else {
+        None
+    };
+    let listener = if agent_api.is_some() {
+        Some(tokio::net::TcpListener::bind(config.agent_api.bind).await?)
+    } else {
+        None
+    };
+    let api_url = listener.as_ref().map(|listener| {
+        let mut address = listener.local_addr().expect("bound agent API listener");
+        if address.ip().is_unspecified() {
+            address.set_ip(if address.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
         }
+        format!("http://{address}")
+    });
+    let (approvals, router) = build_router(&config, agent_api.clone(), api_url);
+    let delivery = Arc::new(
+        agent_router::channel::schedules::ScheduledNotifications::new(
+            &config,
+            approvals.clone(),
+            mode != RunMode::Chat,
+        ),
+    );
+    let schedule_config = config.schedules.clone();
+    let schedule_router = router.clone();
+    let feature_routes = schedules
+        .as_ref()
+        .map(|scheduler| agent_router::schedules::routes(scheduler.clone()))
+        .unwrap_or_else(axum::Router::new);
+    let api_service = async move {
+        if let (Some(api), Some(listener)) = (agent_api, listener) {
+            tracing::info!(address = %listener.local_addr()?, "starting agent API");
+            axum::serve(listener, agent_api::build_app(api, feature_routes))
+                .await
+                .map_err(anyhow::Error::from)
+        } else {
+            std::future::pending::<anyhow::Result<()>>().await
+        }
+    };
+    let background = async move {
+        if let Some(schedules) = schedules {
+            schedules
+                .run(schedule_router, delivery, schedule_config)
+                .await
+        } else {
+            std::future::pending::<anyhow::Result<()>>().await
+        }
+    };
+    let channels = async move {
+        match mode {
+            RunMode::Chat => run_chat_mode(config, router, approvals, chat_log_path, None).await,
+            RunMode::Serve => run_serve_mode(config, router, approvals).await,
+            RunMode::ChatAndServe => {
+                run_chat_and_serve_mode(config, router, approvals, chat_log_path).await
+            }
+        }
+    };
+    tokio::select! {
+        result = api_service => result,
+        result = background => result,
+        result = channels => result,
     }
 }
 
@@ -160,7 +243,11 @@ fn nonempty_env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn build_router(config: &AppConfig) -> (Arc<ApprovalBroker>, Arc<dyn RouterService>) {
+fn build_router(
+    config: &AppConfig,
+    agent_api: Option<Arc<AgentApi>>,
+    api_url: Option<String>,
+) -> (Arc<ApprovalBroker>, Arc<dyn RouterService>) {
     if let Some(root) = &config.workspace.root {
         tracing::info!(workspace_root = %root.display(), "using workspace session persistence");
     } else {
@@ -198,7 +285,7 @@ fn build_router(config: &AppConfig) -> (Arc<ApprovalBroker>, Arc<dyn RouterServi
     ));
     let executor = Arc::new(ExecutorRegistry::with_machines(
         config.executors.clone(),
-        MachineRegistry::new(config.machines.clone()),
+        MachineRegistry::new(config.machines.clone()).with_agent_api_url(api_url),
         approvals.clone(),
     ));
     let orchestrator =
@@ -225,6 +312,7 @@ fn build_router(config: &AppConfig) -> (Arc<ApprovalBroker>, Arc<dyn RouterServi
             approvals.clone(),
         )
         .with_workspace_root(config.workspace.root.clone())
+        .with_agent_api(agent_api)
         .with_owner_user_ids("slack", config.slack.owner_user_ids.clone())
         .with_orchestrator(orchestrator),
     );
@@ -295,7 +383,11 @@ async fn run_serve_mode(
     router: Arc<dyn RouterService>,
     approvals: Arc<ApprovalBroker>,
 ) -> anyhow::Result<()> {
+    let api_enabled = config.agent_api.enabled;
     let mut channels = spawn_external_channels(config, router, approvals)?;
+    if channels.is_empty() && api_enabled {
+        return std::future::pending().await;
+    }
     anyhow::ensure!(
         !channels.is_empty(),
         "no external channels enabled; configure Slack, Telegram, QQ, or web credentials, or enable a channel, then run `agent-router serve`"

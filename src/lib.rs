@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
+pub mod agent_api;
 pub mod approval;
 pub mod channel;
 pub mod config;
 pub mod executor;
 pub mod machine;
 pub mod router;
+pub mod schedules;
 pub mod session;
 mod text;
 

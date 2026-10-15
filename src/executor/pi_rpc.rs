@@ -388,6 +388,8 @@ impl ExecutorBackend for PiRpcExecutorManager {
         let cfg = self.executors.get(&request.turn.executor).ok_or_else(|| {
             anyhow::anyhow!("executor `{}` is not configured", request.turn.executor)
         })?;
+        let mut cfg = cfg.clone();
+        cfg.env.extend(request.environment.clone());
         tracing::info!(
             executor = %request.turn.executor,
             session_key = %request.turn.session_key,
@@ -401,7 +403,7 @@ impl ExecutorBackend for PiRpcExecutorManager {
                 .acquire_session(
                     &request.turn.session_key,
                     &request.turn.executor,
-                    cfg,
+                    &cfg,
                     request.cwd.as_deref(),
                     previous_session_id.clone(),
                     &cancel,
@@ -2400,6 +2402,7 @@ while True:
         manager
             .prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn(1),
                     cwd: None,
                     previous_session_id,
@@ -2587,6 +2590,7 @@ while True:
             prepare_manager
                 .prepare(
                     ExecutorPrepareRequest {
+                        environment: Default::default(),
                         turn: turn(2),
                         cwd: None,
                         previous_session_id: first.external_session_id.clone(),
@@ -2613,6 +2617,7 @@ while True:
             Duration::from_secs(2),
             manager.prepare(
                 ExecutorPrepareRequest {
+                    environment: Default::default(),
                     turn: turn(3),
                     cwd: None,
                     previous_session_id: Some(fake.session_file.clone()),

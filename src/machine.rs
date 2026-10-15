@@ -75,6 +75,7 @@ pub enum MachineKind {
 #[derive(Debug, Clone)]
 pub struct MachineRegistry {
     machines: BTreeMap<String, MachineConfig>,
+    agent_api_url: Option<String>,
     materialization_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     workspace_environment_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
@@ -142,6 +143,7 @@ impl MachineRegistry {
             .or_insert_with(local_machine_config);
         Self {
             machines,
+            agent_api_url: None,
             materialization_locks: Arc::new(Mutex::new(BTreeMap::new())),
             workspace_environment_locks: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -152,6 +154,34 @@ impl MachineRegistry {
             LOCAL_MACHINE_ID.to_string(),
             local_machine_config(),
         )]))
+    }
+
+    pub fn with_agent_api_url(mut self, url: Option<String>) -> Self {
+        self.agent_api_url = url;
+        self
+    }
+
+    fn executor_env(
+        &self,
+        machine: &MachineConfig,
+        env: &BTreeMap<String, String>,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        let mut env = layered_env(&machine.env, env);
+        if env.contains_key(crate::agent_api::API_TOKEN_ENV)
+            && !env.contains_key(crate::agent_api::API_URL_ENV)
+        {
+            anyhow::ensure!(
+                machine.kind == MachineKind::Local,
+                "remote Machine `{}` needs env.AGENT_ROUTER_API_URL pointing to the Router",
+                machine.id
+            );
+            let url = self
+                .agent_api_url
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("agent API URL is not configured"))?;
+            env.insert(crate::agent_api::API_URL_ENV.into(), url.clone());
+        }
+        Ok(env)
     }
 
     pub fn get(&self, id: &str) -> Option<&MachineConfig> {
@@ -212,6 +242,9 @@ impl MachineRegistry {
             let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
             refresh_workspace_environment_files(router_workspace)?;
+            if request.env.contains_key(crate::agent_api::API_TOKEN_ENV) {
+                crate::agent_api::skill::install(router_workspace)?;
+            }
             artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
             if let Some(workspace) = workspace.as_ref() {
                 let router_workspace = canonicalize_lossy(router_workspace);
@@ -231,6 +264,9 @@ impl MachineRegistry {
         ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
         let cwd = canonicalize_lossy(&cwd);
+        if request.env.contains_key(crate::agent_api::API_TOKEN_ENV) {
+            crate::agent_api::skill::install(&cwd)?;
+        }
         let workspace_record = workspace.map(|_| MachineWorkspaceRecord {
             machine_id: machine.id.clone(),
             cwd: cwd.display().to_string(),
@@ -244,7 +280,7 @@ impl MachineRegistry {
                 program: request.command.to_string(),
                 args: request.args.to_vec(),
                 current_dir: Some(cwd.clone()),
-                env: layered_env(&machine.env, request.env),
+                env: self.executor_env(machine, request.env)?,
                 env_remove: Vec::new(),
                 executor_cwd: cwd.display().to_string(),
                 strict_json_stdout: false,
@@ -281,6 +317,9 @@ impl MachineRegistry {
             let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
             refresh_workspace_environment_files(router_workspace)?;
+            if request.env.contains_key(crate::agent_api::API_TOKEN_ENV) {
+                crate::agent_api::skill::install(router_workspace)?;
+            }
             let artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
             materialize_ssh_workspace(host, router_workspace, &remote_cwd, request.cancel).await?;
             (
@@ -292,7 +331,7 @@ impl MachineRegistry {
         };
         ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
-        let remote_env = layered_env(&machine.env, request.env);
+        let remote_env = self.executor_env(machine, request.env)?;
         let remote_script =
             build_remote_exec_script(&remote_cwd, &remote_env, request.command, request.args)?;
         Ok(PreparedMachineCommand {
@@ -722,6 +761,9 @@ fn sync_workspace_contents(
         let destination_path = destination.join(entry.file_name());
         let metadata = std::fs::symlink_metadata(&source_path)?;
         if metadata.file_type().is_symlink() {
+            if crate::agent_api::skill::is_managed_link(&source_path) {
+                continue;
+            }
             anyhow::bail!(
                 "workspace materialization does not copy symlinks: {}",
                 source_path.display()
@@ -961,6 +1003,9 @@ fn hash_workspace(root: &Path, path: &Path, hasher: &mut Sha256) -> anyhow::Resu
         let relative = path.strip_prefix(root).unwrap_or(path.as_path());
         hasher.update(relative.to_string_lossy().as_bytes());
         if metadata.file_type().is_symlink() {
+            if crate::agent_api::skill::is_managed_link(&path) {
+                continue;
+            }
             anyhow::bail!(
                 "workspace fingerprint does not follow symlinks: {}",
                 path.display()
@@ -1298,6 +1343,73 @@ mod tests {
         assert!(script.contains("find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"));
         assert!(script.contains("tar xf - -C ."));
         assert!(!script.contains("tar xf - -C '/remote/work/session'"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_skill_survives_repeated_workspace_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("router");
+        let destination = tmp.path().join("machine");
+        std::fs::create_dir_all(&source).unwrap();
+        let registry = MachineRegistry::new(BTreeMap::from([(
+            "local".into(),
+            test_local_machine("local", Some(&destination), Vec::new()),
+        )]))
+        .with_agent_api_url(Some("http://127.0.0.1:8790".into()));
+        let env = BTreeMap::from([(
+            crate::agent_api::API_TOKEN_ENV.into(),
+            "session-token".into(),
+        )]);
+        for _ in 0..2 {
+            let prepared = registry
+                .prepare_executor_command(MachinePrepareRequest {
+                    machine_id: "local",
+                    session_key: "scheduled-session",
+                    router_workspace: Some(&source),
+                    executor_cwd: None,
+                    command: "agent",
+                    args: &[],
+                    env: &env,
+                    cancel: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                prepared.stdio.env[crate::agent_api::API_TOKEN_ENV],
+                "session-token"
+            );
+            assert_eq!(
+                prepared.stdio.env[crate::agent_api::API_URL_ENV],
+                "http://127.0.0.1:8790"
+            );
+            let cwd = Path::new(&prepared.stdio.executor_cwd);
+            assert_ne!(cwd, source);
+            assert_eq!(
+                std::fs::read_to_string(cwd.join(".claude/skills/agent-router/SKILL.md")).unwrap(),
+                crate::agent_api::skill::SKILL
+            );
+        }
+    }
+
+    #[test]
+    fn remote_scheduling_requires_an_explicit_reachable_api_url() {
+        let registry = MachineRegistry::local_default()
+            .with_agent_api_url(Some("http://127.0.0.1:8790".into()));
+        let mut machine = test_local_machine("remote", None, Vec::new());
+        machine.kind = MachineKind::Ssh;
+        let env = BTreeMap::from([(
+            crate::agent_api::API_TOKEN_ENV.into(),
+            "session-token".into(),
+        )]);
+        assert!(registry.executor_env(&machine, &env).is_err());
+        machine.env.insert(
+            crate::agent_api::API_URL_ENV.into(),
+            "http://router:8790".into(),
+        );
+        assert_eq!(
+            registry.executor_env(&machine, &env).unwrap()[crate::agent_api::API_URL_ENV],
+            "http://router:8790"
+        );
     }
 
     #[tokio::test]

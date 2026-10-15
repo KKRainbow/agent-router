@@ -179,7 +179,7 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

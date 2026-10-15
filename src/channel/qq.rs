@@ -405,6 +405,35 @@ impl QqBotChannel {
             .await
     }
 
+    pub(crate) async fn send_notification(
+        &self,
+        session_key: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let target = if let Some(openid) = session_key.strip_prefix("qq:c2c:") {
+            QqReplyTarget::C2c {
+                openid: openid.to_string(),
+            }
+        } else if let Some(group_openid) = session_key.strip_prefix("qq:group:") {
+            QqReplyTarget::Group {
+                group_openid: group_openid.to_string(),
+            }
+        } else {
+            anyhow::bail!("invalid QQ session key");
+        };
+        // Scheduled work has no fresh incoming message to reply to. Use the
+        // proactive API and surface platform permission/quota errors as delivery
+        // failures, without rerunning the task or reusing expired message IDs.
+        self.post_message_body(
+            &target,
+            0,
+            text.len(),
+            json!({ "content": text, "msg_type": 0 }),
+            "text",
+        )
+        .await
+    }
+
     async fn post_text_message(
         &self,
         target: &QqReplyTarget,
