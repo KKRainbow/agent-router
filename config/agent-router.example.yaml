@@ -68,7 +68,12 @@ executors:
   codex:
     protocol: app_server
     machine: local
+    # command is an executable name/path, not a shell command line.
+    # Explicit args replace the default ["app-server"], so include it below.
     command: codex
+    # args: ["app-server", "-c", 'model="gpt-6-astra"']
+    # To match Codex --yolo, also pass these config overrides in args:
+    # "-c", 'approval_policy="never"', "-c", 'sandbox_mode="danger-full-access"'
   pi:
     protocol: pi_rpc
     machine: local
