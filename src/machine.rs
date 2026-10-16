@@ -806,7 +806,11 @@ fn sync_workspace_contents(
         .map_err(|err| anyhow::anyhow!("read machine workspace {}: {err}", destination.display()))?
     {
         let entry = entry?;
-        if source_names.contains(&entry.file_name()) {
+        if source_names.contains(&entry.file_name())
+            || crate::agent_api::skill::is_workspace_path(
+                source.join(entry.file_name()).strip_prefix(root)?,
+            )
+        {
             continue;
         }
         if let Some(cancel) = cancel
@@ -1464,6 +1468,32 @@ mod tests {
                     !same_file::is_same_file(cwd.join(relative), source.join(relative)).unwrap()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn workspace_sync_preserves_destination_shared_skill_links() {
+        use crate::agent_api::skill;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        for parent in [".agents/skills", ".claude/skills"] {
+            let user_skill = source.join(parent).join("user");
+            std::fs::create_dir_all(&user_skill).unwrap();
+            std::fs::write(user_skill.join("SKILL.md"), "user's skill").unwrap();
+        }
+        skill::install(&destination, tmp.path()).unwrap();
+        sync_workspace_contents(&source, &source, &destination, None).unwrap();
+        for relative in skill::WORKSPACE_PATHS {
+            assert!(
+                same_file::is_same_file(
+                    destination.join(relative),
+                    tmp.path().join(skill::SHARED_PATH)
+                )
+                .unwrap()
+            );
         }
     }
 
