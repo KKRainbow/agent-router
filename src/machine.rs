@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub const LOCAL_MACHINE_ID: &str = "local";
+const SHARED_SKILL_INSTALL_SCRIPT: &str = ".agent-router-install.sh";
 const WORKSPACE_ENVIRONMENT_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 const WORKSPACE_ENVIRONMENT_START_MARKER: &[u8] =
     b"<!-- agent-router:workspace-environment:start -->";
@@ -661,19 +662,50 @@ async fn install_ssh_shared_skills(
     cancel: Option<&TurnCancellation>,
 ) -> anyhow::Result<()> {
     let stage = tempfile::tempdir()?;
+    let archive = prepare_shared_skill_archive(stage.path(), root, cwd, skills)?;
+    let bootstrap = remote_shared_skill_bootstrap_script(root)?;
+    transfer_archive(host, archive, &bootstrap, cancel).await
+}
+
+fn prepare_shared_skill_archive(
+    stage: &Path,
+    root: &str,
+    cwd: &str,
+    skills: &[SharedSkill],
+) -> anyhow::Result<Command> {
     for skill in skills {
-        let directory = stage.path().join(&skill.name);
+        let directory = stage.join(&skill.name);
         std::fs::create_dir(&directory)?;
         crate::skills::write_files(&directory, &skill.files)?;
     }
+    // Send the installation program inside the archive. Its size grows with
+    // the shared library and must not consume the SSH command-line budget.
+    std::fs::write(
+        stage.join(SHARED_SKILL_INSTALL_SCRIPT),
+        install_remote_shared_skills_script(root, cwd, skills)?,
+    )?;
     let mut archive = Command::new("tar");
-    archive
-        .args(["cf", "-"])
-        .arg("-C")
-        .arg(stage.path())
-        .arg(".");
-    let script = install_remote_shared_skills_script(root, cwd, skills)?;
-    transfer_archive(host, archive, &script, cancel).await
+    archive.args(["cf", "-"]).arg("-C").arg(stage).arg(".");
+    Ok(archive)
+}
+
+fn remote_shared_skill_bootstrap_script(root: &str) -> anyhow::Result<String> {
+    let shared_root = join_remote_path(root, ".agent-router/skills");
+    let commands = [
+        create_remote_workspace_script(&shared_root)?,
+        format!(
+            "skill_stage=$(mktemp -d {})",
+            shell_quote(&join_remote_path(&shared_root, ".stage.XXXXXX"))
+        ),
+        "trap 'rm -rf -- \"$skill_stage\"' 0".into(),
+        "tar xf - -C \"$skill_stage\"".into(),
+        format!("sh \"$skill_stage/{SHARED_SKILL_INSTALL_SCRIPT}\" \"$skill_stage\""),
+    ];
+    Ok(commands
+        .into_iter()
+        .map(|command| format!("{{ {command}; }}"))
+        .collect::<Vec<_>>()
+        .join(" && "))
 }
 
 fn install_remote_shared_skills_script(
@@ -682,15 +714,7 @@ fn install_remote_shared_skills_script(
     skills: &[SharedSkill],
 ) -> anyhow::Result<String> {
     let shared_root = join_remote_path(root, ".agent-router/skills");
-    let mut commands = vec![
-        create_remote_workspace_script(&shared_root)?,
-        format!(
-            "skill_stage=$(mktemp -d {})",
-            shell_quote(&join_remote_path(&shared_root, ".stage.XXXXXX"))
-        ),
-        "trap 'rm -rf -- \"$skill_stage\"' 0".into(),
-        "tar xf - -C \"$skill_stage\"".into(),
-    ];
+    let mut commands = vec!["skill_stage=\"$1\"".to_owned()];
     for skill in skills {
         let shared = join_remote_path(&shared_root, &skill.name);
         let destination = shell_quote(&shared);
@@ -1816,6 +1840,25 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn shared_skill_test_archive(root: &str, cwd: &str, skills: &[SharedSkill]) -> Vec<u8> {
+        let stage = tempfile::tempdir().unwrap();
+        let mut archive = prepare_shared_skill_archive(stage.path(), root, cwd, skills).unwrap();
+        // Simulate a Windows archive without Unix executable metadata.
+        for skill in skills {
+            for path in skill.files.keys() {
+                std::fs::set_permissions(
+                    stage.path().join(&skill.name).join(path),
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+        }
+        let output = archive.output().await.unwrap();
+        assert!(output.status.success());
+        output.stdout
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn ssh_custom_skills_keep_packages_and_session_skills_across_materialization() {
         use crate::agent_api::skill;
@@ -1841,20 +1884,7 @@ mod tests {
             .unwrap();
         assert!(workspace_archive.status.success());
 
-        let stage = tmp.path().join("stage");
-        std::fs::create_dir_all(stage.join("writer")).unwrap();
-        crate::skills::write_files(&stage.join("writer"), &skills[0].files).unwrap();
-        // Simulate a Windows archive without Unix executable metadata.
-        std::fs::set_permissions(
-            stage.join("writer/scripts/check.sh"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-        let package_archive = workspace_archive_command(&stage, &[])
-            .output()
-            .await
-            .unwrap();
-        assert!(package_archive.status.success());
+        let bootstrap = remote_shared_skill_bootstrap_script(remote.to_str().unwrap()).unwrap();
         for session in ["first", "second", "first", "second"] {
             let cwd = remote.join(session);
             let own_file = cwd.join(".agents/skills/future-skill/SKILL.md");
@@ -1865,14 +1895,11 @@ mod tests {
             let materialize = materialize_remote_workspace_script(cwd.to_str().unwrap()).unwrap();
             let output = run_shell_script(&materialize, &workspace_archive.stdout).await;
             assert!(output.status.success(), "{output:?}");
-            let install = install_remote_shared_skills_script(
-                remote.to_str().unwrap(),
-                cwd.to_str().unwrap(),
-                &skills,
-            )
-            .unwrap();
+            let package_archive =
+                shared_skill_test_archive(remote.to_str().unwrap(), cwd.to_str().unwrap(), &skills)
+                    .await;
             for _ in 0..2 {
-                let output = run_shell_script(&install, &package_archive.stdout).await;
+                let output = run_shell_script(&bootstrap, &package_archive).await;
                 assert!(output.status.success(), "{output:?}");
             }
             assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "session-owned");
@@ -1906,19 +1933,13 @@ mod tests {
             }
         }
         let future = shared_test_skill("future-skill");
-        std::fs::create_dir_all(stage.join("future-skill")).unwrap();
-        crate::skills::write_files(&stage.join("future-skill"), &future.files).unwrap();
-        let archive = workspace_archive_command(&stage, &[])
-            .output()
-            .await
-            .unwrap();
-        let install = install_remote_shared_skills_script(
+        let archive = shared_skill_test_archive(
             remote.to_str().unwrap(),
             remote.join("first").to_str().unwrap(),
             &[future],
         )
-        .unwrap();
-        let output = run_shell_script(&install, &archive.stdout).await;
+        .await;
+        let output = run_shell_script(&bootstrap, &archive).await;
         assert!(!output.status.success());
         assert_eq!(
             std::fs::read_to_string(remote.join("first/.agents/skills/future-skill/SKILL.md"))
@@ -1927,13 +1948,13 @@ mod tests {
         );
         let remote_file = remote.join(".agent-router/skills/writer/SKILL.md");
         std::fs::write(&remote_file, "remote change").unwrap();
-        let install = install_remote_shared_skills_script(
+        let archive = shared_skill_test_archive(
             remote.to_str().unwrap(),
             remote.join("first").to_str().unwrap(),
             &skills,
         )
-        .unwrap();
-        let output = run_shell_script(&install, &package_archive.stdout).await;
+        .await;
+        let output = run_shell_script(&bootstrap, &archive).await;
         assert!(!output.status.success());
         assert_eq!(
             std::fs::read_to_string(remote_file).unwrap(),
@@ -1955,12 +1976,7 @@ mod tests {
     async fn remote_skill_archive_failure_does_not_publish_or_link() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("session");
-        let script = install_remote_shared_skills_script(
-            tmp.path().to_str().unwrap(),
-            cwd.to_str().unwrap(),
-            &[shared_test_skill("writer")],
-        )
-        .unwrap();
+        let script = remote_shared_skill_bootstrap_script(tmp.path().to_str().unwrap()).unwrap();
         let output = run_shell_script(&script, b"invalid archive").await;
         assert!(!output.status.success());
         assert!(!tmp.path().join(".agent-router/skills/writer").exists());
@@ -1971,6 +1987,66 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_skill_library_size_does_not_grow_ssh_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp
+            .path()
+            .join("data/project/agent-router-workspaces/remote-machine-workspaces");
+        let cwd_root = remote
+            .join("development-machine-0123456789abcdef")
+            .join("qq-c2c-0123456789abcdef0123456789abcdef-0123456789abcdef");
+        let skills = (0..20)
+            .map(|index| {
+                let mut skill = shared_test_skill(&format!("writer-{index:02}"));
+                skill.files.retain(|path, _| path == "SKILL.md");
+                skill
+            })
+            .collect::<Vec<_>>();
+        let mut command_lengths = Vec::new();
+        for count in [1, skills.len()] {
+            let cwd = cwd_root.join(format!("session-{count}"));
+            let script = install_remote_shared_skills_script(
+                remote.to_str().unwrap(),
+                cwd.to_str().unwrap(),
+                &skills[..count],
+            )
+            .unwrap();
+            if count == skills.len() {
+                // This would exceed Linux's single-argument limit if sent
+                // through ssh argv instead of as a file in the archive.
+                assert!(script.len() > 128 * 1024, "script length: {}", script.len());
+            }
+            let bootstrap = remote_shared_skill_bootstrap_script(remote.to_str().unwrap()).unwrap();
+            let ssh_args = ssh_remote_args("test-host", &bootstrap);
+            command_lengths.push(ssh_args.iter().map(String::len).sum::<usize>());
+            assert!(command_lengths.last().unwrap() < &8192);
+            let archive = shared_skill_test_archive(
+                remote.to_str().unwrap(),
+                cwd.to_str().unwrap(),
+                &skills[..count],
+            )
+            .await;
+            for _ in 0..2 {
+                let output = run_shell_script(&bootstrap, &archive).await;
+                assert!(output.status.success(), "{output:?}");
+            }
+            for skill in &skills[..count] {
+                for directory in [".agents/skills", ".claude/skills"] {
+                    assert!(
+                        same_file::is_same_file(
+                            cwd.join(directory).join(&skill.name),
+                            remote.join(".agent-router/skills").join(&skill.name),
+                        )
+                        .unwrap()
+                    );
+                }
+            }
+        }
+        assert_eq!(command_lengths[0], command_lengths[1]);
     }
 
     #[test]

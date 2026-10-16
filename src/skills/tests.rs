@@ -185,6 +185,46 @@ async fn publishing_is_create_only_and_builtin_is_reserved() {
 }
 
 #[tokio::test]
+async fn reserved_metadata_directories_cannot_poison_the_shared_library() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(SkillStore::open(root.path()).unwrap());
+    let api = AgentApi::new(vec!["omp".into()]);
+    let token = credential(&api, "qq:c2c:owner");
+    let app = build_app(api, routes(store.clone()));
+    let valid = package("test-report");
+    assert_eq!(
+        request(&app, &token, "POST", "/api/skills", body(&valid))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+    for directory in [".AGENT-ROUTER-SKILL.JSON", METADATA_FILE] {
+        let mut invalid = package("invalid-package");
+        invalid
+            .files
+            .insert(format!("{directory}/file"), file("data"));
+        assert_eq!(
+            request(&app, &token, "POST", "/api/skills", body(&invalid))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!store.root().join("invalid-package").exists());
+    }
+    assert_eq!(
+        request(&app, &token, "GET", "/api/skills", Value::Null).await,
+        (
+            StatusCode::OK,
+            json!({"skills":[{"name":"test-report", "description":"Create a test report."}]})
+        )
+    );
+    assert_eq!(
+        SkillStore::open(root.path()).unwrap().snapshot().unwrap(),
+        vec![store.read("test-report").unwrap().unwrap()]
+    );
+}
+
+#[tokio::test]
 async fn skill_upload_has_a_route_specific_body_limit() {
     let root = tempfile::tempdir().unwrap();
     let api = AgentApi::new(vec!["omp".into()]);

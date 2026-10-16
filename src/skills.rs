@@ -339,8 +339,11 @@ fn validate_skill(request: CreateSkill) -> anyhow::Result<ValidatedSkill> {
 }
 
 fn validate_path(path: &str) -> anyhow::Result<()> {
+    // Reserve the top-level name for both files and directories so a package
+    // accepted on a case-sensitive filesystem remains readable afterwards.
+    let root_component = path.split('/').next().unwrap();
     ensure!(
-        !path.eq_ignore_ascii_case(METADATA_FILE),
+        !root_component.eq_ignore_ascii_case(METADATA_FILE),
         ".agent-router-skill.json is reserved for Router metadata"
     );
     ensure!(
