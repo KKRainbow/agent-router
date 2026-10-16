@@ -866,11 +866,14 @@ impl SlackSocketModeChannel {
 
     pub(crate) async fn send_notification(
         &self,
-        session_key: &str,
+        channel: &str,
+        thread: Option<&str>,
         text: &str,
     ) -> anyhow::Result<()> {
-        let target = SlackReplyTarget::from_session_key(session_key)
-            .ok_or_else(|| anyhow::anyhow!("invalid Slack session key"))?;
+        let target = SlackReplyTarget {
+            channel: channel.into(),
+            thread_ts: thread.map(str::to_owned),
+        };
         self.post_markdown_message_with_ts(&target, text)
             .await
             .map(|_| ())

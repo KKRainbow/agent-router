@@ -24,7 +24,63 @@ internal workflows, and early integrations.
 - Lets users switch agents inside the same chat session.
 - Projects conversation context when a session switches agents.
 - Sends normalized replies back to the originating channel.
+- Lets agents send messages to their conversation or configured channel targets through HTTP.
 - Runs persistent scheduled tasks that agents can manage through a skill and REST API.
+
+## Agent messages
+
+Enable `agent_api.enabled` with a `workspace.root` to let agents call
+`POST /api/messages`. Scheduling is optional. Agents receive the API URL, a
+session credential, and the shared [Agent Router skill](skills/agent-router/SKILL.md).
+
+Sending `{"text":"The task is finished"}` posts to the originating conversation,
+including its Slack thread or Telegram topic. Scheduled agents also default to
+their originating conversation. To allow additional destinations, configure:
+
+```yaml
+agent_api:
+  enabled: true
+  bind: 127.0.0.1:8790
+  message_targets:
+    reports:
+      channel: slack
+      target: C123456
+    alerts:
+      channel: telegram
+      target: "-1001234567890"
+      thread: "42"
+```
+
+`GET /api/channels` returns `current` and a map of named `targets` for enabled
+channels. Agents can copy a target into a send request:
+
+```json
+{"channel":"slack","target":"C123456","text":"Build passed"}
+```
+
+Every session credential can send to the configured targets. An empty map grants
+only the originating conversation; it does not expose other sessions. These are
+outbound grants, independent of the incoming channel allowlists. A configured
+`thread` restricts the grant to that thread; without it, the channel and all its
+threads are allowed. QQ targets use `c2c:<openid>` or `group:<group_openid>` and
+do not support threads. Web and terminal targets use the session-key suffix,
+such as `user:local:my-session`, and also do not support threads.
+
+Messages support 1–32768 UTF-8 bytes and use the channel's existing formatting.
+Current-conversation and Web/terminal messages are saved to their transcript.
+Cross-channel messages go directly to the external destination without creating
+an artificial conversation or notifying the sender. The response's `recorded`
+field says whether a transcript was saved; `delivery: "accepted"` means the
+platform accepted the send (or the local conversation accepted the notification),
+not that a person has read it. Web displays persisted notifications when its
+active turn finishes; an open terminal displays them immediately.
+
+A disabled channel returns 503 before recording or sending. Platform failures
+return 502 with `recorded` and `delivery: "unknown"`; delivery may be partial,
+and the API never retries automatically. In particular, QQ still requires the
+bot's proactive-message permissions and quota. Do not blindly retry a failed
+or interrupted send. For remote agents, use the reachable API URL configuration
+described below under scheduled tasks.
 
 ## Scheduled tasks
 

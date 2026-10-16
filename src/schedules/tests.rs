@@ -10,6 +10,7 @@ use tower::ServiceExt;
 
 use crate::{
     agent_api::{API_TOKEN_ENV, AgentApi, build_app},
+    channel::notifications::{MessageChannel, MessageTarget, NotificationDelivery},
     executor::{
         ExecutorBackend, ExecutorDescriptor, ExecutorEventSink, ExecutorPrepareRequest,
         ExecutorPromptOutcome, ExecutorPromptRequest, PreparedExecutor, TurnCancellation,
@@ -372,8 +373,12 @@ async fn failed_persistence_does_not_publish_mutation() {
 
 struct FailedDelivery;
 #[async_trait]
-impl ScheduleDelivery for FailedDelivery {
-    async fn deliver(&self, _: &str, _: &str) -> anyhow::Result<()> {
+impl NotificationDelivery for FailedDelivery {
+    fn supports(&self, _: MessageChannel) -> bool {
+        true
+    }
+
+    async fn deliver(&self, _: &MessageTarget, _: &str) -> anyhow::Result<()> {
         anyhow::bail!("platform refused delivery")
     }
 }

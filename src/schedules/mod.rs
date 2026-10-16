@@ -20,7 +20,6 @@ use uuid::Uuid;
 use crate::{agent_api::AgentScope, session::now_ms};
 
 pub use api::routes;
-pub use runtime::ScheduleDelivery;
 
 const HISTORY_LIMIT: usize = 20;
 

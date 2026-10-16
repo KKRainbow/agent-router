@@ -176,6 +176,19 @@ originating session before applying its approval policy.
 can run with scheduling disabled. There is no dynamic plugin registry: startup
 composition and the existing Axum router are sufficient extension points.
 
+`messages` registers `/api/messages` and `/api/channels` with the same caller
+authentication. A request may use its originating conversation or an outbound
+target explicitly granted by `agent_api.message_targets`. Those named grants
+apply to every API session, independently of channel intake allowlists; an
+optional configured thread narrows a grant to that thread. Target discovery
+only returns the caller's current destination and enabled configured targets.
+The channel-owned `NotificationDelivery` and `ChannelNotifications` are shared
+by scheduled results and direct messages. Adapters retain native formatting
+and transport behavior. Current-conversation messages are appended under the
+existing session lock before delivery; cross-channel external sends do not
+invent conversation identities. API responses distinguish transcript recording
+from delivery acceptance, and uncertain sends are never automatically retried.
+
 ### Existing routing dependencies
 
 Channel adapters depend on router-core abstractions.

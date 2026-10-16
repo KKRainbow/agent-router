@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let (approvals, router) = build_router(&config, agent_api.clone(), api_url);
     let delivery = Arc::new(
-        agent_router::channel::schedules::ScheduledNotifications::new(
+        agent_router::channel::notifications::ChannelNotifications::new(
             &config,
             approvals.clone(),
             mode != RunMode::Chat,
@@ -122,10 +122,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let schedule_config = config.schedules.clone();
     let schedule_router = router.clone();
-    let feature_routes = schedules
-        .as_ref()
-        .map(|scheduler| agent_router::schedules::routes(scheduler.clone()))
-        .unwrap_or_else(axum::Router::new);
+    let mut feature_routes = agent_router::messages::routes(
+        router.clone(),
+        delivery.clone(),
+        config.agent_api.message_targets.clone(),
+    );
+    if let Some(scheduler) = &schedules {
+        feature_routes = feature_routes.merge(agent_router::schedules::routes(scheduler.clone()));
+    }
     let api_service = async move {
         if let (Some(api), Some(listener)) = (agent_api, listener) {
             tracing::info!(address = %listener.local_addr()?, "starting agent API");

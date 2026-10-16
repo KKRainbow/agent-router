@@ -33,6 +33,7 @@ pub const API_TOKEN_ENV: &str = "AGENT_ROUTER_API_TOKEN";
 pub struct AgentApiConfig {
     pub enabled: bool,
     pub bind: SocketAddr,
+    pub message_targets: BTreeMap<String, crate::channel::notifications::MessageTarget>,
 }
 
 impl Default for AgentApiConfig {
@@ -40,6 +41,7 @@ impl Default for AgentApiConfig {
         Self {
             enabled: false,
             bind: "127.0.0.1:8790".parse().unwrap(),
+            message_targets: BTreeMap::new(),
         }
     }
 }

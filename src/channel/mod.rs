@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, VecDeque};
 
 pub(crate) mod context;
+pub mod notifications;
 pub mod qq;
-pub mod schedules;
 pub mod slack;
 pub mod telegram;
 pub mod tui;

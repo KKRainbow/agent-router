@@ -5,6 +5,7 @@ use tokio::task::JoinSet;
 
 use super::{HISTORY_LIMIT, RunStatus, ScheduledRun, ScheduledTask, Scheduler, SchedulesConfig};
 use crate::{
+    channel::notifications::{MessageTarget, NotificationDelivery},
     router::{
         RouterChannelEvent, RouterInput, RouterOutputSink, RouterService, SessionNotification,
     },
@@ -12,16 +13,11 @@ use crate::{
     text::truncate_chars,
 };
 
-#[async_trait]
-pub trait ScheduleDelivery: Send + Sync + 'static {
-    async fn deliver(&self, session_key: &str, text: &str) -> anyhow::Result<()>;
-}
-
 impl Scheduler {
     pub async fn run(
         self: Arc<Self>,
         router: Arc<dyn RouterService>,
-        delivery: Arc<dyn ScheduleDelivery>,
+        delivery: Arc<dyn NotificationDelivery>,
         config: SchedulesConfig,
     ) -> anyhow::Result<()> {
         let mut running = JoinSet::new();
@@ -102,7 +98,7 @@ impl Scheduler {
     pub(super) async fn execute(
         &self,
         router: Arc<dyn RouterService>,
-        delivery: Arc<dyn ScheduleDelivery>,
+        delivery: Arc<dyn NotificationDelivery>,
         task: ScheduledTask,
         run_id: String,
         timeout_secs: u64,
@@ -149,7 +145,8 @@ impl Scheduler {
         };
         let delivered = async {
             router.append_notification(notification).await?;
-            delivery.deliver(&task.owner_session_key, &text).await
+            let target = MessageTarget::from_session_key(&task.owner_session_key)?;
+            delivery.deliver(&target, &text).await
         }
         .await;
         if let Err(error) = delivered {

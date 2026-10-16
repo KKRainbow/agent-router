@@ -415,6 +415,15 @@ impl AppConfig {
         };
         let machines = parse_machine_configs(file_cfg.machines, workspace.root.as_deref())?;
         let agent_api = file_cfg.agent_api.unwrap_or_default();
+        for (name, target) in &agent_api.message_targets {
+            anyhow::ensure!(
+                !name.trim().is_empty(),
+                "message target name must not be empty"
+            );
+            target.validate().map_err(|error| {
+                anyhow::anyhow!("invalid agent_api.message_targets.{name}: {error}")
+            })?;
+        }
         anyhow::ensure!(
             !agent_api.enabled || workspace.root.is_some(),
             "agent_api.enabled requires workspace.root"
@@ -1288,6 +1297,32 @@ executors:
         );
         for invalid in ["max_concurrent: 0", "timeout_secs: 0"] {
             assert!(load(&format!("workspace:\n  root: workspaces\nagent_api:\n  enabled: true\nschedules:\n  enabled: true\n  {invalid}\n")).is_err());
+        }
+    }
+
+    #[test]
+    fn validates_outbound_message_targets_independently_of_incoming_allowlists() {
+        let base = "router:\n  default_executor: kimi\nexecutors:\n  kimi:\n    protocol: acp\n    command: kimi\nworkspace:\n  root: workspaces\nagent_api:\n  enabled: true\n  message_targets:\n    reports:\n";
+        let load = |target: &str| {
+            let file_cfg = serde_yaml::from_str::<FileConfig>(&format!("{base}{target}"))?;
+            app_config_from_file(file_cfg, EnvConfig::default())
+        };
+        let cfg =
+            load("      channel: slack\n      target: C123\n      thread: '123.456'\n").unwrap();
+        assert!(cfg.slack.allowed_channels.is_empty());
+        assert_eq!(cfg.agent_api.message_targets["reports"].target, "C123");
+        assert_eq!(
+            cfg.agent_api.message_targets["reports"].thread.as_deref(),
+            Some("123.456")
+        );
+        for invalid in [
+            "      channel: slack\n      target: ''\n",
+            "      channel: unknown\n      target: C123\n",
+            "      channel: qq\n      target: group:G1\n      thread: '1'\n",
+            "      channel: qq\n      target: arbitrary\n",
+            "      channel: slack\n      target: C123\n      typo: yes\n",
+        ] {
+            assert!(load(invalid).is_err(), "{invalid}");
         }
     }
 

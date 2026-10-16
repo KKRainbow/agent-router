@@ -7,6 +7,7 @@ pub mod channel;
 pub mod config;
 pub mod executor;
 pub mod machine;
+pub mod messages;
 pub mod router;
 pub mod schedules;
 pub mod session;

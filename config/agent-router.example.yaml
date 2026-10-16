@@ -28,6 +28,23 @@ agent_api:
   # Requires workspace.root. Remote agents need a reachable API URL below.
   enabled: false
   bind: 127.0.0.1:8790
+  # Every agent session may send to these additional destinations. Empty means
+  # only its originating conversation. Incoming channel allowlists are separate.
+  message_targets: {}
+  # message_targets:
+  #   reports:
+  #     channel: slack
+  #     target: C123456
+  #     # Omit thread to allow the channel and any thread; set it to restrict
+  #     # this grant to one thread.
+  #     thread: "1234567890.123456"
+  #   telegram-alerts:
+  #     channel: telegram
+  #     target: "-1001234567890"
+  #     thread: "42"
+  #   qq-alerts:
+  #     channel: qq
+  #     target: "group:GROUP_OPENID"  # or c2c:USER_OPENID
 
 schedules:
   # Requires agent_api.enabled; keep Router running to execute scheduled work.
