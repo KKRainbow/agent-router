@@ -212,8 +212,8 @@ mod tests {
     #[test]
     fn skill_install_is_idempotent_and_preserves_unmanaged_files() {
         let root = tempfile::tempdir().unwrap();
-        skill::install(root.path()).unwrap();
-        skill::install(root.path()).unwrap();
+        skill::install(root.path(), root.path()).unwrap();
+        skill::install(root.path(), root.path()).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join(".claude/skills/agent-router/SKILL.md"))
                 .unwrap(),
@@ -224,7 +224,7 @@ mod tests {
             "user's own skill",
         )
         .unwrap();
-        assert!(skill::install(root.path()).is_err());
+        assert!(skill::install(root.path(), root.path()).is_err());
         assert_eq!(
             std::fs::read_to_string(root.path().join(".agents/skills/agent-router/SKILL.md"))
                 .unwrap(),

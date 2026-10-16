@@ -242,15 +242,17 @@ impl MachineRegistry {
             let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
             refresh_workspace_environment_files(router_workspace)?;
-            if request.env.contains_key(crate::agent_api::API_TOKEN_ENV) {
-                crate::agent_api::skill::install(router_workspace)?;
-            }
             artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
             if let Some(workspace) = workspace.as_ref() {
                 let router_workspace = canonicalize_lossy(router_workspace);
                 let workspace = canonicalize_lossy(workspace);
                 if router_workspace != workspace {
-                    sync_workspace_contents(&router_workspace, &workspace, request.cancel)?;
+                    sync_workspace_contents(
+                        &router_workspace,
+                        &router_workspace,
+                        &workspace,
+                        request.cancel,
+                    )?;
                     MachineWorkspaceMaterialization::Materialized
                 } else {
                     MachineWorkspaceMaterialization::NotNeeded
@@ -265,7 +267,14 @@ impl MachineRegistry {
 
         let cwd = canonicalize_lossy(&cwd);
         if request.env.contains_key(crate::agent_api::API_TOKEN_ENV) {
-            crate::agent_api::skill::install(&cwd)?;
+            let root = machine
+                .workspace_root
+                .as_deref()
+                .map(Path::new)
+                .or_else(|| request.router_workspace.and_then(Path::parent))
+                .ok_or_else(|| anyhow::anyhow!("agent API skills require a workspace root"))?;
+            ensure_dir_path_without_symlinks(root)?;
+            crate::agent_api::skill::install(&cwd, root)?;
         }
         let workspace_record = workspace.map(|_| MachineWorkspaceRecord {
             machine_id: machine.id.clone(),
@@ -317,9 +326,6 @@ impl MachineRegistry {
             let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
             refresh_workspace_environment_files(router_workspace)?;
-            if request.env.contains_key(crate::agent_api::API_TOKEN_ENV) {
-                crate::agent_api::skill::install(router_workspace)?;
-            }
             let artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
             materialize_ssh_workspace(host, router_workspace, &remote_cwd, request.cancel).await?;
             (
@@ -332,6 +338,21 @@ impl MachineRegistry {
         ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
 
         let remote_env = self.executor_env(machine, request.env)?;
+        if request.env.contains_key(crate::agent_api::API_TOKEN_ENV) {
+            let script = install_remote_skill_script(root, &remote_cwd)?;
+            let status = Command::new("ssh")
+                .args(ssh_remote_args(host, &script))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .kill_on_drop(true)
+                .status()
+                .await?;
+            anyhow::ensure!(
+                status.success(),
+                "install shared skill on `{host}`: {status}"
+            );
+            ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
+        }
         let remote_script =
             build_remote_exec_script(&remote_cwd, &remote_env, request.command, request.args)?;
         Ok(PreparedMachineCommand {
@@ -537,10 +558,54 @@ fn create_remote_workspace_script(remote_cwd: &str) -> anyhow::Result<String> {
         };
         let quoted = shell_quote(&current);
         commands.push(format!(
-            "if [ -e {quoted} ] || [ -L {quoted} ]; then [ -d {quoted} ] && [ ! -L {quoted} ] || exit 73; else mkdir -- {quoted}; fi"
+            "if [ ! -e {quoted} ] && [ ! -L {quoted} ]; then mkdir -p -- {quoted} || exit 73; fi; [ -d {quoted} ] && [ ! -L {quoted} ] || exit 73"
         ));
     }
     Ok(commands.join(" && "))
+}
+
+fn install_remote_skill_script(root: &str, cwd: &str) -> anyhow::Result<String> {
+    use crate::agent_api::skill;
+
+    let shared = join_remote_path(root, skill::SHARED_PATH);
+    let file = shell_quote(&join_remote_path(&shared, "SKILL.md"));
+    let mut commands = vec![create_remote_workspace_script(&shared)?];
+    commands.push(format!(
+        "if [ -e {file} ] || [ -L {file} ]; then [ -f {file} ] && [ ! -L {file} ] && grep -Fq -- {} {file} || exit 73; fi",
+        shell_quote(skill::MARKER)
+    ));
+    commands.push(format!(
+        "skill_tmp=$(mktemp {}) && trap 'rm -f -- \"$skill_tmp\"' 0 && printf '%s' {} > \"$skill_tmp\" && if cmp -s -- \"$skill_tmp\" {file}; then rm -f -- \"$skill_tmp\"; else mv -f -- \"$skill_tmp\" {file}; fi",
+        shell_quote(&join_remote_path(&shared, "SKILL.md.XXXXXX")),
+        shell_quote(skill::SKILL)
+    ));
+    for relative in skill::WORKSPACE_PATHS {
+        let alias = join_remote_path(cwd, relative);
+        let (parent, _) = alias.rsplit_once('/').unwrap();
+        commands.push(create_remote_workspace_script(parent)?);
+        let alias = shell_quote(&alias);
+        let target = shell_quote(&shared);
+        commands.push(format!(
+            "if [ -L {alias} ]; then [ \"$(readlink -- {alias})\" = {target} ] || exit 73; elif [ -e {alias} ]; then exit 73; else ln -s -- {target} {alias}; fi"
+        ));
+    }
+    Ok(commands
+        .into_iter()
+        .map(|command| format!("({command})"))
+        .collect::<Vec<_>>()
+        .join(" && "))
+}
+
+fn workspace_archive_command(router_workspace: &Path) -> Command {
+    let mut command = Command::new("tar");
+    command.args(["cf", "-"]);
+    // Machine-owned links must be recreated on the destination Machine, never
+    // copied from a different Machine or dereferenced into session content.
+    for path in crate::agent_api::skill::WORKSPACE_PATHS {
+        command.arg(format!("--exclude=./{path}"));
+    }
+    command.arg("-C").arg(router_workspace).arg(".");
+    command
 }
 
 async fn materialize_ssh_workspace(
@@ -549,10 +614,7 @@ async fn materialize_ssh_workspace(
     remote_cwd: &str,
     cancel: Option<&TurnCancellation>,
 ) -> anyhow::Result<()> {
-    let mut tar = Command::new("tar")
-        .args(["cf", "-", "-C"])
-        .arg(router_workspace)
-        .arg(".")
+    let mut tar = workspace_archive_command(router_workspace)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -727,6 +789,7 @@ async fn read_remote_skill(host: &str, root: &str, relative_path: &str) -> anyho
 }
 
 fn sync_workspace_contents(
+    root: &Path,
     source: &Path,
     destination: &Path,
     cancel: Option<&TurnCancellation>,
@@ -759,11 +822,11 @@ fn sync_workspace_contents(
         let entry = entry?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
+        if crate::agent_api::skill::is_workspace_path(source_path.strip_prefix(root)?) {
+            continue;
+        }
         let metadata = std::fs::symlink_metadata(&source_path)?;
         if metadata.file_type().is_symlink() {
-            if crate::agent_api::skill::is_managed_link(&source_path) {
-                continue;
-            }
             anyhow::bail!(
                 "workspace materialization does not copy symlinks: {}",
                 source_path.display()
@@ -782,7 +845,7 @@ fn sync_workspace_contents(
                     remove_workspace_entry(&destination_path)?;
                 }
             }
-            sync_workspace_contents(&source_path, &destination_path, cancel)?;
+            sync_workspace_contents(root, &source_path, &destination_path, cancel)?;
         } else if metadata.is_file() {
             if let Some(cancel) = cancel
                 && cancel.is_cancelled_now()
@@ -999,13 +1062,13 @@ fn hash_workspace(root: &Path, path: &Path, hasher: &mut Sha256) -> anyhow::Resu
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
         let relative = path.strip_prefix(root).unwrap_or(path.as_path());
+        if crate::agent_api::skill::is_workspace_path(relative) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
         hasher.update(relative.to_string_lossy().as_bytes());
         if metadata.file_type().is_symlink() {
-            if crate::agent_api::skill::is_managed_link(&path) {
-                continue;
-            }
             anyhow::bail!(
                 "workspace fingerprint does not follow symlinks: {}",
                 path.display()
@@ -1330,7 +1393,7 @@ mod tests {
         assert!(script.contains("[ ! -L '/remote' ]"));
         assert!(script.contains("[ ! -L '/remote/work' ]"));
         assert!(script.contains("[ ! -L '/remote/work/session' ]"));
-        assert!(script.contains("mkdir -- '/remote/work/session'"));
+        assert!(script.contains("mkdir -p -- '/remote/work/session'"));
     }
 
     #[test]
@@ -1351,6 +1414,7 @@ mod tests {
         let source = tmp.path().join("router");
         let destination = tmp.path().join("machine");
         std::fs::create_dir_all(&source).unwrap();
+        crate::agent_api::skill::install(&source, tmp.path()).unwrap();
         let registry = MachineRegistry::new(BTreeMap::from([(
             "local".into(),
             test_local_machine("local", Some(&destination), Vec::new()),
@@ -1360,11 +1424,11 @@ mod tests {
             crate::agent_api::API_TOKEN_ENV.into(),
             "session-token".into(),
         )]);
-        for _ in 0..2 {
+        for session_key in ["first", "second", "first", "second"] {
             let prepared = registry
                 .prepare_executor_command(MachinePrepareRequest {
                     machine_id: "local",
-                    session_key: "scheduled-session",
+                    session_key,
                     router_workspace: Some(&source),
                     executor_cwd: None,
                     command: "agent",
@@ -1388,7 +1452,165 @@ mod tests {
                 std::fs::read_to_string(cwd.join(".claude/skills/agent-router/SKILL.md")).unwrap(),
                 crate::agent_api::skill::SKILL
             );
+            for relative in crate::agent_api::skill::WORKSPACE_PATHS {
+                assert!(
+                    same_file::is_same_file(
+                        cwd.join(relative),
+                        destination.join(crate::agent_api::skill::SHARED_PATH)
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    !same_file::is_same_file(cwd.join(relative), source.join(relative)).unwrap()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn workspace_fingerprint_excludes_shared_skills() {
+        use crate::agent_api::skill;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("session");
+        std::fs::create_dir(&cwd).unwrap();
+        skill::install(&cwd, tmp.path()).unwrap();
+        let before = workspace_fingerprint(&cwd).unwrap();
+        std::fs::write(
+            tmp.path().join(skill::SHARED_PATH).join("SKILL.md"),
+            "changed",
+        )
+        .unwrap();
+        assert_eq!(workspace_fingerprint(&cwd).unwrap(), before);
+        std::fs::write(cwd.join("context.txt"), "new context").unwrap();
+        assert_ne!(workspace_fingerprint(&cwd).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    async fn run_shell_script(script: &str, input: &[u8]) -> std::process::Output {
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input).await.unwrap();
+        drop(stdin);
+        child.wait_with_output().await.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_materialization_recreates_links_to_remote_shared_skills() {
+        use crate::agent_api::skill;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let remote = tmp.path().join("remote ' machine");
+        std::fs::create_dir(&source).unwrap();
+        skill::install(&source, tmp.path()).unwrap();
+        let user_skill = ".agents/skills/user/SKILL.md";
+        std::fs::create_dir_all(source.join(".agents/skills/user")).unwrap();
+        std::fs::write(source.join(user_skill), "user's skill").unwrap();
+        let archive = workspace_archive_command(&source).output().await.unwrap();
+        assert!(archive.status.success());
+        for session in ["first", "second", "first", "second"] {
+            let cwd = remote.join(session);
+            let script = materialize_remote_workspace_script(cwd.to_str().unwrap()).unwrap();
+            let output = run_shell_script(&script, &archive.stdout).await;
+            assert!(output.status.success(), "{output:?}");
+            for relative in skill::WORKSPACE_PATHS {
+                assert!(std::fs::symlink_metadata(cwd.join(relative)).is_err());
+            }
+            let script =
+                install_remote_skill_script(remote.to_str().unwrap(), cwd.to_str().unwrap())
+                    .unwrap();
+            // Installation must also work when retried without materialization.
+            for _ in 0..2 {
+                let output = run_shell_script(&script, &[]).await;
+                assert!(output.status.success(), "{output:?}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(cwd.join(user_skill)).unwrap(),
+                "user's skill"
+            );
+            for relative in skill::WORKSPACE_PATHS {
+                assert!(
+                    same_file::is_same_file(cwd.join(relative), remote.join(skill::SHARED_PATH))
+                        .unwrap()
+                );
+                assert!(
+                    !same_file::is_same_file(cwd.join(relative), source.join(relative)).unwrap()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(cwd.join(relative).join("SKILL.md")).unwrap(),
+                    skill::SKILL
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_sessions_can_install_the_shared_skill_concurrently() {
+        use crate::agent_api::skill;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = (0..8)
+            .map(|index| {
+                install_remote_skill_script(
+                    tmp.path().to_str().unwrap(),
+                    tmp.path().join(index.to_string()).to_str().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let outputs = futures_util::future::join_all(
+            scripts.iter().map(|script| run_shell_script(script, &[])),
+        )
+        .await;
+        for output in outputs {
+            assert!(output.status.success(), "{output:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(skill::SHARED_PATH).join("SKILL.md")).unwrap(),
+            skill::SKILL
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_shared_skill_install_preserves_conflicts() {
+        use crate::agent_api::skill;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("session");
+        let shared = tmp.path().join(skill::SHARED_PATH);
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("SKILL.md"), "user's skill").unwrap();
+        let script =
+            install_remote_skill_script(tmp.path().to_str().unwrap(), cwd.to_str().unwrap())
+                .unwrap();
+        let output = run_shell_script(&script, &[]).await;
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(shared.join("SKILL.md")).unwrap(),
+            "user's skill"
+        );
+        assert!(!cwd.exists());
+
+        std::fs::write(shared.join("SKILL.md"), skill::SKILL).unwrap();
+        let conflict = cwd.join(skill::WORKSPACE_PATHS[0]);
+        std::fs::create_dir_all(&conflict).unwrap();
+        std::fs::write(conflict.join("SKILL.md"), "user's skill").unwrap();
+        let output = run_shell_script(&script, &[]).await;
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(conflict.join("SKILL.md")).unwrap(),
+            "user's skill"
+        );
     }
 
     #[test]

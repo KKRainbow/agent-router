@@ -156,7 +156,11 @@ originating conversation, executor, and requesting user. Reusing that identity
 reuses the credential; changing it revokes the old credential and changes the
 process command identity, so cached executor processes cannot silently acquire
 another caller's authority. Machine supplies the reachable API URL and installs
-the skill in the actual execution directory. Credentials are not written into
+one shared skill directory under its workspace root. Each session links its
+skill discovery paths to that directory; Windows uses directory junctions.
+Workspace hashing and materialization exclude these Machine-owned paths.
+Links are created after materialization, using the destination Machine's
+shared directory, including on SSH hosts. Credentials are not written into
 skill files, prompts, or persisted task definitions.
 
 `schedules` is the first feature module, registered under `/api/schedules`.

@@ -43,11 +43,13 @@ schedules:
 ```
 
 Ask an agent to create a reminder, recurring report, or periodic check. Router
-installs [the scheduling skill](skills/agent-router/SKILL.md) in each executor's
-working directory at `.agents/skills/agent-router/SKILL.md`, with a relative
-`.claude/skills/agent-router` link. Windows without symlink privileges receives
-a generated copy. Existing unrelated skills are preserved. There is no MCP
-configuration or separate client package to install.
+installs one shared copy of [the skill](skills/agent-router/SKILL.md) per Machine
+workspace root, at `.agent-router/skills/agent-router/SKILL.md`. Each session's
+`.agents/skills/agent-router` and `.claude/skills/agent-router` link to that
+directory (directory junctions on Windows, without symlink privileges).
+SSH Machines install their own shared copy and links on the remote host.
+Existing unrelated skills are preserved. There is no MCP configuration or
+separate client package to install.
 
 The agent receives `AGENT_ROUTER_API_URL` and a session-scoped
 `AGENT_ROUTER_API_TOKEN` in its environment. It can create, inspect, update,
