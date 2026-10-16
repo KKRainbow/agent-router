@@ -2137,7 +2137,40 @@ while True:
             log({"event": "exit_after_get_state"})
             sys.exit(0)
     elif typ == "prompt":
-        if scenario == "prompt_fail":
+        if scenario == "shared_skills":
+            import base64
+            import pathlib
+            import subprocess
+            import urllib.request
+            response(cmd, "prompt")
+            if "publish shared skill" in cmd["message"]:
+                files = {
+                    "SKILL.md": b"---\nname: shared-check\ndescription: Check shared skill execution\n---\nRun scripts/check.py.\n",
+                    "scripts/check.py": b"print('shared script ran')\n",
+                    "assets/data.bin": bytes([0, 255, 1]),
+                }
+                payload = {"name": "shared-check", "files": {
+                    name: {"content_base64": base64.b64encode(content).decode("ascii")}
+                    for name, content in files.items()
+                }}
+                request = urllib.request.Request(
+                    os.environ["AGENT_ROUTER_API_URL"] + "/api/skills",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer " + os.environ["AGENT_ROUTER_API_TOKEN"]},
+                )
+                with urllib.request.urlopen(request) as result:
+                    agent_end("published " + str(result.status))
+            else:
+                directory = pathlib.Path(".agents/skills/shared-check")
+                if directory.exists():
+                    assert '"path":".agents/skills/shared-check/SKILL.md"' in cmd["message"]
+                    assert "Run scripts/check.py." in (directory / "SKILL.md").read_text()
+                    assert (directory / "assets/data.bin").read_bytes() == bytes([0, 255, 1])
+                    result = subprocess.check_output([sys.executable, str(directory / "scripts/check.py")], text=True)
+                    agent_end(result.strip())
+                else:
+                    agent_end("no shared skill")
+        elif scenario == "prompt_fail":
             response(cmd, "prompt", success=False, error="preflight failed")
         elif scenario == "exit_on_prompt":
             sys.exit(0)
@@ -3847,6 +3880,107 @@ while True:
             .await
             .unwrap();
         assert_eq!(response.final_text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn router_sessions_publish_and_use_shared_skills_without_process_restart() {
+        use crate::{
+            agent_api::{self, AgentApi},
+            router::{
+                AgentRouter, RouterChannelEvent, RouterInput, RouterOutputSink, RouterService,
+            },
+            session::store::InMemorySessionStore,
+            skills::SkillStore,
+        };
+        #[derive(Default)]
+        struct Output(Vec<String>);
+        #[async_trait]
+        impl RouterOutputSink for Output {
+            fn send_channel_event(&mut self, _: RouterChannelEvent) {}
+            async fn send_final_reply(&mut self, text: String) -> anyhow::Result<()> {
+                self.0.push(text);
+                Ok(())
+            }
+        }
+
+        let fake = FakePi::new();
+        let workspace_root = fake._tmp.path().join("workspaces");
+        let skills = Arc::new(SkillStore::open(&workspace_root).unwrap());
+        let api = AgentApi::new(vec!["pi".into()]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = agent_api::build_app(api.clone(), crate::skills::routes(skills.clone()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut manager, approvals) = fake.manager("shared_skills");
+        manager.machines = MachineRegistry::local_default()
+            .with_agent_api_url(Some(url))
+            .with_shared_skills(Some(skills.clone()));
+        let router = AgentRouter::with_approvals(
+            "pi",
+            Arc::new(InMemorySessionStore::default()),
+            Arc::new(manager),
+            approvals,
+        )
+        .with_workspace_root(Some(workspace_root))
+        .with_agent_api(Some(api))
+        .with_shared_skills(Some(skills));
+
+        for (session_key, text, expected) in [
+            (
+                "slack:channel:C1:thread:1",
+                "check skills",
+                "no shared skill",
+            ),
+            ("qq:c2c:test", "publish shared skill", "published 201"),
+            (
+                "slack:channel:C1:thread:1",
+                "check skills again",
+                "shared script ran",
+            ),
+        ] {
+            let mut output = Output::default();
+            router
+                .handle(
+                    RouterInput {
+                        session_key: session_key.into(),
+                        text: text.into(),
+                        user_id: Some("owner".into()),
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.0.last().map(String::as_str), Some(expected));
+        }
+        assert_eq!(
+            fake.log_entries()
+                .iter()
+                .filter(|entry| entry.get("argv").is_some())
+                .count(),
+            2,
+            "publishing a skill must not restart the existing consumer process"
+        );
+        for text in ["/new", "check skills after new"] {
+            let mut output = Output::default();
+            router
+                .handle(
+                    RouterInput {
+                        session_key: "slack:channel:C1:thread:1".into(),
+                        text: text.into(),
+                        user_id: Some("owner".into()),
+                    },
+                    &mut output,
+                )
+                .await
+                .unwrap();
+            if text != "/new" {
+                assert_eq!(
+                    output.0.last().map(String::as_str),
+                    Some("shared script ran")
+                );
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]

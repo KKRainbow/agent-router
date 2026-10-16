@@ -74,6 +74,13 @@ async fn main() -> anyhow::Result<()> {
         .agent_api
         .enabled
         .then(|| AgentApi::new(config.executors.keys().cloned().collect()));
+    let shared_skills = if agent_api.is_some() {
+        Some(Arc::new(agent_router::skills::SkillStore::open(
+            config.workspace.root.as_ref().unwrap(),
+        )?))
+    } else {
+        None
+    };
     let schedules = if config.schedules.enabled {
         let executors = config
             .executors
@@ -112,7 +119,8 @@ async fn main() -> anyhow::Result<()> {
         }
         format!("http://{address}")
     });
-    let (approvals, router) = build_router(&config, agent_api.clone(), api_url);
+    let (approvals, router) =
+        build_router(&config, agent_api.clone(), api_url, shared_skills.clone());
     let delivery = Arc::new(
         agent_router::channel::notifications::ChannelNotifications::new(
             &config,
@@ -127,6 +135,9 @@ async fn main() -> anyhow::Result<()> {
         delivery.clone(),
         config.agent_api.message_targets.clone(),
     );
+    if let Some(skills) = shared_skills {
+        feature_routes = feature_routes.merge(agent_router::skills::routes(skills));
+    }
     if let Some(scheduler) = &schedules {
         feature_routes = feature_routes.merge(agent_router::schedules::routes(scheduler.clone()));
     }
@@ -251,6 +262,7 @@ fn build_router(
     config: &AppConfig,
     agent_api: Option<Arc<AgentApi>>,
     api_url: Option<String>,
+    shared_skills: Option<Arc<agent_router::skills::SkillStore>>,
 ) -> (Arc<ApprovalBroker>, Arc<dyn RouterService>) {
     if let Some(root) = &config.workspace.root {
         tracing::info!(workspace_root = %root.display(), "using workspace session persistence");
@@ -289,7 +301,9 @@ fn build_router(
     ));
     let executor = Arc::new(ExecutorRegistry::with_machines(
         config.executors.clone(),
-        MachineRegistry::new(config.machines.clone()).with_agent_api_url(api_url),
+        MachineRegistry::new(config.machines.clone())
+            .with_agent_api_url(api_url)
+            .with_shared_skills(shared_skills.clone()),
         approvals.clone(),
     ));
     let orchestrator =
@@ -317,6 +331,7 @@ fn build_router(
         )
         .with_workspace_root(config.workspace.root.clone())
         .with_agent_api(agent_api)
+        .with_shared_skills(shared_skills)
         .with_owner_user_ids("slack", config.slack.owner_user_ids.clone())
         .with_orchestrator(orchestrator),
     );

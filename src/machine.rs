@@ -15,7 +15,10 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::executor::TurnCancellation;
+use crate::{
+    executor::TurnCancellation,
+    skills::{SharedSkill, SkillStore},
+};
 
 pub const LOCAL_MACHINE_ID: &str = "local";
 const WORKSPACE_ENVIRONMENT_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
@@ -76,6 +79,8 @@ pub enum MachineKind {
 pub struct MachineRegistry {
     machines: BTreeMap<String, MachineConfig>,
     agent_api_url: Option<String>,
+    shared_skills: Option<Arc<SkillStore>>,
+    shared_skill_install_lock: Arc<Mutex<()>>,
     materialization_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     workspace_environment_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
@@ -144,6 +149,8 @@ impl MachineRegistry {
         Self {
             machines,
             agent_api_url: None,
+            shared_skills: None,
+            shared_skill_install_lock: Arc::new(Mutex::new(())),
             materialization_locks: Arc::new(Mutex::new(BTreeMap::new())),
             workspace_environment_locks: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -159,6 +166,28 @@ impl MachineRegistry {
     pub fn with_agent_api_url(mut self, url: Option<String>) -> Self {
         self.agent_api_url = url;
         self
+    }
+
+    pub fn with_shared_skills(mut self, skills: Option<Arc<SkillStore>>) -> Self {
+        self.shared_skills = skills;
+        self
+    }
+
+    fn install_local_shared_skills(
+        &self,
+        cwd: &Path,
+        skills: &[SharedSkill],
+    ) -> anyhow::Result<()> {
+        if let Some(store) = &self.shared_skills {
+            for skill in skills {
+                crate::agent_api::skill::install_shared_links(
+                    cwd,
+                    &store.root().join(&skill.name),
+                    &skill.name,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn executor_env(
@@ -200,9 +229,27 @@ impl MachineRegistry {
         let machine = self
             .get(request.machine_id)
             .ok_or_else(|| anyhow::anyhow!("machine `{}` is not configured", request.machine_id))?;
+        // Snapshot while holding the source workspace lock: another Machine
+        // must not install a newly published alias while this prepare hashes
+        // or archives the previous snapshot.
+        let workspace_lock = match request.router_workspace {
+            Some(workspace) => Some(self.workspace_environment_lock(workspace).await),
+            None => None,
+        };
+        let _workspace_guard = match &workspace_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
+        let skills = self
+            .shared_skills
+            .as_ref()
+            .map(|store| store.snapshot())
+            .transpose()?
+            .unwrap_or_default();
         match machine.kind {
-            MachineKind::Local => self.prepare_local_command(machine, request).await,
-            MachineKind::Ssh => self.prepare_ssh_command(machine, request).await,
+            MachineKind::Local => self.prepare_local_command(machine, request, &skills).await,
+            MachineKind::Ssh => self.prepare_ssh_command(machine, request, &skills).await,
         }
     }
 
@@ -221,6 +268,7 @@ impl MachineRegistry {
         &self,
         machine: &MachineConfig,
         request: MachinePrepareRequest<'_>,
+        skills: &[SharedSkill],
     ) -> anyhow::Result<PreparedMachineCommand> {
         let workspace = local_workspace_path(machine, &request)?;
         let cwd = workspace
@@ -231,18 +279,17 @@ impl MachineRegistry {
             ensure_dir_path_without_symlinks(&cwd)?;
         }
 
+        self.install_local_shared_skills(&cwd, skills)?;
         let mut artifact_fingerprint = None;
         let materialization = if let Some(router_workspace) = request.router_workspace {
-            let workspace_environment_lock =
-                self.workspace_environment_lock(router_workspace).await;
-            let _workspace_environment_guard = workspace_environment_lock.lock().await;
             let materialization_lock = self
                 .materialization_lock(&machine.id, request.session_key)
                 .await;
             let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
+            self.install_local_shared_skills(router_workspace, skills)?;
             refresh_workspace_environment_files(router_workspace)?;
-            artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
+            artifact_fingerprint = Some(workspace_fingerprint(router_workspace, skills)?);
             if let Some(workspace) = workspace.as_ref() {
                 let router_workspace = canonicalize_lossy(router_workspace);
                 let workspace = canonicalize_lossy(workspace);
@@ -251,6 +298,7 @@ impl MachineRegistry {
                         &router_workspace,
                         &router_workspace,
                         &workspace,
+                        skills,
                         request.cancel,
                     )?;
                     MachineWorkspaceMaterialization::Materialized
@@ -301,6 +349,7 @@ impl MachineRegistry {
         &self,
         machine: &MachineConfig,
         request: MachinePrepareRequest<'_>,
+        skills: &[SharedSkill],
     ) -> anyhow::Result<PreparedMachineCommand> {
         let host = machine
             .host
@@ -317,17 +366,16 @@ impl MachineRegistry {
         let (materialization, artifact_fingerprint) = if let Some(router_workspace) =
             request.router_workspace
         {
-            let workspace_environment_lock =
-                self.workspace_environment_lock(router_workspace).await;
-            let _workspace_environment_guard = workspace_environment_lock.lock().await;
             let materialization_lock = self
                 .materialization_lock(&machine.id, request.session_key)
                 .await;
             let _materialization_guard = materialization_lock.lock().await;
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
+            self.install_local_shared_skills(router_workspace, skills)?;
             refresh_workspace_environment_files(router_workspace)?;
-            let artifact_fingerprint = Some(workspace_fingerprint(router_workspace)?);
-            materialize_ssh_workspace(host, router_workspace, &remote_cwd, request.cancel).await?;
+            let artifact_fingerprint = Some(workspace_fingerprint(router_workspace, skills)?);
+            materialize_ssh_workspace(host, router_workspace, &remote_cwd, skills, request.cancel)
+                .await?;
             (
                 MachineWorkspaceMaterialization::Materialized,
                 artifact_fingerprint,
@@ -352,6 +400,10 @@ impl MachineRegistry {
                 "install shared skill on `{host}`: {status}"
             );
             ensure_not_cancelled(request.cancel, "machine prepare cancelled").await?;
+        }
+        if !skills.is_empty() {
+            let _install_guard = self.shared_skill_install_lock.lock().await;
+            install_ssh_shared_skills(host, root, &remote_cwd, skills, request.cancel).await?;
         }
         let remote_script =
             build_remote_exec_script(&remote_cwd, &remote_env, request.command, request.args)?;
@@ -579,16 +631,7 @@ fn install_remote_skill_script(root: &str, cwd: &str) -> anyhow::Result<String> 
         shell_quote(&join_remote_path(&shared, "SKILL.md.XXXXXX")),
         shell_quote(skill::SKILL)
     ));
-    for relative in skill::WORKSPACE_PATHS {
-        let alias = join_remote_path(cwd, relative);
-        let (parent, _) = alias.rsplit_once('/').unwrap();
-        commands.push(create_remote_workspace_script(parent)?);
-        let alias = shell_quote(&alias);
-        let target = shell_quote(&shared);
-        commands.push(format!(
-            "if [ -L {alias} ]; then [ \"$(readlink -- {alias})\" = {target} ] || exit 73; elif [ -e {alias} ]; then exit 73; else ln -s -- {target} {alias}; fi"
-        ));
-    }
+    commands.extend(remote_skill_link_commands(cwd, &shared, "agent-router")?);
     Ok(commands
         .into_iter()
         .map(|command| format!("({command})"))
@@ -596,13 +639,127 @@ fn install_remote_skill_script(root: &str, cwd: &str) -> anyhow::Result<String> 
         .join(" && "))
 }
 
-fn workspace_archive_command(router_workspace: &Path) -> Command {
+fn remote_skill_link_commands(cwd: &str, shared: &str, name: &str) -> anyhow::Result<Vec<String>> {
+    let mut commands = Vec::new();
+    for directory in [".agents/skills", ".claude/skills"] {
+        let parent = join_remote_path(cwd, directory);
+        commands.push(create_remote_workspace_script(&parent)?);
+        let alias = shell_quote(&join_remote_path(&parent, name));
+        let target = shell_quote(shared);
+        commands.push(format!(
+            "if [ -L {alias} ]; then [ \"$(readlink -- {alias})\" = {target} ] || exit 73; elif [ -e {alias} ]; then exit 73; else ln -s -- {target} {alias}; fi"
+        ));
+    }
+    Ok(commands)
+}
+
+async fn install_ssh_shared_skills(
+    host: &str,
+    root: &str,
+    cwd: &str,
+    skills: &[SharedSkill],
+    cancel: Option<&TurnCancellation>,
+) -> anyhow::Result<()> {
+    let stage = tempfile::tempdir()?;
+    for skill in skills {
+        let directory = stage.path().join(&skill.name);
+        std::fs::create_dir(&directory)?;
+        crate::skills::write_files(&directory, &skill.files)?;
+    }
+    let mut archive = Command::new("tar");
+    archive
+        .args(["cf", "-"])
+        .arg("-C")
+        .arg(stage.path())
+        .arg(".");
+    let script = install_remote_shared_skills_script(root, cwd, skills)?;
+    transfer_archive(host, archive, &script, cancel).await
+}
+
+fn install_remote_shared_skills_script(
+    root: &str,
+    cwd: &str,
+    skills: &[SharedSkill],
+) -> anyhow::Result<String> {
+    let shared_root = join_remote_path(root, ".agent-router/skills");
+    let mut commands = vec![
+        create_remote_workspace_script(&shared_root)?,
+        format!(
+            "skill_stage=$(mktemp -d {})",
+            shell_quote(&join_remote_path(&shared_root, ".stage.XXXXXX"))
+        ),
+        "trap 'rm -rf -- \"$skill_stage\"' 0".into(),
+        "tar xf - -C \"$skill_stage\"".into(),
+    ];
+    for skill in skills {
+        let shared = join_remote_path(&shared_root, &skill.name);
+        let destination = shell_quote(&shared);
+        let staged = format!("\"$skill_stage\"/{}", shell_quote(&skill.name));
+        // Unix modes cannot travel in a tar created on Windows. Apply the
+        // package's declared mode before the completed directory is published.
+        for (path, file) in &skill.files {
+            commands.push(format!(
+                "chmod {} -- {staged}/{}",
+                if file.executable { "755" } else { "644" },
+                shell_quote(path)
+            ));
+        }
+        let mut compare = vec![
+            format!("[ -d {destination} ] && [ ! -L {destination} ]"),
+            format!("[ -z \"$(find {destination} ! -type d ! -type f -print)\" ]"),
+            format!("diff -r {staged} {destination} >/dev/null"),
+        ];
+        for (path, file) in &skill.files {
+            compare.push(format!(
+                "[ {}-x {} ]",
+                if file.executable { "" } else { "! " },
+                shell_quote(&join_remote_path(&shared, path))
+            ));
+        }
+        commands.push(format!(
+            "if [ -e {destination} ] || [ -L {destination} ]; then {} || exit 73; else mv -- {staged} {destination} || exit 73; fi",
+            compare.join(" && ")
+        ));
+        commands.extend(remote_skill_link_commands(cwd, &shared, &skill.name)?);
+    }
+    Ok(commands
+        .into_iter()
+        .map(|command| format!("{{ {command}; }}"))
+        .collect::<Vec<_>>()
+        .join(" && "))
+}
+
+fn is_skill_directory(relative: &Path) -> bool {
+    [".agents/skills", ".claude/skills"]
+        .iter()
+        .any(|directory| relative == Path::new(directory))
+}
+
+fn is_skill_parent(relative: &Path) -> bool {
+    relative == Path::new(".agents") || relative == Path::new(".claude")
+}
+
+fn is_shared_skill_path(relative: &Path, skills: &[SharedSkill]) -> bool {
+    crate::agent_api::skill::is_workspace_path(relative)
+        || skills.iter().any(|skill| {
+            [".agents/skills", ".claude/skills"]
+                .iter()
+                .any(|directory| relative == Path::new(directory).join(&skill.name))
+        })
+}
+
+fn workspace_archive_command(router_workspace: &Path, skills: &[SharedSkill]) -> Command {
     let mut command = Command::new("tar");
     command.args(["cf", "-"]);
     // Machine-owned links must be recreated on the destination Machine, never
     // copied from a different Machine or dereferenced into session content.
     for path in crate::agent_api::skill::WORKSPACE_PATHS {
         command.arg(format!("--exclude=./{path}"));
+    }
+    for skill in skills {
+        for directory in [".agents/skills", ".claude/skills"] {
+            command.arg(format!("--exclude=./{directory}/{}", skill.name));
+        }
     }
     command.arg("-C").arg(router_workspace).arg(".");
     command
@@ -612,24 +769,32 @@ async fn materialize_ssh_workspace(
     host: &str,
     router_workspace: &Path,
     remote_cwd: &str,
+    skills: &[SharedSkill],
     cancel: Option<&TurnCancellation>,
 ) -> anyhow::Result<()> {
-    let mut tar = workspace_archive_command(router_workspace)
+    let archive = workspace_archive_command(router_workspace, skills);
+    let script = materialize_remote_workspace_script(remote_cwd)?;
+    transfer_archive(host, archive, &script, cancel).await
+}
+
+async fn transfer_archive(
+    host: &str,
+    mut archive: Command,
+    remote_script: &str,
+    cancel: Option<&TurnCancellation>,
+) -> anyhow::Result<()> {
+    let mut tar = archive
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "could not start workspace materialization archive for {}: {err}",
-                router_workspace.display()
-            )
-        })?;
+        .map_err(|err| anyhow::anyhow!("could not start Machine archive: {err}"))?;
     let mut tar_stdout = tar.stdout.take().ok_or_else(|| {
         anyhow::anyhow!("workspace materialization archive did not expose stdout")
     })?;
-    let remote_command = materialize_remote_workspace_script(remote_cwd)?;
     let mut ssh = Command::new("ssh")
-        .args(ssh_remote_args(host, &remote_command))
+        .args(ssh_remote_args(host, remote_script))
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -669,19 +834,26 @@ async fn materialize_ssh_workspace(
     } else {
         ssh_stdin.shutdown().await
     };
-    ensure_not_cancelled(cancel, "machine prepare cancelled").await?;
-    let tar_status = tar.wait().await?;
-    let ssh_status = ssh.wait().await?;
+    drop(ssh_stdin);
+    let wait = async {
+        let tar_status = tar.wait().await?;
+        let ssh_status = ssh.wait().await?;
+        anyhow::Ok((tar_status, ssh_status))
+    };
+    let (tar_status, ssh_status) = if let Some(cancel) = cancel {
+        tokio::select! {
+            result = wait => result?,
+            _ = cancel.cancelled() => anyhow::bail!("machine prepare cancelled"),
+        }
+    } else {
+        wait.await?
+    };
     copy?;
     shutdown?;
-    anyhow::ensure!(
-        tar_status.success(),
-        "workspace materialization archive failed for {}: {tar_status}",
-        router_workspace.display()
-    );
+    anyhow::ensure!(tar_status.success(), "Machine archive failed: {tar_status}");
     anyhow::ensure!(
         ssh_status.success(),
-        "workspace materialization to `{host}:{remote_cwd}` failed: {ssh_status}"
+        "Machine archive transfer to `{host}` failed: {ssh_status}"
     );
     Ok(())
 }
@@ -690,7 +862,7 @@ fn materialize_remote_workspace_script(remote_cwd: &str) -> anyhow::Result<Strin
     let ensure_workspace = create_remote_workspace_script(remote_cwd)?;
     let quoted = shell_quote(remote_cwd);
     Ok(format!(
-        "{ensure_workspace} && cd -P -- {quoted} && [ \"$(pwd -P)\" = {quoted} ] && find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + && tar xf - -C ."
+        "{ensure_workspace} && cd -P -- {quoted} && [ \"$(pwd -P)\" = {quoted} ] && find . -mindepth 1 -maxdepth 1 ! -name .agents ! -name .claude -exec rm -rf -- {{}} + && for skill_parent in .agents .claude; do if [ -e \"$skill_parent\" ] || [ -L \"$skill_parent\" ]; then [ -d \"$skill_parent\" ] && [ ! -L \"$skill_parent\" ] || exit 73; find \"$skill_parent\" -mindepth 1 -maxdepth 1 ! -name skills -exec rm -rf -- {{}} + || exit 73; if [ -e \"$skill_parent/skills\" ] || [ -L \"$skill_parent/skills\" ]; then [ -d \"$skill_parent/skills\" ] && [ ! -L \"$skill_parent/skills\" ] || exit 73; fi; fi; done && tar xf - -C ."
     ))
 }
 
@@ -792,6 +964,7 @@ fn sync_workspace_contents(
     root: &Path,
     source: &Path,
     destination: &Path,
+    skills: &[SharedSkill],
     cancel: Option<&TurnCancellation>,
 ) -> anyhow::Result<()> {
     ensure_dir_path_without_symlinks(destination)?;
@@ -807,9 +980,8 @@ fn sync_workspace_contents(
     {
         let entry = entry?;
         if source_names.contains(&entry.file_name())
-            || crate::agent_api::skill::is_workspace_path(
-                source.join(entry.file_name()).strip_prefix(root)?,
-            )
+            || is_skill_directory(source.join(entry.file_name()).strip_prefix(root)?)
+            || source.strip_prefix(root).is_ok_and(is_skill_directory)
         {
             continue;
         }
@@ -818,7 +990,19 @@ fn sync_workspace_contents(
         {
             anyhow::bail!("machine prepare cancelled");
         }
-        remove_workspace_entry(&entry.path())?;
+        if is_skill_parent(source.join(entry.file_name()).strip_prefix(root)?) {
+            // A destination-only skill belongs to the session, not to the
+            // router's materialized context. Keep it across subsequent turns.
+            ensure_dir_path_without_symlinks(&entry.path())?;
+            for child in std::fs::read_dir(entry.path())? {
+                let child = child?;
+                if child.file_name() != "skills" {
+                    remove_workspace_entry(&child.path())?;
+                }
+            }
+        } else {
+            remove_workspace_entry(&entry.path())?;
+        }
     }
     for entry in std::fs::read_dir(source)
         .map_err(|err| anyhow::anyhow!("read router workspace {}: {err}", source.display()))?
@@ -826,7 +1010,7 @@ fn sync_workspace_contents(
         let entry = entry?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
-        if crate::agent_api::skill::is_workspace_path(source_path.strip_prefix(root)?) {
+        if is_shared_skill_path(source_path.strip_prefix(root)?, skills) {
             continue;
         }
         let metadata = std::fs::symlink_metadata(&source_path)?;
@@ -849,7 +1033,7 @@ fn sync_workspace_contents(
                     remove_workspace_entry(&destination_path)?;
                 }
             }
-            sync_workspace_contents(root, &source_path, &destination_path, cancel)?;
+            sync_workspace_contents(root, &source_path, &destination_path, skills, cancel)?;
         } else if metadata.is_file() {
             if let Some(cancel) = cancel
                 && cancel.is_cancelled_now()
@@ -1051,9 +1235,9 @@ fn remove_workspace_entry(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn workspace_fingerprint(root: &Path) -> anyhow::Result<String> {
+fn workspace_fingerprint(root: &Path, skills: &[SharedSkill]) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
-    hash_workspace(root, root, &mut hasher)?;
+    hash_workspace(root, root, skills, &mut hasher)?;
     Ok(hasher
         .finalize()
         .iter()
@@ -1061,13 +1245,18 @@ fn workspace_fingerprint(root: &Path) -> anyhow::Result<String> {
         .collect())
 }
 
-fn hash_workspace(root: &Path, path: &Path, hasher: &mut Sha256) -> anyhow::Result<()> {
+fn hash_workspace(
+    root: &Path,
+    path: &Path,
+    skills: &[SharedSkill],
+    hasher: &mut Sha256,
+) -> anyhow::Result<()> {
     let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
         let relative = path.strip_prefix(root).unwrap_or(path.as_path());
-        if crate::agent_api::skill::is_workspace_path(relative) {
+        if is_shared_skill_path(relative, skills) {
             continue;
         }
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -1080,7 +1269,7 @@ fn hash_workspace(root: &Path, path: &Path, hasher: &mut Sha256) -> anyhow::Resu
         }
         if metadata.is_dir() {
             hasher.update(b"/");
-            hash_workspace(root, &path, hasher)?;
+            hash_workspace(root, &path, skills, hasher)?;
         } else if metadata.is_file() {
             hasher.update(metadata.len().to_le_bytes());
             let modified = metadata
@@ -1407,7 +1596,7 @@ mod tests {
         assert!(script.contains("[ ! -L '/remote/work/session' ]"));
         assert!(script.contains("cd -P -- '/remote/work/session'"));
         assert!(script.contains("[ \"$(pwd -P)\" = '/remote/work/session' ]"));
-        assert!(script.contains("find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"));
+        assert!(script.contains("find . -mindepth 1 -maxdepth 1 ! -name .agents ! -name .claude"));
         assert!(script.contains("tar xf - -C ."));
         assert!(!script.contains("tar xf - -C '/remote/work/session'"));
     }
@@ -1471,6 +1660,319 @@ mod tests {
         }
     }
 
+    fn shared_test_skill(name: &str) -> SharedSkill {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        SharedSkill {
+            name: name.into(),
+            description: "Shared test skill".into(),
+            files: BTreeMap::from([
+                (
+                    "SKILL.md".into(),
+                    crate::skills::SkillFile {
+                        content_base64: STANDARD.encode(format!(
+                            "---\nname: {name}\ndescription: Shared test skill\n---\nUse the script.\n"
+                        )),
+                        executable: false,
+                    },
+                ),
+                (
+                    "scripts/check.sh".into(),
+                    crate::skills::SkillFile {
+                        content_base64: STANDARD.encode(b"#!/bin/sh\nprintf shared\n"),
+                        executable: true,
+                    },
+                ),
+                (
+                    "assets/sample.bin".into(),
+                    crate::skills::SkillFile {
+                        content_base64: STANDARD.encode([0, 255, 128, 1]),
+                        executable: false,
+                    },
+                ),
+            ]),
+        }
+    }
+
+    fn publish_test_skill(store: &SkillStore, name: &str) {
+        let skill = shared_test_skill(name);
+        assert!(
+            store
+                .create(crate::skills::CreateSkill {
+                    name: skill.name,
+                    files: skill.files,
+                })
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_skills_share_router_store_across_local_machine_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let router_root = tmp.path().join("router");
+        let machine_root = tmp.path().join("machine");
+        std::fs::create_dir(&router_root).unwrap();
+        let store = Arc::new(SkillStore::open(&router_root).unwrap());
+        publish_test_skill(&store, "writer");
+        let registry = MachineRegistry::new(BTreeMap::from([(
+            "local".into(),
+            test_local_machine("local", Some(&machine_root), Vec::new()),
+        )]))
+        .with_shared_skills(Some(store.clone()));
+        let env = BTreeMap::new();
+        let mut first_cwd = None;
+        for session_key in ["first", "second", "first", "second"] {
+            let source = router_root.join(session_key);
+            std::fs::create_dir_all(&source).unwrap();
+            let prepared = registry
+                .prepare_executor_command(MachinePrepareRequest {
+                    machine_id: "local",
+                    session_key,
+                    router_workspace: Some(&source),
+                    executor_cwd: None,
+                    command: "agent",
+                    args: &[],
+                    env: &env,
+                    cancel: None,
+                })
+                .await
+                .unwrap();
+            let cwd = PathBuf::from(prepared.stdio.executor_cwd);
+            for relative in [".agents/skills/writer", ".claude/skills/writer"] {
+                assert!(
+                    same_file::is_same_file(cwd.join(relative), store.root().join("writer"))
+                        .unwrap()
+                );
+            }
+            let own_skill = cwd.join(".agents/skills/future-skill");
+            if !own_skill.exists() {
+                std::fs::create_dir(&own_skill).unwrap();
+                std::fs::write(own_skill.join("SKILL.md"), "session-owned").unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(own_skill.join("SKILL.md")).unwrap(),
+                "session-owned"
+            );
+            if session_key == "first" {
+                first_cwd = Some(cwd);
+            }
+        }
+        publish_test_skill(&store, "future-skill");
+        let source = router_root.join("first");
+        let result = registry
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: "local",
+                session_key: "first",
+                router_workspace: Some(&source),
+                executor_cwd: None,
+                command: "agent",
+                args: &[],
+                env: &env,
+                cancel: None,
+            })
+            .await;
+        assert!(result.unwrap_err().to_string().contains("conflicts"));
+        assert_eq!(
+            std::fs::read_to_string(
+                first_cwd
+                    .unwrap()
+                    .join(".agents/skills/future-skill/SKILL.md")
+            )
+            .unwrap(),
+            "session-owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_skill_conflict_in_router_source_is_not_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SkillStore::open(tmp.path()).unwrap());
+        publish_test_skill(&store, "writer");
+        let source = tmp.path().join("source");
+        let conflict = source.join(".agents/skills/writer/SKILL.md");
+        std::fs::create_dir_all(conflict.parent().unwrap()).unwrap();
+        std::fs::write(&conflict, "source-owned").unwrap();
+        let machine_root = tmp.path().join("machine");
+        let registry = MachineRegistry::new(BTreeMap::from([(
+            "local".into(),
+            test_local_machine("local", Some(&machine_root), Vec::new()),
+        )]))
+        .with_shared_skills(Some(store));
+        let result = registry
+            .prepare_executor_command(MachinePrepareRequest {
+                machine_id: "local",
+                session_key: "test",
+                router_workspace: Some(&source),
+                executor_cwd: None,
+                command: "agent",
+                args: &[],
+                env: &BTreeMap::new(),
+                cancel: None,
+            })
+            .await;
+        assert!(result.unwrap_err().to_string().contains("conflicts"));
+        assert_eq!(std::fs::read_to_string(conflict).unwrap(), "source-owned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_custom_skills_keep_packages_and_session_skills_across_materialization() {
+        use crate::agent_api::skill;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SkillStore::open(tmp.path()).unwrap();
+        publish_test_skill(&store, "writer");
+        let skills = store.snapshot().unwrap();
+        let source = tmp.path().join("source");
+        let remote = tmp.path().join("remote ' machine");
+        std::fs::create_dir(&source).unwrap();
+        skill::install_shared_links(&source, &store.root().join("writer"), "writer").unwrap();
+        let before = workspace_fingerprint(&source, &skills).unwrap();
+        std::fs::write(
+            store.root().join("writer/assets/sample.bin"),
+            [0, 255, 128, 1],
+        )
+        .unwrap();
+        assert_eq!(workspace_fingerprint(&source, &skills).unwrap(), before);
+        let workspace_archive = workspace_archive_command(&source, &skills)
+            .output()
+            .await
+            .unwrap();
+        assert!(workspace_archive.status.success());
+
+        let stage = tmp.path().join("stage");
+        std::fs::create_dir_all(stage.join("writer")).unwrap();
+        crate::skills::write_files(&stage.join("writer"), &skills[0].files).unwrap();
+        // Simulate a Windows archive without Unix executable metadata.
+        std::fs::set_permissions(
+            stage.join("writer/scripts/check.sh"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let package_archive = workspace_archive_command(&stage, &[])
+            .output()
+            .await
+            .unwrap();
+        assert!(package_archive.status.success());
+        for session in ["first", "second", "first", "second"] {
+            let cwd = remote.join(session);
+            let own_file = cwd.join(".agents/skills/future-skill/SKILL.md");
+            if !own_file.exists() {
+                std::fs::create_dir_all(own_file.parent().unwrap()).unwrap();
+                std::fs::write(&own_file, "session-owned").unwrap();
+            }
+            let materialize = materialize_remote_workspace_script(cwd.to_str().unwrap()).unwrap();
+            let output = run_shell_script(&materialize, &workspace_archive.stdout).await;
+            assert!(output.status.success(), "{output:?}");
+            let install = install_remote_shared_skills_script(
+                remote.to_str().unwrap(),
+                cwd.to_str().unwrap(),
+                &skills,
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let output = run_shell_script(&install, &package_archive.stdout).await;
+                assert!(output.status.success(), "{output:?}");
+            }
+            assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "session-owned");
+            for relative in [".agents/skills/writer", ".claude/skills/writer"] {
+                let alias = cwd.join(relative);
+                assert!(
+                    same_file::is_same_file(&alias, remote.join(".agent-router/skills/writer"))
+                        .unwrap()
+                );
+                assert!(!same_file::is_same_file(&alias, store.root().join("writer")).unwrap());
+                assert_eq!(
+                    std::fs::read(alias.join("assets/sample.bin")).unwrap(),
+                    [0, 255, 128, 1]
+                );
+                assert_ne!(
+                    std::fs::metadata(alias.join("scripts/check.sh"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0
+                );
+                assert_eq!(
+                    std::fs::metadata(alias.join("assets/sample.bin"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0
+                );
+            }
+        }
+        let future = shared_test_skill("future-skill");
+        std::fs::create_dir_all(stage.join("future-skill")).unwrap();
+        crate::skills::write_files(&stage.join("future-skill"), &future.files).unwrap();
+        let archive = workspace_archive_command(&stage, &[])
+            .output()
+            .await
+            .unwrap();
+        let install = install_remote_shared_skills_script(
+            remote.to_str().unwrap(),
+            remote.join("first").to_str().unwrap(),
+            &[future],
+        )
+        .unwrap();
+        let output = run_shell_script(&install, &archive.stdout).await;
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(remote.join("first/.agents/skills/future-skill/SKILL.md"))
+                .unwrap(),
+            "session-owned"
+        );
+        let remote_file = remote.join(".agent-router/skills/writer/SKILL.md");
+        std::fs::write(&remote_file, "remote change").unwrap();
+        let install = install_remote_shared_skills_script(
+            remote.to_str().unwrap(),
+            remote.join("first").to_str().unwrap(),
+            &skills,
+        )
+        .unwrap();
+        let output = run_shell_script(&install, &package_archive.stdout).await;
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(remote_file).unwrap(),
+            "remote change"
+        );
+        assert!(
+            std::fs::read_dir(remote.join(".agent-router/skills"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stage."))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_skill_archive_failure_does_not_publish_or_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("session");
+        let script = install_remote_shared_skills_script(
+            tmp.path().to_str().unwrap(),
+            cwd.to_str().unwrap(),
+            &[shared_test_skill("writer")],
+        )
+        .unwrap();
+        let output = run_shell_script(&script, b"invalid archive").await;
+        assert!(!output.status.success());
+        assert!(!tmp.path().join(".agent-router/skills/writer").exists());
+        assert!(!cwd.exists());
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join(".agent-router/skills"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn workspace_sync_preserves_destination_shared_skill_links() {
         use crate::agent_api::skill;
@@ -1485,7 +1987,7 @@ mod tests {
             std::fs::write(user_skill.join("SKILL.md"), "user's skill").unwrap();
         }
         skill::install(&destination, tmp.path()).unwrap();
-        sync_workspace_contents(&source, &source, &destination, None).unwrap();
+        sync_workspace_contents(&source, &source, &destination, &[], None).unwrap();
         for relative in skill::WORKSPACE_PATHS {
             assert!(
                 same_file::is_same_file(
@@ -1505,15 +2007,15 @@ mod tests {
         let cwd = tmp.path().join("session");
         std::fs::create_dir(&cwd).unwrap();
         skill::install(&cwd, tmp.path()).unwrap();
-        let before = workspace_fingerprint(&cwd).unwrap();
+        let before = workspace_fingerprint(&cwd, &[]).unwrap();
         std::fs::write(
             tmp.path().join(skill::SHARED_PATH).join("SKILL.md"),
             "changed",
         )
         .unwrap();
-        assert_eq!(workspace_fingerprint(&cwd).unwrap(), before);
+        assert_eq!(workspace_fingerprint(&cwd, &[]).unwrap(), before);
         std::fs::write(cwd.join("context.txt"), "new context").unwrap();
-        assert_ne!(workspace_fingerprint(&cwd).unwrap(), before);
+        assert_ne!(workspace_fingerprint(&cwd, &[]).unwrap(), before);
     }
 
     #[cfg(unix)]
@@ -1544,16 +2046,16 @@ mod tests {
         let user_skill = ".agents/skills/user/SKILL.md";
         std::fs::create_dir_all(source.join(".agents/skills/user")).unwrap();
         std::fs::write(source.join(user_skill), "user's skill").unwrap();
-        let archive = workspace_archive_command(&source).output().await.unwrap();
+        let archive = workspace_archive_command(&source, &[])
+            .output()
+            .await
+            .unwrap();
         assert!(archive.status.success());
         for session in ["first", "second", "first", "second"] {
             let cwd = remote.join(session);
             let script = materialize_remote_workspace_script(cwd.to_str().unwrap()).unwrap();
             let output = run_shell_script(&script, &archive.stdout).await;
             assert!(output.status.success(), "{output:?}");
-            for relative in skill::WORKSPACE_PATHS {
-                assert!(std::fs::symlink_metadata(cwd.join(relative)).is_err());
-            }
             let script =
                 install_remote_skill_script(remote.to_str().unwrap(), cwd.to_str().unwrap())
                     .unwrap();

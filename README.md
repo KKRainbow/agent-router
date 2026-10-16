@@ -82,6 +82,28 @@ bot's proactive-message permissions and quota. Do not blindly retry a failed
 or interrupted send. For remote agents, use the reachable API URL configuration
 described below under scheduled tasks.
 
+## Shared skills
+
+With `agent_api.enabled: true` and `workspace.root` configured, agents can
+publish reusable skills for every session on this Router. The canonical
+library is `<workspace.root>/.agent-router/skills/<name>/`, separate from
+session history and preserved across `/new` and restarts.
+
+`GET /api/skills` lists custom skills, `POST /api/skills` publishes a complete
+package, and `GET /api/skills/{name}` reads one. All three use the existing
+session credential. A package contains `SKILL.md` and optional scripts,
+references, or binary assets. Creation is atomic; duplicate names return 409.
+The built-in `agent-router` skill remains Router-managed. See the
+[publishing instructions](skills/agent-router/SKILL.md#publish-shared-skills)
+for the request format and limits.
+
+Before an executor turn, Router installs workspace links to shared skills;
+SSH Machines receive their own copies. Existing unrelated workspace skills
+are preserved and conflicting names cause preparation to fail. Each turn
+includes an index with names, descriptions, and paths, so existing agent
+sessions can discover new skills without relying on native skill hot reload.
+Skill bodies and supporting files are read on demand.
+
 ## Scheduled tasks
 
 Enable scheduling in your configuration:

@@ -1,6 +1,6 @@
 ---
 name: agent-router
-description: Send messages to the current conversation or configured channels, discover available destinations, and manage scheduled agent tasks in Agent Router. Use for progress notifications, cross-channel reports, reminders, and periodic follow-up.
+description: Send messages to configured channels, publish skills shared by all Router sessions, and manage scheduled agent tasks in Agent Router. Use for cross-channel reports, sharing reusable workflows, reminders, and periodic follow-up.
 ---
 
 <!-- agent-router:managed-skill -->
@@ -74,12 +74,69 @@ All paths below are relative to `AGENT_ROUTER_API_URL`. JSON requests use
 | `GET /api/context` | Current session, default executor, configured executors, and server time (`now_ms`) |
 | `GET /api/channels` | Current destination and named, enabled outbound targets |
 | `POST /api/messages` | Send text to the current conversation or a configured target |
+| `GET /api/skills` | List skills shared by all sessions on this Router |
+| `POST /api/skills` | Publish a complete new shared skill |
+| `GET /api/skills/{name}` | Read a shared skill and its packaged files |
 | `GET /api/schedules/tasks` | List this conversation's tasks, next run times, and recent execution records |
 | `POST /api/schedules/tasks` | Create a task |
 | `GET /api/schedules/tasks/{id}` | Inspect a task and its last 20 runs |
 | `PATCH /api/schedules/tasks/{id}` | Change `name`, `prompt`, `schedule`, `executor`, or `enabled` |
 | `DELETE /api/schedules/tasks/{id}` | Delete a task |
 | `POST /api/schedules/tasks/{id}/run` | Queue one immediate run, including for a paused task |
+
+## Publish shared skills
+
+Publish a skill when the user wants to share a reusable workflow with other
+sessions on this Router. The library persists across `/new` and Router restarts.
+Local and SSH executors receive published skills before their next turn; the
+turn's skill index gives local paths for reading them. To discover a skill
+published during the current turn, use `GET /api/skills` and read it with
+`GET /api/skills/{name}`; its local directory may not exist until the next turn.
+
+Prepare a directory named after the skill, with `SKILL.md` containing YAML
+frontmatter `name` and `description`. Names use lowercase letters, digits and
+hyphens, up to 64 characters. Include only supporting files the workflow needs,
+such as `scripts/`, `references/`, and `assets/`. Do not bundle credentials or
+conversation-specific files. The built-in `agent-router` skill is reserved.
+
+Publish JSON with `name` and `files`. Each file is keyed by its relative path
+and has `content_base64` plus an optional `executable` boolean. This carries
+binary assets as well as text, and preserves executable scripts on Unix.
+Packages allow up to 64 files and 1 MiB of decoded content; HTTP bodies are
+limited to 2 MiB. Paths must be portable relative paths without symlinks,
+parent traversal, Windows reserved names, or case-insensitive collisions.
+
+For example, package a prepared directory with Python 3:
+
+```sh
+python3 - ./my-skill > publish-skill.json <<'PY'
+import base64, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = {}
+for path in sorted(root.rglob('*')):
+    if path.is_symlink():
+        raise SystemExit(f'Symlinks cannot be published: {path}')
+    if path.is_file():
+        files[path.relative_to(root).as_posix()] = {
+            'content_base64': base64.b64encode(path.read_bytes()).decode('ascii'),
+            'executable': bool(path.stat().st_mode & 0o111),
+        }
+json.dump({'name': root.name, 'files': files}, sys.stdout)
+PY
+curl --fail-with-body --silent --show-error \
+  -H "Authorization: Bearer $AGENT_ROUTER_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary @publish-skill.json "$AGENT_ROUTER_API_URL/api/skills"
+```
+
+On Windows, use the same JSON schema with a file packer and
+`Invoke-RestMethod`. A 201 response means the package was saved. A 409 means
+the name already exists; inspect it before choosing a different name. This
+API supports creation, listing and reading only. It does not overwrite or
+delete existing skills. Treat installed shared skill directories as read-only;
+publish changes under a new name when appropriate.
+
+## Create scheduled tasks
 
 Create a scheduled task with `name`, `prompt`, and `schedule`. `executor` is optional and defaults
 to the current agent. Task ownership and notification destination come from the

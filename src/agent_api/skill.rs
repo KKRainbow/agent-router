@@ -5,11 +5,11 @@ pub(crate) const SHARED_PATH: &str = ".agent-router/skills/agent-router";
 pub(crate) const WORKSPACE_PATHS: [&str; 2] =
     [".agents/skills/agent-router", ".claude/skills/agent-router"];
 pub(crate) const MARKER: &str = "<!-- agent-router:managed-skill -->";
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn install(cwd: &Path, workspace_root: &Path) -> anyhow::Result<()> {
     // Windows cannot atomically replace the same destination concurrently.
     // Publish shared content and links serially; every session uses this path.
-    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = INSTALL_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("shared skill installation lock is poisoned"))?;
@@ -18,12 +18,22 @@ pub(crate) fn install(cwd: &Path, workspace_root: &Path) -> anyhow::Result<()> {
     }
     let shared = workspace_root.join(SHARED_PATH).canonicalize()?;
     write_skill(&shared.join("SKILL.md"))?;
-    for relative in WORKSPACE_PATHS {
-        let alias = cwd.join(relative);
-        let parent = alias.parent().unwrap();
+    install_links(cwd, &shared, "agent-router")
+}
+
+pub(crate) fn install_shared_links(cwd: &Path, shared: &Path, name: &str) -> anyhow::Result<()> {
+    let _guard = INSTALL_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("shared skill installation lock is poisoned"))?;
+    install_links(cwd, shared, name)
+}
+
+fn install_links(cwd: &Path, shared: &Path, name: &str) -> anyhow::Result<()> {
+    for directory in [".agents/skills", ".claude/skills"] {
+        let parent = cwd.join(directory);
         ensure_directory(parent.parent().unwrap())?;
-        ensure_directory(parent)?;
-        install_link(&alias, &shared)?;
+        ensure_directory(&parent)?;
+        install_link(&parent.join(name), shared)?;
     }
     Ok(())
 }

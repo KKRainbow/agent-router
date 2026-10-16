@@ -11,6 +11,7 @@ pub mod messages;
 pub mod router;
 pub mod schedules;
 pub mod session;
+pub mod skills;
 mod text;
 
 pub use router::{

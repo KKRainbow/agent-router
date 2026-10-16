@@ -38,6 +38,7 @@ use crate::{
         },
         store::SessionStore,
     },
+    skills::{SkillStore, SkillSummary},
     text::truncate_chars,
 };
 
@@ -732,6 +733,7 @@ where
     approvals: SharedApprovalBroker,
     workspace_root: Option<PathBuf>,
     agent_api: Option<Arc<AgentApi>>,
+    shared_skills: Option<Arc<SkillStore>>,
     notifications: broadcast::Sender<SessionNotification>,
     owner_user_ids_by_source: HashMap<String, BTreeSet<String>>,
     #[cfg(test)]
@@ -998,6 +1000,7 @@ where
             approvals,
             workspace_root: None,
             agent_api: None,
+            shared_skills: None,
             notifications: broadcast::channel(256).0,
             owner_user_ids_by_source: HashMap::new(),
             #[cfg(test)]
@@ -1017,6 +1020,11 @@ where
 
     pub fn with_agent_api(mut self, agent_api: Option<Arc<AgentApi>>) -> Self {
         self.agent_api = agent_api;
+        self
+    }
+
+    pub fn with_shared_skills(mut self, skills: Option<Arc<SkillStore>>) -> Self {
+        self.shared_skills = skills;
         self
     }
 
@@ -2493,19 +2501,31 @@ Current user message:\n{}",
         } else {
             Default::default()
         };
-        let prepared = self
-            .executor
-            .prepare(
-                ExecutorPrepareRequest {
-                    environment,
-                    turn: executor_turn.clone(),
-                    cwd: session_cwd.clone(),
-                    previous_session_id: binding.external_session_id.clone(),
-                },
-                cancel.clone(),
-            )
-            .await;
-        let prepared = match prepared {
+        let prepared = async {
+            // Skills are create-only. Read the index before preparing the
+            // Machine so every advertised skill is included in its snapshot.
+            let skills = self
+                .shared_skills
+                .as_ref()
+                .map(|store| store.list())
+                .transpose()?
+                .unwrap_or_default();
+            let prepared = self
+                .executor
+                .prepare(
+                    ExecutorPrepareRequest {
+                        environment,
+                        turn: executor_turn.clone(),
+                        cwd: session_cwd.clone(),
+                        previous_session_id: binding.external_session_id.clone(),
+                    },
+                    cancel.clone(),
+                )
+                .await?;
+            anyhow::Ok((prepared, skills))
+        }
+        .await;
+        let (prepared, shared_skills) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 if cancel.is_cancelled().await {
@@ -2635,7 +2655,7 @@ Current user message:\n{}",
                 .prompt(
                     ExecutorPromptRequest {
                         turn: executor_turn,
-                        prompt: projection.prompt,
+                        prompt: prompt_with_shared_skills(projection.prompt, &shared_skills),
                         user_id: input.user_id.clone(),
                     },
                     &mut executor_events,
@@ -3520,6 +3540,26 @@ impl RouterReplyStreamState {
             self.last_message_id = Some(id.clone());
         }
     }
+}
+
+fn prompt_with_shared_skills(prompt: String, skills: &[SkillSummary]) -> String {
+    if skills.is_empty() {
+        return prompt;
+    }
+    let index = skills
+        .iter()
+        .map(|skill| {
+            serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+                "path": format!(".agents/skills/{}/SKILL.md", skill.name),
+            })
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Shared Agent Router skills available for this turn (paths are relative to the current session workspace):\n{}\nRead the SKILL.md of a skill when it applies to the user's task; read its supporting files as needed.\n\n{prompt}",
+        serde_json::json!(index),
+    )
 }
 
 fn reply_chunk_from_executor_update(update: &ExecutorUpdate) -> Option<String> {

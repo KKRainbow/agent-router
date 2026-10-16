@@ -163,6 +163,23 @@ Links are created after materialization, using the destination Machine's
 shared directory, including on SSH hosts. Credentials are not written into
 skill files, prompts, or persisted task definitions.
 
+`skills` owns the Router-wide custom skill library and `/api/skills` routes.
+Authenticated sessions can list, read, and atomically create complete packages;
+names cannot be overwritten and the built-in `agent-router` name is reserved.
+The canonical files live under the Router workspace root, independently of
+session state. Local Machine workspaces link to those files; SSH Machines
+receive complete packages in their own shared directory before linking them.
+Unrelated workspace skills survive materialization and name conflicts fail
+preparation rather than replacing user content.
+
+The Router reads the skill index before preparing the executor. Machine
+preparation materializes the current library, and the Router includes that
+index with relative workspace paths in the turn prompt. Create-only semantics
+ensure every indexed skill is present even if another session publishes during
+preparation. Skill descriptions are included each turn; full instructions and
+resources remain on disk for the agent to read when relevant. This makes new
+skills visible to resumed sessions without restarting backend processes.
+
 `schedules` is the first feature module, registered under `/api/schedules`.
 It owns task validation, persistence, claiming, and execution history. Claimed
 runs are persisted before execution and interrupted runs are not replayed after
