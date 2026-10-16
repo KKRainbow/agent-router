@@ -249,6 +249,7 @@ pub struct ExecutorChannelEvent {
     pub kind: ExecutorChannelEventKind,
     pub title: String,
     pub text: String,
+    pub tool_call_id: Option<String>,
 }
 
 impl ExecutorChannelEvent {
@@ -257,6 +258,7 @@ impl ExecutorChannelEvent {
             kind: ExecutorChannelEventKind::AgentProgress,
             title: "Progress".to_string(),
             text: text.into(),
+            tool_call_id: None,
         }
     }
 
@@ -265,6 +267,7 @@ impl ExecutorChannelEvent {
             kind: ExecutorChannelEventKind::ReasoningSummary,
             title: "Reasoning".to_string(),
             text: text.into(),
+            tool_call_id: None,
         }
     }
 
@@ -273,6 +276,7 @@ impl ExecutorChannelEvent {
             kind: ExecutorChannelEventKind::ToolCall,
             title: title.into(),
             text: text.into(),
+            tool_call_id: None,
         }
     }
 }

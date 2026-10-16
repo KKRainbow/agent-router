@@ -1244,7 +1244,12 @@ impl PiRpcSession {
                     )
                     .await?;
             }
-            "extension_ui_request" => {
+            "extension_ui_request"
+                if matches!(
+                    message.get("method").and_then(Value::as_str),
+                    Some("confirm" | "select" | "input" | "editor" | "notify")
+                ) =>
+            {
                 pending_text_progress.flush(events).await?;
                 pending_thinking.flush(events).await?;
                 self.handle_extension_ui_request(
@@ -1433,9 +1438,9 @@ impl PiRpcSession {
                     .await?;
                 }
             }
-            "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text" => {
+            "notify" => {
                 if let Some(events) = events.as_mut()
-                    && let Some(text) = extension_ui_progress_text(message)
+                    && let Some(text) = extract_textish(message.get("message"))
                 {
                     events
                         .send(
@@ -1844,9 +1849,16 @@ fn project_pi_tool_event(message: &Value, status: &str) -> ExecutorUpdate {
         .unwrap_or("Tool")
         .to_string();
     let text = tool_event_text(message, status);
+    let mut channel_event = ExecutorChannelEvent::tool_call(title.clone(), text.clone());
+    channel_event.tool_call_id = message
+        .get("toolCallId")
+        .or_else(|| message.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned);
     ExecutorUpdate::new("tool_call", title.clone(), text.clone(), status)
         .with_transcript_summary(format!("{title}: status: {status}"))
-        .with_channel_event(ExecutorChannelEvent::tool_call(title, text))
+        .with_channel_event(channel_event)
 }
 
 fn tool_event_text(message: &Value, status: &str) -> String {
@@ -1947,33 +1959,6 @@ fn extension_error_text(message: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown error");
     format!("Pi extension `{extension}` failed during {event}: {error}")
-}
-
-fn extension_ui_progress_text(message: &Value) -> Option<String> {
-    match message.get("method").and_then(Value::as_str)? {
-        "notify" => extract_textish(message.get("message")),
-        "setStatus" => extract_textish(message.get("statusText"))
-            .or_else(|| extract_textish(message.get("status_text")))
-            .or_else(|| {
-                message
-                    .get("statusKey")
-                    .or_else(|| message.get("status_key"))
-                    .and_then(Value::as_str)
-                    .map(|key| format!("Pi status updated: {key}"))
-            }),
-        "setWidget" => extract_textish(message.get("widgetLines"))
-            .or_else(|| extract_textish(message.get("widget_lines")))
-            .or_else(|| {
-                message
-                    .get("widgetKey")
-                    .or_else(|| message.get("widget_key"))
-                    .and_then(Value::as_str)
-                    .map(|key| format!("Pi widget updated: {key}"))
-            }),
-        "setTitle" => extract_textish(message.get("title")),
-        "set_editor_text" => Some("Pi updated editor text".to_string()),
-        _ => None,
-    }
 }
 
 fn select_options(value: Option<&Value>) -> Vec<SelectOption> {
@@ -2259,6 +2244,23 @@ while True:
             response(cmd, "prompt")
             text_delta("progress draft")
             agent_end("final answer")
+        elif scenario == "terminal_ui_during_text":
+            response(cmd, "prompt")
+            send({"type": "extension_ui_request", "method": "notify", "message": "Checking workspace"})
+            text_delta("I will inspect ")
+            send({"type": "extension_ui_request", "method": "setStatus", "statusKey": "speed", "statusText": "177 tps"})
+            text_delta("the workspace.")
+            send({"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "bash", "args": {"command": "pwd"}})
+            send({"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "bash", "isError": False})
+            for text, update in [
+                ("The ", {"method": "setWidget", "widgetKey": "throughput", "widgetLines": ["\u001b[38;2;0;180;255mThroughput\u001b[39m 177 tps"]}),
+                ("workspace ", {"method": "setTitle", "title": "Inspect workspace"}),
+                ("is ", {"method": "set_editor_text", "text": "draft"}),
+                ("ready.", {"method": "setWidget", "widgetKey": "throughput", "widgetLines": []}),
+            ]:
+                text_delta(text)
+                send({"type": "extension_ui_request", **update})
+            agent_end("The workspace is ready.")
         elif scenario == "approval_confirm":
             response(cmd, "prompt")
             send({
@@ -2741,6 +2743,19 @@ while True:
                 "status: completed",
             ]
         );
+        assert!(
+            events
+                .updates
+                .iter()
+                .filter(|update| update.kind == "tool_call")
+                .all(|update| update
+                    .channel_event
+                    .as_ref()
+                    .unwrap()
+                    .tool_call_id
+                    .as_deref()
+                    == Some("tool-1"))
+        );
         assert!(tool_channel_texts.iter().all(|text| {
             !text.contains("args:") && !text.contains("partial:") && !text.contains("result:")
         }));
@@ -2837,6 +2852,46 @@ while True:
                 && update.title == "Pi"
                 && update.text == "progress draft")
         }));
+    }
+
+    #[tokio::test]
+    async fn terminal_ui_updates_do_not_split_text_or_emit_channel_progress() {
+        let fake = FakePi::new();
+        let (manager, _) = fake.manager("terminal_ui_during_text");
+        prepare(&manager, None).await;
+
+        let mut events = CollectingExecutorEventSink::default();
+        let response = manager
+            .prompt(
+                ExecutorPromptRequest {
+                    turn: turn(1),
+                    prompt: "check workspace".to_string(),
+                    user_id: None,
+                },
+                &mut events,
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.final_text, "The workspace is ready.");
+        let progress = events
+            .updates
+            .iter()
+            .filter_map(|update| update.channel_event.as_ref())
+            .filter(|event| event.kind == ExecutorChannelEventKind::AgentProgress)
+            .map(|event| event.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            progress,
+            ["Checking workspace", "I will inspect the workspace."]
+        );
+        assert!(
+            events
+                .updates
+                .iter()
+                .all(|update| !update.text.contains("Throughput"))
+        );
     }
 
     #[tokio::test]

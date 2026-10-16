@@ -1085,6 +1085,7 @@ mod tests {
     fn event(title: &str) -> RouterChannelEvent {
         RouterChannelEvent {
             kind: RouterChannelEventKind::ToolCall,
+            tool_call_id: None,
             executor: "kimi".to_string(),
             title: title.to_string(),
             text: format!("{title} text"),
@@ -1094,6 +1095,7 @@ mod tests {
     fn progress_event(text: &str) -> RouterChannelEvent {
         RouterChannelEvent {
             kind: RouterChannelEventKind::AgentProgress,
+            tool_call_id: None,
             executor: "pi".to_string(),
             title: "Progress".to_string(),
             text: text.to_string(),

@@ -706,6 +706,7 @@ mod tests {
         .unwrap();
         let snapshot = live_compact_channel_activity(&[RouterChannelEvent {
             kind: RouterChannelEventKind::ToolCall,
+            tool_call_id: None,
             executor: "kimi".to_string(),
             title: "Bash".to_string(),
             text: "$ cargo test\nexit: 0\nstatus: completed".to_string(),
@@ -946,6 +947,7 @@ mod tests {
             RouterOutputEvent::ReplyBreak,
             RouterOutputEvent::Channel(RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "kimi".to_string(),
                 title: "Bash".to_string(),
                 text: "$ cargo test\nexit: 0\nstatus: completed".to_string(),
@@ -1013,6 +1015,7 @@ mod tests {
         let router = Arc::new(RecordingRouter::with_events(vec![
             RouterOutputEvent::Channel(RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "kimi".to_string(),
                 title: "Progress".to_string(),
                 text: "working".to_string(),
@@ -1053,6 +1056,7 @@ mod tests {
         let router = Arc::new(RecordingRouter::with_events(vec![
             RouterOutputEvent::Channel(RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "kimi".to_string(),
                 title: "Bash".to_string(),
                 text: "$ cargo test\nexit: 0\nstatus: completed".to_string(),

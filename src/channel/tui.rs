@@ -928,6 +928,7 @@ mod tests {
     fn tool_event(text: &str) -> RouterChannelEvent {
         RouterChannelEvent {
             kind: RouterChannelEventKind::ToolCall,
+            tool_call_id: None,
             executor: "codex".to_string(),
             title: "Bash".to_string(),
             text: text.to_string(),
@@ -937,6 +938,7 @@ mod tests {
     fn reasoning_event(text: &str) -> RouterChannelEvent {
         RouterChannelEvent {
             kind: RouterChannelEventKind::ReasoningSummary,
+            tool_call_id: None,
             executor: "codex".to_string(),
             title: "Reasoning".to_string(),
             text: text.to_string(),

@@ -155,6 +155,7 @@ pub struct RouterChannelEvent {
     pub executor: String,
     pub title: String,
     pub text: String,
+    pub tool_call_id: Option<String>,
 }
 
 impl RouterChannelEvent {
@@ -263,7 +264,8 @@ fn compact_channel_activity_inner(
     let mut progress_items = Vec::new();
     let mut last_progress_text: Option<String> = None;
     let mut latest_reasoning = None;
-    let mut tool_total = 0usize;
+    let mut tool_items: Vec<(CompactToolItem, Option<String>)> = Vec::new();
+    let mut tool_indices: HashMap<(&str, &str), usize> = HashMap::new();
     let mut command_counts: Vec<(String, usize)> = Vec::new();
     let mut tool_counts: Vec<(String, usize)> = Vec::new();
     let mut attention = Vec::new();
@@ -281,20 +283,35 @@ fn compact_channel_activity_inner(
                 latest_reasoning = Some(truncate_chars(one_line(&event.text).as_str(), 240));
             }
             RouterChannelEventKind::ToolCall => {
-                tool_total += 1;
-                let item = compact_tool_item(event);
-                match &item {
-                    CompactToolItem::Command(command) => {
-                        push_compact_count(&mut command_counts, command.clone());
+                let key = event
+                    .tool_call_id
+                    .as_deref()
+                    .map(|id| (event.executor.as_str(), id));
+                if let Some(index) = key.and_then(|key| tool_indices.get(&key)).copied() {
+                    // End events may omit the arguments; keep the original label.
+                    tool_items[index].1 = compact_attention_status(event);
+                } else {
+                    if let Some(key) = key {
+                        tool_indices.insert(key, tool_items.len());
                     }
-                    CompactToolItem::Tool(label) => {
-                        push_compact_count(&mut tool_counts, label.clone());
-                    }
-                }
-                if let Some(status) = compact_attention_status(event) {
-                    attention.push(item.attention(status));
+                    tool_items.push((compact_tool_item(event), compact_attention_status(event)));
                 }
             }
+        }
+    }
+
+    let tool_total = tool_items.len();
+    for (item, status) in tool_items {
+        match &item {
+            CompactToolItem::Command(command) => {
+                push_compact_count(&mut command_counts, command.clone());
+            }
+            CompactToolItem::Tool(label) => {
+                push_compact_count(&mut tool_counts, label.clone());
+            }
+        }
+        if let Some(status) = status {
+            attention.push(item.attention(status));
         }
     }
 
@@ -2423,6 +2440,7 @@ Current user message:\n{}",
         {
             output.send_channel_event(RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: executor_name.clone(),
                 title: "Agent handoff".to_string(),
                 text: format!("Routing this session to `{executor_name}`."),
@@ -3527,6 +3545,7 @@ fn channel_event_from_executor_update(
         executor: executor.to_string(),
         title: event.title.clone(),
         text: truncate_chars(event.text.trim(), 1_500),
+        tool_call_id: event.tool_call_id.clone(),
     })
 }
 
@@ -9404,6 +9423,7 @@ mod tests {
     fn compact_channel_events_suppress_single_successful_tool() {
         let events = vec![RouterChannelEvent {
             kind: RouterChannelEventKind::ToolCall,
+            tool_call_id: None,
             executor: "codex".to_string(),
             title: "Bash".to_string(),
             text: "exit: 0\nstatus: completed".to_string(),
@@ -9413,9 +9433,51 @@ mod tests {
     }
 
     #[test]
+    fn compact_channel_events_count_calls_and_keep_latest_status() {
+        let tool_update = |id: &str, text: &str| {
+            let mut event = ExecutorChannelEvent::tool_call("bash", text);
+            event.tool_call_id = Some(id.to_string());
+            channel_event_from_executor_update(
+                "omp",
+                &ExecutorUpdate::new("tool_call", "bash", text, "").with_channel_event(event),
+            )
+            .unwrap()
+        };
+        let mut events = vec![
+            tool_update("call-1", "$ pwd\nstatus: running"),
+            tool_update("call-1", "$ pwd\nstatus: running"),
+            tool_update("call-1", "status: completed"),
+        ];
+
+        // A single successful call stays suppressed in the final summary.
+        assert_eq!(render_compact_channel_events(&events), None);
+        assert_eq!(
+            render_live_compact_channel_events(&events).as_deref(),
+            Some("[omp] Activity\nCommands:\n- `pwd`")
+        );
+
+        events.extend([
+            tool_update("call-2", "$ pwd\nstatus: running"),
+            tool_update("call-2", "status: failed"),
+            tool_update("call-2", "status: failed"),
+        ]);
+        assert_eq!(
+            render_compact_channel_events(&events).as_deref(),
+            Some("[omp] Activity\nCommands:\n- `pwd` x2\nAttention:\n- `pwd`: status: failed")
+        );
+
+        events.push(tool_update("call-2", "status: completed"));
+        assert_eq!(
+            render_compact_channel_events(&events).as_deref(),
+            Some("[omp] Activity\nCommands:\n- `pwd` x2")
+        );
+    }
+
+    #[test]
     fn live_compact_channel_events_show_single_successful_tool() {
         let events = vec![RouterChannelEvent {
             kind: RouterChannelEventKind::ToolCall,
+            tool_call_id: None,
             executor: "codex".to_string(),
             title: "Bash".to_string(),
             text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
@@ -9432,12 +9494,14 @@ mod tests {
         let events = vec![
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Progress".to_string(),
                 text: "I will inspect the config first.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Progress".to_string(),
                 text: "Now I will add the focused test.".to_string(),
@@ -9458,42 +9522,49 @@ mod tests {
         let events = vec![
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Progress".to_string(),
                 text: "I will inspect the failing test first.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ReasoningSummary,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Reasoning".to_string(),
                 text: "Need to inspect the failing test first.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Base".to_string(),
                 text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Base".to_string(),
                 text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Base".to_string(),
                 text: "$ sleep 3\nexit: 0\nstatus: completed".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Bash".to_string(),
                 text: "$ cargo test -q\nexit: 0\nstatus: completed".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "dynamicToolCall".to_string(),
                 text: "read_file\nstatus: completed".to_string(),
@@ -9513,24 +9584,28 @@ mod tests {
         let events = vec![
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Progress".to_string(),
                 text: "First step.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ReasoningSummary,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Reasoning".to_string(),
                 text: "Need a targeted fix.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Bash".to_string(),
                 text: "$ cargo test -q\nexit: 2\nstatus: failed".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "dynamicToolCall".to_string(),
                 text: "read_file\nstatus: completed".to_string(),
@@ -9558,24 +9633,28 @@ mod tests {
         let events = vec![
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Progress".to_string(),
                 text: "First step.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Progress".to_string(),
                 text: "Second step.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Progress".to_string(),
                 text: "Second step. Third step.".to_string(),
             },
             RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Bash".to_string(),
                 text: "$ echo ok\nexit: 0\nstatus: completed".to_string(),
@@ -9595,6 +9674,7 @@ mod tests {
         let events = (1..=8)
             .map(|index| RouterChannelEvent {
                 kind: RouterChannelEventKind::ToolCall,
+                tool_call_id: None,
                 executor: "codex".to_string(),
                 title: "Base".to_string(),
                 text: format!("$ cmd {index}\nexit: 0\nstatus: completed"),
@@ -9613,6 +9693,7 @@ mod tests {
     fn compact_channel_events_keep_failed_tool_attention() {
         let events = vec![RouterChannelEvent {
             kind: RouterChannelEventKind::ToolCall,
+            tool_call_id: None,
             executor: "codex".to_string(),
             title: "Bash".to_string(),
             text: "$ sleep 3\nexit: 2\nstatus: failed".to_string(),
@@ -10276,6 +10357,7 @@ mod tests {
             true,
             vec![RouterOutputEvent::Channel(RouterChannelEvent {
                 kind: RouterChannelEventKind::AgentProgress,
+                tool_call_id: None,
                 executor: "kimi".to_string(),
                 title: "Progress".to_string(),
                 text: "before cancel".to_string(),
