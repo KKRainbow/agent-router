@@ -185,7 +185,9 @@ It owns task validation, persistence, claiming, and execution history. Claimed
 runs are persisted before execution and interrupted runs are not replayed after
 restart. Background runs use separate `schedule:<id>` sessions and a fixed
 executor; their results are appended to the original transcript under its
-session lock before channel delivery. Approval identity maps back to the
+session lock before channel delivery, when the task's `notify` policy publishes
+that run (`always` for every run, `on_failure` for failed runs, `never` for a
+task that reports through the Agent API itself). Approval identity maps back to the
 originating session before applying its approval policy.
 
 `agent_api.enabled` controls the shared service independently of

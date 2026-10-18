@@ -134,6 +134,9 @@ impl Scheduler {
         // never cause the agent's potentially side-effecting work to run again.
         self.finish_run(&task.id, &run_id, status, &output.text, error.as_deref())
             .await?;
+        if !task.notify.should_notify(status) {
+            return Ok(());
+        }
         let text = match &error {
             Some(error) => format!("Scheduled task “{}” failed:\n\n{}", task.name, error),
             None => format!("Scheduled task “{}”:\n\n{}", task.name, output.text),

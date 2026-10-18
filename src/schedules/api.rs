@@ -87,6 +87,9 @@ async fn update(
     if let Some(executor) = request.executor {
         task.executor = executor;
     }
+    if let Some(notify) = request.notify {
+        task.notify = notify;
+    }
     if let Some(schedule) = request.schedule {
         schedule
             .next_after(now_ms())

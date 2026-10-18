@@ -328,6 +328,7 @@ async fn restart_interrupts_running_jobs_without_replay_and_runs_overdue_once() 
                 name: "once".into(),
                 prompt: "once".into(),
                 executor: None,
+                notify: NotifyPolicy::Always,
                 schedule: Schedule::Once {
                     at: "2099-01-01T00:00:00Z".into(),
                 },
@@ -447,6 +448,149 @@ async fn scheduled_execution_uses_its_own_session_and_saves_result_before_delive
     let run = &state.tasks[&task.id].runs[0];
     assert_eq!(run.status, RunStatus::Succeeded);
     assert_eq!(run.output, "fake response");
+    assert!(
+        run.delivery_error
+            .as_deref()
+            .unwrap()
+            .contains("platform refused")
+    );
+}
+
+#[tokio::test]
+async fn notify_never_keeps_the_result_out_of_the_origin_conversation() {
+    let (root, scheduler, api, token) = scheduler();
+    let task = create(&scheduler, &api, &token).await;
+    assert_eq!(task.notify, NotifyPolicy::Always);
+    let app = build_app(api.clone(), routes(scheduler.clone()));
+    let path = format!("/api/schedules/tasks/{}", task.id);
+    let (status, body) = request(
+        &app,
+        &token,
+        "PATCH",
+        &path,
+        Some(json!({"notify":"never"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["notify"], "never");
+    let store = Arc::new(InMemorySessionStore::default());
+    let backend = Arc::new(FakeExecutorBackend::default());
+    let router = Arc::new(
+        AgentRouter::new("kimi", store.clone(), backend.clone())
+            .with_workspace_root(Some(root.path().into()))
+            .with_agent_api(Some(api.clone())),
+    );
+    let mut notifications = router.subscribe_notifications().unwrap();
+    let (claimed, run) = scheduler
+        .claim_ready(now_ms() + 60_001, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(claimed.notify, NotifyPolicy::Never);
+    scheduler
+        .execute(router, Arc::new(FailedDelivery), claimed, run, 10)
+        .await
+        .unwrap();
+    let origin = store
+        .load_or_create(&task.owner_session_key, "kimi")
+        .await
+        .unwrap();
+    assert!(origin.transcript.is_empty(), "{:?}", origin.transcript);
+    assert!(notifications.try_recv().is_err());
+    let state = scheduler.state.lock().await;
+    let run = &state.tasks[&task.id].runs[0];
+    assert_eq!(run.status, RunStatus::Succeeded);
+    assert_eq!(run.output, "fake response");
+    assert!(run.delivery_error.is_none());
+}
+
+#[tokio::test]
+async fn notify_on_failure_keeps_successful_runs_quiet() {
+    let (root, scheduler, api, token) = scheduler();
+    let task = create(&scheduler, &api, &token).await;
+    let store = Arc::new(InMemorySessionStore::default());
+    let backend = Arc::new(FakeExecutorBackend::default());
+    let router = Arc::new(
+        AgentRouter::new("kimi", store.clone(), backend.clone())
+            .with_workspace_root(Some(root.path().into()))
+            .with_agent_api(Some(api.clone())),
+    );
+    let mut notifications = router.subscribe_notifications().unwrap();
+    let (mut claimed, run) = scheduler
+        .claim_ready(now_ms() + 60_001, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    claimed.notify = NotifyPolicy::OnFailure;
+    scheduler
+        .execute(router, Arc::new(FailedDelivery), claimed, run, 10)
+        .await
+        .unwrap();
+    let origin = store
+        .load_or_create(&task.owner_session_key, "kimi")
+        .await
+        .unwrap();
+    assert!(origin.transcript.is_empty(), "{:?}", origin.transcript);
+    assert!(notifications.try_recv().is_err());
+    let state = scheduler.state.lock().await;
+    let run = &state.tasks[&task.id].runs[0];
+    assert_eq!(run.status, RunStatus::Succeeded);
+    assert_eq!(run.output, "fake response");
+    assert!(run.delivery_error.is_none());
+}
+
+#[derive(Default)]
+struct FailingRouter {
+    published: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl RouterService for FailingRouter {
+    async fn run_scheduled(
+        &self,
+        _: &ScheduledTask,
+        _: &mut dyn RouterOutputSink,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("executor exploded")
+    }
+    async fn handle(&self, _: RouterInput, _: &mut dyn RouterOutputSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn observe(&self, _: RouterInput) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn append_notification(&self, notification: SessionNotification) -> anyhow::Result<()> {
+        self.published.lock().await.push(notification.text);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn notify_on_failure_publishes_failed_runs() {
+    let (_root, scheduler, api, token) = scheduler();
+    let task = create(&scheduler, &api, &token).await;
+    let (mut claimed, run) = scheduler
+        .claim_ready(now_ms() + 60_001, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    claimed.notify = NotifyPolicy::OnFailure;
+    let router = Arc::new(FailingRouter::default());
+    scheduler
+        .execute(router.clone(), Arc::new(FailedDelivery), claimed, run, 10)
+        .await
+        .unwrap();
+    let published = router.published.lock().await;
+    assert_eq!(published.len(), 1);
+    assert!(
+        published[0].contains("executor exploded"),
+        "{}",
+        published[0]
+    );
+    drop(published);
+    let state = scheduler.state.lock().await;
+    let run = &state.tasks[&task.id].runs[0];
+    assert_eq!(run.status, RunStatus::Failed);
     assert!(
         run.delivery_error
             .as_deref()

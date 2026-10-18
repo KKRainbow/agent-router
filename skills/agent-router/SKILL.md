@@ -80,7 +80,7 @@ All paths below are relative to `AGENT_ROUTER_API_URL`. JSON requests use
 | `GET /api/schedules/tasks` | List this conversation's tasks, next run times, and recent execution records |
 | `POST /api/schedules/tasks` | Create a task |
 | `GET /api/schedules/tasks/{id}` | Inspect a task and its last 20 runs |
-| `PATCH /api/schedules/tasks/{id}` | Change `name`, `prompt`, `schedule`, `executor`, or `enabled` |
+| `PATCH /api/schedules/tasks/{id}` | Change `name`, `prompt`, `schedule`, `executor`, `notify`, or `enabled` |
 | `DELETE /api/schedules/tasks/{id}` | Delete a task |
 | `POST /api/schedules/tasks/{id}/run` | Queue one immediate run, including for a paused task |
 
@@ -141,6 +141,11 @@ publish changes under a new name when appropriate.
 Create a scheduled task with `name`, `prompt`, and `schedule`. `executor` is optional and defaults
 to the current agent. Task ownership and notification destination come from the
 session credential; do not supply session IDs or channel targets.
+`notify` decides which run results are published to that destination: `always`
+(the default) publishes every run, `on_failure` publishes failed runs only, and
+`never` publishes nothing. Use `on_failure` or `never` for a frequent task that
+already sends its own progress messages, so routine runs stay quiet; every run
+still records its status and output for `GET /api/schedules/tasks/{id}`.
 If `/api/context` works but `/api/schedules/tasks` returns 404, scheduling is
 disabled on this Router. Ask the user to enable `schedules.enabled`.
 
@@ -185,7 +190,8 @@ interpolation of the JSON body; send a file or serialize a native object.
   and workspace; it does not inherit the original chat or its synced files.
 - The selected executor is fixed until the task is updated. Switching agents in
   the original conversation does not change existing tasks.
-- Results return to the originating conversation. Normal executor permission
+- Results return to the originating conversation, subject to the task's `notify`
+  policy. Normal executor permission
   rules still apply; tool approval requests return there too.
 - During a scheduled run, `AGENT_ROUTER_TASK_ID` identifies the current task.
   The agent can update or pause its task when the user's requested condition is

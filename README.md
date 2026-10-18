@@ -138,7 +138,12 @@ timestamps, intervals, and five-field cron with an explicit IANA timezone.
 
 Each task has its own persistent session and workspace, uses the selected
 executor, and returns results and approval requests to the original
-conversation. Include necessary URLs and absolute project paths in the task
+conversation. The task's `notify` policy (`always`, `on_failure`, or `never`)
+decides which run results are published there; the default `always` publishes
+every run, while a frequent task that already reports through the Agent API
+should use `on_failure` or `never` so routine runs stay quiet. Every run keeps
+its status and output in the task's run history regardless of the policy.
+Include necessary URLs and absolute project paths in the task
 prompt; the original conversation and synced files are not copied. Web chat
 refreshes background results while idle; terminal chat displays notifications
 while open. Slack and Telegram receive outbound messages. QQ delivery requires

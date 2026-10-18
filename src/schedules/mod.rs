@@ -99,6 +99,29 @@ impl Schedule {
     }
 }
 
+/// Controls whether a finished run is published to the originating conversation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyPolicy {
+    /// Publish every run result.
+    #[default]
+    Always,
+    /// Publish only runs that failed.
+    OnFailure,
+    /// Publish nothing; the task reports through the Agent API when it matters.
+    Never,
+}
+
+impl NotifyPolicy {
+    fn should_notify(self, status: RunStatus) -> bool {
+        match self {
+            Self::Always => true,
+            Self::OnFailure => status == RunStatus::Failed,
+            Self::Never => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledTask {
     pub id: String,
@@ -106,6 +129,8 @@ pub struct ScheduledTask {
     pub prompt: String,
     pub executor: String,
     pub schedule: Schedule,
+    #[serde(default)]
+    pub notify: NotifyPolicy,
     pub enabled: bool,
     pub owner_session_key: String,
     pub requester_user_id: Option<String>,
@@ -153,6 +178,8 @@ pub struct CreateTask {
     pub prompt: String,
     pub schedule: Schedule,
     pub executor: Option<String>,
+    #[serde(default)]
+    pub notify: NotifyPolicy,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -162,6 +189,7 @@ pub struct UpdateTask {
     pub prompt: Option<String>,
     pub schedule: Option<Schedule>,
     pub executor: Option<String>,
+    pub notify: Option<NotifyPolicy>,
     pub enabled: Option<bool>,
 }
 
@@ -256,6 +284,7 @@ impl Scheduler {
             prompt: request.prompt,
             executor,
             schedule: request.schedule,
+            notify: request.notify,
             enabled: true,
             owner_session_key: scope.owner_session_key.clone(),
             requester_user_id: scope.requester_user_id.clone(),
