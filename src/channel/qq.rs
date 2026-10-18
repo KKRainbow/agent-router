@@ -2206,6 +2206,7 @@ mod tests {
         assert!(failures[1].starts_with("c.pdf:"), "{}", failures[1]);
     }
 
+    #[test]
     fn parses_numeric_and_string_expiry_values() {
         assert_eq!(value_as_u64(&json!(12)), Some(12));
         assert_eq!(value_as_u64(&json!("34")), Some(34));
