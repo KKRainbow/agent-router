@@ -11,7 +11,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
@@ -353,11 +353,27 @@ impl QqBotChannel {
             attachment_count = message.attachments.len(),
             "routing QQ message"
         );
-        let sync = if context_allowed {
+        let QqAttachmentSync {
+            request,
+            mut failures,
+            admission,
+        } = if context_allowed {
             self.sync_attachments(&message).await
         } else {
             QqAttachmentSync::default()
         };
+        // Sync before the turn: a turn that a newer message supersedes never
+        // commits its context, and losing a one-shot attachment would be
+        // silent. The admission is released once the router has written the
+        // buffered attachments out.
+        if let Some(request) = request
+            && let Err(err) = router.sync_context(request).await
+        {
+            let reason = format!("{err:#}");
+            tracing::warn!(session_key = %message.session_key, error = %reason, "QQ attachment context sync failed");
+            failures.push(reason);
+        }
+        drop(admission);
         let mut output = ChannelOutputSink::new(
             QqReplyPort {
                 channel: self.clone(),
@@ -367,11 +383,9 @@ impl QqBotChannel {
             message.target,
             qq_output_policy(self.cfg.channel_events),
         );
-        let result = router
-            .finish_channel_input(ticket, sync.request, &mut output)
-            .await;
-        if !sync.failures.is_empty() {
-            self.report_attachment_failures(&message.session_key, &sync.failures)
+        let result = router.finish_channel_input(ticket, None, &mut output).await;
+        if !failures.is_empty() {
+            self.report_attachment_failures(&message.session_key, &failures)
                 .await;
         }
         result
@@ -381,6 +395,18 @@ impl QqBotChannel {
         if message.attachments.is_empty() {
             return QqAttachmentSync::default();
         }
+        // One admission covers the whole message: its attachments stay
+        // buffered until the router has written them out.
+        let admission = match self.attachments.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                tracing::warn!(error = %err, "QQ attachment admission is closed");
+                return QqAttachmentSync {
+                    failures: vec![format!("attachment sync unavailable: {err}")],
+                    ..QqAttachmentSync::default()
+                };
+            }
+        };
         let unit = qq_message_unit(&message.msg_id, message.msg_idx.as_deref());
         let mut downloaded = Vec::new();
         let mut unresolved = Vec::new();
@@ -403,17 +429,10 @@ impl QqBotChannel {
                 failures.push(reason);
                 break;
             }
-            // Bound concurrent downloads: each message may hold its own
-            // attachment bytes in memory until the turn consumes them.
-            let permit = self.attachments.acquire().await;
-            let result = match permit {
-                Ok(_permit) => {
-                    self.download_attachment(message, attachment, index, byte_cap)
-                        .await
-                }
-                Err(err) => Err(anyhow::anyhow!("download semaphore is closed: {err}")),
-            };
-            match result {
+            match self
+                .download_attachment(message, attachment, index, byte_cap)
+                .await
+            {
                 Ok(file) => {
                     committed += file.bytes.len();
                     downloaded.push(file);
@@ -439,6 +458,7 @@ impl QqBotChannel {
         QqAttachmentSync {
             request: Some(qq_context_request(message, downloaded, unresolved)),
             failures,
+            admission: Some(admission),
         }
     }
 
@@ -1029,6 +1049,10 @@ struct DownloadedQqAttachment {
 struct QqAttachmentSync {
     request: Option<ContextSyncRequest>,
     failures: Vec<String>,
+    // Held from the first download until the router has consumed the buffered
+    // attachments, so retained attachment bytes stay bounded by
+    // QQ_ATTACHMENT_MAX_CONCURRENT * QQ_ATTACHMENT_MESSAGE_MAX_BYTES.
+    admission: Option<OwnedSemaphorePermit>,
 }
 
 fn parse_inbound_message(event_type: &str, data: &Value) -> Option<QqInboundMessage> {
