@@ -1269,6 +1269,24 @@ impl PiRpcSession {
                     pending_thinking.clear();
                     return Ok(false);
                 }
+                if let Some(assistant) =
+                    message
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .and_then(|messages| {
+                            messages.iter().rev().find(|message| {
+                                message.get("role").and_then(Value::as_str) == Some("assistant")
+                            })
+                        })
+                    && assistant.get("stopReason").and_then(Value::as_str) == Some("error")
+                {
+                    let error = assistant
+                        .get("errorMessage")
+                        .and_then(Value::as_str)
+                        .filter(|error| !error.trim().is_empty())
+                        .unwrap_or("Pi model request failed");
+                    anyhow::bail!("{error}");
+                }
                 pending_text_progress.clear();
                 pending_thinking.flush(events).await?;
                 *agent_end_final_text = extract_agent_end_final_text(message);
@@ -2039,12 +2057,13 @@ def response(cmd, command, success=True, data=None, error=None):
         obj["error"] = error
     send(obj)
 
-def agent_end(text="", will_retry=False):
+def agent_end(text="", will_retry=False, error=None):
     send({
         "type": "agent_end",
         "willRetry": will_retry,
         "messages": [
-            {"role": "assistant", "content": [{"type": "text", "text": text}]}
+            {"role": "assistant", "content": [{"type": "text", "text": text}],
+             "stopReason": "error" if error is not None else "stop", "errorMessage": error}
         ],
     })
 
@@ -2260,11 +2279,16 @@ while True:
         elif scenario == "will_retry":
             response(cmd, "prompt")
             text_delta("old")
-            agent_end("old", True)
+            agent_end("old", True, "temporary failure")
             send({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 2, "delayMs": 1, "errorMessage": "try again"})
             send({"type": "auto_retry_end", "success": True, "attempt": 1})
             text_delta("new")
             agent_end("new")
+        elif scenario in ("model_error", "model_error_after_text", "model_error_without_detail"):
+            response(cmd, "prompt")
+            if scenario == "model_error_after_text":
+                text_delta("partial answer")
+            agent_end(error="" if scenario == "model_error_without_detail" else "401 API key expired")
         elif scenario == "thinking_then_text":
             response(cmd, "prompt")
             thinking_delta("investig")
@@ -2954,6 +2978,33 @@ while True:
                 .iter()
                 .any(|update| update.kind == "agent_progress" && update.title == "Retry")
         );
+    }
+
+    #[tokio::test]
+    async fn model_error_returns_failed_outcome_instead_of_empty_or_partial_success() {
+        for (scenario, expected) in [
+            ("model_error", "401 API key expired"),
+            ("model_error_after_text", "401 API key expired"),
+            ("model_error_without_detail", "Pi model request failed"),
+        ] {
+            let fake = FakePi::new();
+            let (manager, _) = fake.manager(scenario);
+            prepare(&manager, None).await;
+            let mut events = CollectingExecutorEventSink::default();
+            let error = manager
+                .prompt(
+                    ExecutorPromptRequest {
+                        turn: turn(1),
+                        prompt: "hello".to_string(),
+                        user_id: None,
+                    },
+                    &mut events,
+                    TurnCancellation::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{scenario}: {error}");
+        }
     }
 
     #[tokio::test]

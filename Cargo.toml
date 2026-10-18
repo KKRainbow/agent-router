@@ -37,4 +37,5 @@ uuid = { version = "1.23.4", features = ["v4"] }
 junction = "2.1"
 
 [dev-dependencies]
+tokio = { version = "1.48", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

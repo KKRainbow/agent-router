@@ -82,6 +82,18 @@ impl QqBotChannel {
         tracing::info!("connecting QQ gateway");
         let (stream, _) = connect_async(gateway_url).await?;
         tracing::info!("connected QQ gateway");
+        self.run_gateway(stream, &token, router).await
+    }
+
+    async fn run_gateway<S>(
+        &self,
+        stream: tokio_tungstenite::WebSocketStream<S>,
+        token: &str,
+        router: Arc<dyn RouterService>,
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (mut sink, mut stream) = stream.split();
 
         let hello = stream
@@ -126,13 +138,27 @@ impl QqBotChannel {
                 .await?;
         }
 
-        let mut heartbeat = tokio::time::interval(Duration::from_millis(heartbeat_interval));
+        anyhow::ensure!(
+            heartbeat_interval > 0,
+            "QQ heartbeat interval must be positive"
+        );
+        let heartbeat_interval = Duration::from_millis(heartbeat_interval);
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
+        let mut heartbeat_ack_deadline = None;
 
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
-                    send_heartbeat(&mut sink, sequence).await?;
+                    if heartbeat_ack_deadline.is_none() {
+                        send_heartbeat(&mut sink, sequence, heartbeat_interval).await?;
+                        heartbeat_ack_deadline = Some(tokio::time::Instant::now() + heartbeat_interval);
+                    }
+                }
+                _ = tokio::time::sleep_until(heartbeat_ack_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if heartbeat_ack_deadline.is_some() => {
+                    anyhow::bail!("QQ heartbeat ACK timed out");
                 }
                 frame = stream.next() => {
                     let Some(frame) = frame else {
@@ -140,13 +166,16 @@ impl QqBotChannel {
                     };
                     match frame? {
                         Message::Text(text) => {
-                            self.handle_gateway_payload(text.as_ref(), &mut sink, &mut sequence, router.clone()).await?;
+                            self.handle_gateway_payload(text.as_ref(), &mut sink, &mut sequence, &mut heartbeat_ack_deadline, heartbeat_interval, router.clone()).await?;
                         }
                         Message::Binary(bytes) => {
                             let text = String::from_utf8(bytes.to_vec())?;
-                            self.handle_gateway_payload(&text, &mut sink, &mut sequence, router.clone()).await?;
+                            self.handle_gateway_payload(&text, &mut sink, &mut sequence, &mut heartbeat_ack_deadline, heartbeat_interval, router.clone()).await?;
                         }
-                        Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
+                        Message::Ping(payload) => {
+                            tokio::time::timeout(heartbeat_interval, sink.send(Message::Pong(payload)))
+                                .await.map_err(|_| anyhow::anyhow!("QQ pong write timed out"))??;
+                        }
                         Message::Close(close) => {
                             anyhow::bail!("QQ gateway closed: {close:?}");
                         }
@@ -162,6 +191,8 @@ impl QqBotChannel {
         text: &str,
         sink: &mut S,
         sequence: &mut Option<i64>,
+        heartbeat_ack_deadline: &mut Option<tokio::time::Instant>,
+        heartbeat_interval: Duration,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()>
     where
@@ -202,13 +233,17 @@ impl QqBotChannel {
                 }
                 self.handle_dispatch(&event_type, data, router).await?;
             }
-            1 => send_heartbeat(sink, *sequence).await?,
+            1 => {
+                send_heartbeat(sink, *sequence, heartbeat_interval).await?;
+                heartbeat_ack_deadline
+                    .get_or_insert(tokio::time::Instant::now() + heartbeat_interval);
+            }
             7 => anyhow::bail!("QQ gateway requested reconnect"),
             9 => {
                 self.clear_gateway_session().await;
                 anyhow::bail!("QQ gateway reported invalid session");
             }
-            11 => {}
+            11 => *heartbeat_ack_deadline = None,
             _ => {}
         }
         Ok(())
@@ -848,14 +883,22 @@ fn parse_group_at_message(event_type: &str, data: &Value) -> Option<QqInboundMes
     })
 }
 
-async fn send_heartbeat<S>(sink: &mut S, sequence: Option<i64>) -> anyhow::Result<()>
+async fn send_heartbeat<S>(
+    sink: &mut S,
+    sequence: Option<i64>,
+    timeout: Duration,
+) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    sink.send(Message::Text(
-        json!({"op": 1, "d": sequence}).to_string().into(),
-    ))
-    .await?;
+    tokio::time::timeout(
+        timeout,
+        sink.send(Message::Text(
+            json!({"op": 1, "d": sequence}).to_string().into(),
+        )),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("QQ heartbeat write timed out"))??;
     Ok(())
 }
 
@@ -941,6 +984,120 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    async fn test_gateway() -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+        let (client, server) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let channel = QqBotChannel::new(
+            QqConfig {
+                enabled: true,
+                app_id: String::new(),
+                client_secret: String::new(),
+                sandbox: false,
+                intents: 0,
+                channel_events: ChannelEventMode::Off,
+                allowed_users: BTreeSet::new(),
+                allowed_groups: BTreeSet::new(),
+            },
+            Arc::new(ApprovalBroker::default()),
+        );
+        let task = tokio::spawn(async move {
+            channel
+                .run_gateway(client, "test-token", Arc::new(RecordingRouter::default()))
+                .await
+        });
+        server
+            .send(Message::Text(
+                json!({"op": 10, "d": {"heartbeat_interval": 1000}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let identify = server.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(identify.to_text().unwrap()).unwrap()["op"],
+            2
+        );
+        server
+            .send(Message::Text(
+                json!({"op": 0, "t": "READY", "s": 42, "d": {"session_id": "test-session"}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        (task, server)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_missing_heartbeat_ack_disconnects_even_with_other_frames() {
+        let (task, mut server) = test_gateway().await;
+        let heartbeat = server.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(heartbeat.to_text().unwrap()).unwrap(),
+            json!({"op": 1, "d": 42})
+        );
+        server.send(Message::Ping(vec![1].into())).await.unwrap();
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Pong(_)
+        ));
+        let sent_at = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        server
+            .send(Message::Text(json!({"op": 1}).to_string().into()))
+            .await
+            .unwrap();
+        let heartbeat = server.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(heartbeat.to_text().unwrap()).unwrap()["op"],
+            1
+        );
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("heartbeat ACK timed out"));
+        assert_eq!(sent_at.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_heartbeat_ack_keeps_connection_alive() {
+        let (task, mut server) = test_gateway().await;
+        for _ in 0..3 {
+            let heartbeat = server.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(heartbeat.to_text().unwrap()).unwrap()["op"],
+                1
+            );
+            server
+                .send(Message::Text(json!({"op": 11}).to_string().into()))
+                .await
+                .unwrap();
+        }
+        server
+            .send(Message::Text(json!({"op": 7}).to_string().into()))
+            .await
+            .unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("requested reconnect"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_write_times_out_when_peer_stops_reading() {
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+        let (client, _server) = tokio::io::duplex(1);
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let error = send_heartbeat(&mut client, None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("heartbeat write timed out"));
+    }
 
     #[derive(Debug, Default)]
     struct RecordingRouter {
