@@ -11,7 +11,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
@@ -43,6 +43,8 @@ const QQ_REPLY_CHECKPOINT_MIN_GROWTH: usize = 500;
 const QQ_ATTACHMENT_HOSTS: [&str; 4] = ["qq.com", "qq.com.cn", "qpic.cn", "gtimg.cn"];
 const QQ_ATTACHMENT_KIND: &str = "qq_file";
 const QQ_ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
+const QQ_ATTACHMENT_MESSAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const QQ_ATTACHMENT_MAX_CONCURRENT: usize = 2;
 const QQ_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const QQ_ATTACHMENT_PLACEHOLDER: &str = "[attachment]";
 const QQ_ATTACHMENT_NOTICE_LIMIT: usize = 3;
@@ -55,6 +57,7 @@ pub struct QqBotChannel {
     approvals: SharedApprovalBroker,
     http: Client,
     attachment_http: Client,
+    attachments: Arc<Semaphore>,
     access_token: Arc<Mutex<Option<CachedAccessToken>>>,
     gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
@@ -69,6 +72,7 @@ impl QqBotChannel {
             approvals,
             http: Client::new(),
             attachment_http: qq_attachment_http_client(),
+            attachments: Arc::new(Semaphore::new(QQ_ATTACHMENT_MAX_CONCURRENT)),
             access_token: Arc::new(Mutex::new(None)),
             gateway_session: Arc::new(Mutex::new(QqGatewaySession::default())),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(1024))),
@@ -377,12 +381,43 @@ impl QqBotChannel {
         if message.attachments.is_empty() {
             return QqAttachmentSync::default();
         }
+        let unit = qq_message_unit(&message.msg_id, message.msg_idx.as_deref());
         let mut downloaded = Vec::new();
         let mut unresolved = Vec::new();
         let mut failures = Vec::new();
+        let mut committed = 0;
         for (index, attachment) in message.attachments.iter().enumerate() {
-            match self.download_attachment(message, attachment, index).await {
-                Ok(file) => downloaded.push(file),
+            let byte_cap = qq_attachment_byte_cap(committed);
+            if byte_cap == 0 {
+                let skipped = message.attachments.len() - index;
+                let reason = format!(
+                    "{skipped} attachment(s) skipped: message exceeds \
+                     {QQ_ATTACHMENT_MESSAGE_MAX_BYTES} bytes of attachments"
+                );
+                tracing::warn!(message_id = %message.msg_id, error = %reason, "QQ attachment sync stopped");
+                unresolved.push(ContextSyncIssueInput {
+                    kind: QQ_ATTACHMENT_KIND.to_string(),
+                    reference: qq_attachment_reference(&unit, index),
+                    reason: reason.clone(),
+                });
+                failures.push(reason);
+                break;
+            }
+            // Bound concurrent downloads: each message may hold its own
+            // attachment bytes in memory until the turn consumes them.
+            let permit = self.attachments.acquire().await;
+            let result = match permit {
+                Ok(_permit) => {
+                    self.download_attachment(message, attachment, index, byte_cap)
+                        .await
+                }
+                Err(err) => Err(anyhow::anyhow!("download semaphore is closed: {err}")),
+            };
+            match result {
+                Ok(file) => {
+                    committed += file.bytes.len();
+                    downloaded.push(file);
+                }
                 Err(err) => {
                     let reason = format!("{err:#}");
                     let name = qq_attachment_label(attachment, index);
@@ -394,7 +429,7 @@ impl QqBotChannel {
                     );
                     unresolved.push(ContextSyncIssueInput {
                         kind: QQ_ATTACHMENT_KIND.to_string(),
-                        reference: qq_attachment_reference(&message.msg_id, index),
+                        reference: qq_attachment_reference(&unit, index),
                         reason: reason.clone(),
                     });
                     failures.push(format!("{name}: {reason}"));
@@ -412,11 +447,12 @@ impl QqBotChannel {
         message: &QqInboundMessage,
         attachment: &QqAttachment,
         index: usize,
+        byte_cap: usize,
     ) -> anyhow::Result<DownloadedQqAttachment> {
         let url = parse_qq_attachment_url(&attachment.url)?;
         anyhow::ensure!(
-            attachment.size <= QQ_ATTACHMENT_MAX_BYTES as u64,
-            "file exceeds {QQ_ATTACHMENT_MAX_BYTES} bytes"
+            attachment.size <= byte_cap as u64,
+            "file exceeds the {byte_cap} byte attachment budget left for this message"
         );
         tracing::info!(
             message_id = %message.msg_id,
@@ -431,32 +467,37 @@ impl QqBotChannel {
             .get(url)
             .send()
             .await
-            .map_err(|err| anyhow::anyhow!("download request failed: {err}"))?;
+            .map_err(|err| anyhow::anyhow!("download request failed: {}", err.without_url()))?;
         if !response.status().is_success() {
             anyhow::bail!("download rejected with {}", response.status());
         }
         if response
             .content_length()
-            .is_some_and(|length| length > QQ_ATTACHMENT_MAX_BYTES as u64)
+            .is_some_and(|length| length > byte_cap as u64)
         {
-            anyhow::bail!("file exceeds {QQ_ATTACHMENT_MAX_BYTES} bytes");
+            anyhow::bail!(
+                "file exceeds the {byte_cap} byte attachment budget left for this message"
+            );
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|err| anyhow::anyhow!("download read failed: {err}"))?
+            .map_err(|err| anyhow::anyhow!("download read failed: {}", err.without_url()))?
         {
-            if bytes.len() + chunk.len() > QQ_ATTACHMENT_MAX_BYTES {
-                anyhow::bail!("file exceeds {QQ_ATTACHMENT_MAX_BYTES} bytes");
+            if bytes.len() + chunk.len() > byte_cap {
+                anyhow::bail!(
+                    "file exceeds the {byte_cap} byte attachment budget left for this message"
+                );
             }
             bytes.extend_from_slice(&chunk);
         }
         let name = qq_attachment_label(attachment, index);
-        let relative_path = PathBuf::from("qq")
-            .join("files")
-            .join(sanitize_path_segment(&message.msg_id))
-            .join(sanitize_path_segment(&name));
+        let relative_path = qq_attachment_relative_path(
+            &qq_message_unit(&message.msg_id, message.msg_idx.as_deref()),
+            &name,
+            index,
+        );
         Ok(DownloadedQqAttachment {
             attachment: attachment.clone(),
             index,
@@ -957,6 +998,7 @@ impl QqReplyTarget {
 struct QqInboundMessage {
     event_key: String,
     msg_id: String,
+    msg_idx: Option<String>,
     session_key: String,
     user_id: String,
     group_id: Option<String>,
@@ -995,6 +1037,40 @@ fn parse_inbound_message(event_type: &str, data: &Value) -> Option<QqInboundMess
         "GROUP_AT_MESSAGE_CREATE" => parse_group_at_message(event_type, data),
         _ => None,
     }
+}
+
+/// The same `msg_id` may cover several pushed messages, and a retry of one
+/// message repeats its `msg_idx`; both are part of the identity.
+fn qq_event_key(event_type: &str, msg_id: &str, msg_idx: Option<&str>) -> String {
+    match msg_idx {
+        Some(msg_idx) => format!("{event_type}:{msg_id}:{msg_idx}"),
+        None => format!("{event_type}:{msg_id}"),
+    }
+}
+
+fn qq_message_unit(msg_id: &str, msg_idx: Option<&str>) -> String {
+    match msg_idx {
+        Some(msg_idx) => format!("{msg_id}:{msg_idx}"),
+        None => msg_id.to_string(),
+    }
+}
+
+fn qq_parse_message_idx(data: &Value) -> Option<String> {
+    data.get("message_scene")?
+        .get("ext")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|entry| entry.strip_prefix("msg_idx="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// A message may carry several attachments; keep the whole message inside one
+/// byte budget so a single event cannot reserve unbounded memory.
+fn qq_attachment_byte_cap(committed: usize) -> usize {
+    QQ_ATTACHMENT_MAX_BYTES.min(QQ_ATTACHMENT_MESSAGE_MAX_BYTES.saturating_sub(committed))
 }
 
 fn parse_attachments(data: &Value) -> Vec<QqAttachment> {
@@ -1036,8 +1112,18 @@ fn qq_attachment_label(attachment: &QqAttachment, index: usize) -> String {
     raw.chars().filter(|ch| !ch.is_control()).take(80).collect()
 }
 
-fn qq_attachment_reference(msg_id: &str, index: usize) -> String {
-    format!("{msg_id}:{index}")
+fn qq_attachment_reference(unit: &str, index: usize) -> String {
+    format!("{unit}:{index}")
+}
+
+/// Two attachments of one message may share a name, so the index keeps their
+/// files apart even after the name is sanitized.
+fn qq_attachment_relative_path(unit: &str, name: &str, index: usize) -> PathBuf {
+    PathBuf::from("qq")
+        .join("files")
+        .join(sanitize_path_segment(unit))
+        .join(index.to_string())
+        .join(sanitize_path_segment(name))
 }
 
 /// Attachment-only messages carry no text; keep a placeholder so the turn still
@@ -1061,6 +1147,7 @@ fn qq_message_text(text: String, attachments: &[QqAttachment]) -> String {
 
 fn parse_c2c_message(event_type: &str, data: &Value) -> Option<QqInboundMessage> {
     let msg_id = data.get("id").and_then(Value::as_str)?.to_string();
+    let msg_idx = qq_parse_message_idx(data);
     let author = data.get("author")?;
     let user_id = author
         .get("user_openid")
@@ -1078,8 +1165,9 @@ fn parse_c2c_message(event_type: &str, data: &Value) -> Option<QqInboundMessage>
         return None;
     }
     Some(QqInboundMessage {
-        event_key: format!("{event_type}:{msg_id}"),
+        event_key: qq_event_key(event_type, &msg_id, msg_idx.as_deref()),
         msg_id,
+        msg_idx,
         session_key: format!("qq:c2c:{user_id}"),
         user_id: user_id.clone(),
         group_id: None,
@@ -1091,6 +1179,7 @@ fn parse_c2c_message(event_type: &str, data: &Value) -> Option<QqInboundMessage>
 
 fn parse_group_at_message(event_type: &str, data: &Value) -> Option<QqInboundMessage> {
     let msg_id = data.get("id").and_then(Value::as_str)?.to_string();
+    let msg_idx = qq_parse_message_idx(data);
     let group_id = data
         .get("group_openid")
         .and_then(Value::as_str)?
@@ -1112,8 +1201,9 @@ fn parse_group_at_message(event_type: &str, data: &Value) -> Option<QqInboundMes
         return None;
     }
     Some(QqInboundMessage {
-        event_key: format!("{event_type}:{msg_id}"),
+        event_key: qq_event_key(event_type, &msg_id, msg_idx.as_deref()),
         msg_id,
+        msg_idx,
         session_key: format!("qq:group:{group_id}"),
         user_id,
         group_id: Some(group_id.clone()),
@@ -1160,10 +1250,11 @@ fn qq_context_request(
     downloaded: Vec<DownloadedQqAttachment>,
     unresolved: Vec<ContextSyncIssueInput>,
 ) -> ContextSyncRequest {
+    let unit = qq_message_unit(&message.msg_id, message.msg_idx.as_deref());
     let artifacts = downloaded
         .into_iter()
         .map(|file| {
-            let reference = qq_attachment_reference(&message.msg_id, file.index);
+            let reference = qq_attachment_reference(&unit, file.index);
             let mut metadata = BTreeMap::new();
             metadata.insert("message_id".to_string(), json!(message.msg_id));
             metadata.insert("filename".to_string(), json!(file.name));
@@ -1177,7 +1268,7 @@ fn qq_context_request(
                 json!([{"kind": QQ_ATTACHMENT_KIND, "reference": reference}]),
             );
             ContextArtifactInput {
-                id: format!("qq:file:{}:{}", message.msg_id, file.index),
+                id: format!("qq:file:{unit}:{}", file.index),
                 kind: QQ_ATTACHMENT_KIND.to_string(),
                 title: format!("QQ attachment: {}", file.name),
                 source_locator: None,
@@ -1686,6 +1777,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn message_idx_separates_events_that_share_a_message_id() {
+        let first = json!({
+            "id": "m5",
+            "content": "",
+            "author": { "user_openid": "u_open" },
+            "message_scene": { "source": "default", "ext": ["msg_idx=REFIDX_one=="] },
+            "attachments": [{ "url": "https://gchat.qpic.cn/a.png", "filename": "a.png" }]
+        });
+        let second = json!({
+            "id": "m5",
+            "content": "",
+            "author": { "user_openid": "u_open" },
+            "message_scene": { "source": "default", "ext": ["msg_idx=REFIDX_two=="] },
+            "attachments": [{ "url": "https://gchat.qpic.cn/b.png", "filename": "b.png" }]
+        });
+        let retry = second.clone();
+
+        let first = parse_inbound_message("C2C_MESSAGE_CREATE", &first).unwrap();
+        let second = parse_inbound_message("C2C_MESSAGE_CREATE", &second).unwrap();
+        let retry = parse_inbound_message("C2C_MESSAGE_CREATE", &retry).unwrap();
+
+        assert_eq!(first.msg_idx.as_deref(), Some("REFIDX_one=="));
+        assert_ne!(first.event_key, second.event_key);
+        // A retry of one message repeats its index and stays deduplicated.
+        assert_eq!(second.event_key, retry.event_key);
+        assert_ne!(
+            qq_message_unit(&first.msg_id, first.msg_idx.as_deref()),
+            qq_message_unit(&second.msg_id, second.msg_idx.as_deref())
+        );
+    }
+
+    #[test]
+    fn attachment_paths_keep_same_named_files_apart() {
+        let unit = qq_message_unit("ROBOT1.0_msg", Some("REFIDX_one=="));
+
+        assert_eq!(
+            qq_attachment_relative_path(&unit, "协议 v2.pdf", 0),
+            PathBuf::from("qq/files/ROBOT1.0_msg-REFIDX_one/0/v2.pdf")
+        );
+        assert_ne!(
+            qq_attachment_relative_path(&unit, "same.pdf", 0),
+            qq_attachment_relative_path(&unit, "same.pdf", 1)
+        );
+        // Chinese names sanitize to the same segment, so the index is what
+        // keeps two attachments of one message apart.
+        assert_eq!(
+            sanitize_path_segment("甲.pdf"),
+            sanitize_path_segment("乙.pdf")
+        );
+        assert_ne!(
+            qq_attachment_relative_path(&unit, "甲.pdf", 0),
+            qq_attachment_relative_path(&unit, "乙.pdf", 1)
+        );
+    }
+
+    #[test]
+    fn attachment_byte_cap_shrinks_with_the_message_budget() {
+        assert_eq!(qq_attachment_byte_cap(0), QQ_ATTACHMENT_MAX_BYTES);
+        assert_eq!(
+            qq_attachment_byte_cap(QQ_ATTACHMENT_MESSAGE_MAX_BYTES - 1024),
+            1024
+        );
+        assert_eq!(qq_attachment_byte_cap(QQ_ATTACHMENT_MESSAGE_MAX_BYTES), 0);
+        assert_eq!(
+            qq_attachment_byte_cap(QQ_ATTACHMENT_MESSAGE_MAX_BYTES + 1),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn slash_command_does_not_preempt() {
         let channel = QqBotChannel::new(
@@ -1861,6 +2022,7 @@ mod tests {
             user_id: "u1".to_string(),
             group_id: Some("g1".to_string()),
             text: "old".to_string(),
+            msg_idx: None,
             attachments: Vec::new(),
             target: QqReplyTarget::Group {
                 group_openid: "old_group".to_string(),
@@ -1873,6 +2035,7 @@ mod tests {
             user_id: "u1".to_string(),
             group_id: Some("g1".to_string()),
             text: "new".to_string(),
+            msg_idx: None,
             attachments: Vec::new(),
             target: QqReplyTarget::Group {
                 group_openid: "new_group".to_string(),
