@@ -409,18 +409,15 @@ impl QqBotChannel {
         for (index, attachment) in message.attachments.iter().enumerate() {
             let byte_cap = qq_attachment_byte_cap(committed);
             if byte_cap == 0 {
-                let skipped = message.attachments.len() - index;
-                let reason = format!(
-                    "{skipped} attachment(s) skipped: message exceeds \
-                     {QQ_ATTACHMENT_MESSAGE_MAX_BYTES} bytes of attachments"
+                tracing::warn!(
+                    message_id = %message.msg_id,
+                    skipped = message.attachments.len() - index,
+                    "QQ attachment sync stopped at the message budget"
                 );
-                tracing::warn!(message_id = %message.msg_id, error = %reason, "QQ attachment sync stopped");
-                unresolved.push(ContextSyncIssueInput {
-                    kind: QQ_ATTACHMENT_KIND.to_string(),
-                    reference: qq_attachment_reference(&unit, index),
-                    reason: reason.clone(),
-                });
-                failures.push(reason);
+                let (skipped_issues, skipped_failures) =
+                    qq_budget_skipped_attachments(message, &unit, index);
+                unresolved.extend(skipped_issues);
+                failures.extend(skipped_failures);
                 break;
             }
             match self
@@ -1151,6 +1148,29 @@ fn qq_message_unit_digest(unit: &str) -> String {
     hasher.update(unit.as_bytes());
     let digest = hasher.finalize();
     format!("{digest:x}")[..24].to_string()
+}
+
+/// Every attachment the message budget skipped gets its own issue, so the
+/// notice and the manifest agree on how many were skipped.
+fn qq_budget_skipped_attachments(
+    message: &QqInboundMessage,
+    unit: &str,
+    from: usize,
+) -> (Vec<ContextSyncIssueInput>, Vec<String>) {
+    let reason =
+        format!("skipped: message exceeds {QQ_ATTACHMENT_MESSAGE_MAX_BYTES} bytes of attachments");
+    let mut unresolved = Vec::new();
+    let mut failures = Vec::new();
+    for index in from..message.attachments.len() {
+        let name = qq_attachment_label(&message.attachments[index], index);
+        unresolved.push(ContextSyncIssueInput {
+            kind: QQ_ATTACHMENT_KIND.to_string(),
+            reference: qq_attachment_reference(unit, index),
+            reason: reason.clone(),
+        });
+        failures.push(format!("{name}: {reason}"));
+    }
+    (unresolved, failures)
 }
 
 /// Attachment-only messages carry no text; keep a placeholder so the turn still
@@ -2126,7 +2146,41 @@ mod tests {
         assert_eq!(*router.synced.lock().await, 0);
     }
 
+    fn qq_attachment_message(msg_id: &str, names: &[&str]) -> QqInboundMessage {
+        let attachments = names
+            .iter()
+            .map(|name| json!({ "url": "https://gchat.qpic.cn/x", "filename": name }))
+            .collect::<Vec<_>>();
+        parse_inbound_message(
+            "C2C_MESSAGE_CREATE",
+            &json!({
+                "id": msg_id,
+                "content": "",
+                "author": {
+                    "user_openid": "u_open"
+                },
+                "attachments": attachments
+            }),
+        )
+        .unwrap()
+    }
+
     #[test]
+    fn budget_skips_are_reported_per_attachment() {
+        let message = qq_attachment_message("m-budget", &["a.pdf", "b.pdf", "c.pdf"]);
+        let unit = qq_message_unit(&message.msg_id, None);
+
+        let (unresolved, failures) = qq_budget_skipped_attachments(&message, &unit, 1);
+
+        assert_eq!(unresolved.len(), 2);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(unresolved[0].reference, format!("{unit}:1"));
+        assert_eq!(unresolved[1].reference, format!("{unit}:2"));
+        assert!(unresolved[0].reason.contains("skipped"));
+        assert!(failures[0].starts_with("b.pdf:"), "{}", failures[0]);
+        assert!(failures[1].starts_with("c.pdf:"), "{}", failures[1]);
+    }
+
     fn parses_numeric_and_string_expiry_values() {
         assert_eq!(value_as_u64(&json!(12)), Some(12));
         assert_eq!(value_as_u64(&json!("34")), Some(34));
