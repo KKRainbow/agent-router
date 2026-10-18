@@ -11,6 +11,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -355,25 +356,13 @@ impl QqBotChannel {
         );
         let QqAttachmentSync {
             request,
-            mut failures,
+            failures,
             admission,
         } = if context_allowed {
             self.sync_attachments(&message).await
         } else {
             QqAttachmentSync::default()
         };
-        // Sync before the turn: a turn that a newer message supersedes never
-        // commits its context, and losing a one-shot attachment would be
-        // silent. The admission is released once the router has written the
-        // buffered attachments out.
-        if let Some(request) = request
-            && let Err(err) = router.sync_context(request).await
-        {
-            let reason = format!("{err:#}");
-            tracing::warn!(session_key = %message.session_key, error = %reason, "QQ attachment context sync failed");
-            failures.push(reason);
-        }
-        drop(admission);
         let mut output = ChannelOutputSink::new(
             QqReplyPort {
                 channel: self.clone(),
@@ -383,7 +372,12 @@ impl QqBotChannel {
             message.target,
             qq_output_policy(self.cfg.channel_events),
         );
-        let result = router.finish_channel_input(ticket, None, &mut output).await;
+        // The turn owns the context commit, so the admission lives until it
+        // finishes: a superseded turn ends right away and frees it.
+        let result = router
+            .finish_channel_input(ticket, request, &mut output)
+            .await;
+        drop(admission);
         if !failures.is_empty() {
             self.report_attachment_failures(&message.session_key, &failures)
                 .await;
@@ -1141,13 +1135,22 @@ fn qq_attachment_reference(unit: &str, index: usize) -> String {
 }
 
 /// Two attachments of one message may share a name, so the index keeps their
-/// files apart even after the name is sanitized.
+/// files apart even after the name is sanitized. The directory is a digest of
+/// the full message identity: platform ids exceed the path-segment limit, and
+/// a truncated id would make two messages share one directory.
 fn qq_attachment_relative_path(unit: &str, name: &str, index: usize) -> PathBuf {
     PathBuf::from("qq")
         .join("files")
-        .join(sanitize_path_segment(unit))
+        .join(qq_message_unit_digest(unit))
         .join(index.to_string())
         .join(sanitize_path_segment(name))
+}
+
+fn qq_message_unit_digest(unit: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(unit.as_bytes());
+    let digest = hasher.finalize();
+    format!("{digest:x}")[..24].to_string()
 }
 
 /// Attachment-only messages carry no text; keep a placeholder so the turn still
@@ -1281,6 +1284,9 @@ fn qq_context_request(
             let reference = qq_attachment_reference(&unit, file.index);
             let mut metadata = BTreeMap::new();
             metadata.insert("message_id".to_string(), json!(message.msg_id));
+            if let Some(msg_idx) = message.msg_idx.as_deref() {
+                metadata.insert("message_idx".to_string(), json!(msg_idx));
+            }
             metadata.insert("filename".to_string(), json!(file.name));
             metadata.insert("size_bytes".to_string(), json!(file.bytes.len()));
             metadata.insert(
@@ -1411,7 +1417,9 @@ mod tests {
         ChannelRouteTicket, RouterInput, RouterOutputSink, TurnBeginMode, TurnReservation,
     };
     use crate::session::ContextSyncRequest;
+    use crate::session::context::{read_context_artifacts_from_manifest, write_context_sync};
     use serde_json::json;
+    use std::path::Path;
     use tokio::sync::Mutex;
 
     use super::*;
@@ -1565,6 +1573,9 @@ mod tests {
     struct IntakeOnlyRouter {
         began: Mutex<Vec<ChannelInput>>,
         finished: Mutex<usize>,
+        contexts: Mutex<Vec<Option<ContextSyncRequest>>>,
+        synced: Mutex<usize>,
+        allow_context: bool,
     }
 
     #[async_trait::async_trait]
@@ -1576,17 +1587,23 @@ mod tests {
             self.began.lock().await.push(input.clone());
             Ok(ChannelIntakeOutcome::Route {
                 ticket: ChannelRouteTicket::for_test(input),
-                context_allowed: false,
+                context_allowed: self.allow_context,
             })
+        }
+
+        async fn sync_context(&self, _request: ContextSyncRequest) -> anyhow::Result<()> {
+            *self.synced.lock().await += 1;
+            Ok(())
         }
 
         async fn finish_channel_input(
             &self,
             _ticket: ChannelRouteTicket,
-            _context: Option<ContextSyncRequest>,
+            context: Option<ContextSyncRequest>,
             _output: &mut dyn RouterOutputSink,
         ) -> anyhow::Result<()> {
             *self.finished.lock().await += 1;
+            self.contexts.lock().await.push(context);
             Ok(())
         }
 
@@ -1833,27 +1850,105 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attachment_paths_keep_same_named_files_apart() {
-        let unit = qq_message_unit("ROBOT1.0_msg", Some("REFIDX_one=="));
+    /// The message id observed in production, longer than the 96 byte path
+    /// segment limit.
+    const LONG_MSG_ID: &str = concat!(
+        "ROBOT1.0_ERH.4md9HCFavedKYo4nU7202-W3.QbvQCmliJLKBXUYPPZHZE4.SmUgLjdSWqGic",
+        "LeJ9zC4ObIWZ2x3kd1rivpYgaf4C5XyaLdtdKVzqgg!"
+    );
 
-        assert_eq!(
-            qq_attachment_relative_path(&unit, "协议 v2.pdf", 0),
-            PathBuf::from("qq/files/ROBOT1.0_msg-REFIDX_one/0/v2.pdf")
-        );
+    #[test]
+    fn attachment_paths_keep_distinct_messages_and_files_apart() {
+        let first = qq_message_unit(LONG_MSG_ID, Some("REFIDX_one=="));
+        let second = qq_message_unit(LONG_MSG_ID, Some("REFIDX_two=="));
+
+        // Platform ids exceed a path segment, so the directory is a digest of
+        // the whole identity rather than a truncated id.
+        assert!(LONG_MSG_ID.len() > 96);
+        let digest = qq_message_unit_digest(&first);
+        assert_eq!(digest.len(), 24);
+        assert_ne!(digest, qq_message_unit_digest(&second));
+        assert_ne!(digest, qq_message_unit_digest(LONG_MSG_ID));
+
+        let first_pdf = qq_attachment_relative_path(&first, "协议.pdf", 0);
+        let second_pdf = qq_attachment_relative_path(&second, "协议.pdf", 0);
+        assert_ne!(first_pdf, second_pdf, "same id, different message index");
+        assert_eq!(first_pdf, PathBuf::from(format!("qq/files/{digest}/0/pdf")));
+
+        // Same-named files of one message stay apart through the index.
         assert_ne!(
-            qq_attachment_relative_path(&unit, "same.pdf", 0),
-            qq_attachment_relative_path(&unit, "same.pdf", 1)
+            qq_attachment_relative_path(&first, "same.pdf", 0),
+            qq_attachment_relative_path(&first, "same.pdf", 1)
         );
-        // Chinese names sanitize to the same segment, so the index is what
-        // keeps two attachments of one message apart.
+        // Chinese names sanitize to the same segment.
         assert_eq!(
             sanitize_path_segment("甲.pdf"),
             sanitize_path_segment("乙.pdf")
         );
-        assert_ne!(
-            qq_attachment_relative_path(&unit, "甲.pdf", 0),
-            qq_attachment_relative_path(&unit, "乙.pdf", 1)
+    }
+
+    #[test]
+    fn attachment_files_survive_manifest_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let message = parse_inbound_message(
+            "C2C_MESSAGE_CREATE",
+            &json!({
+                "id": LONG_MSG_ID,
+                "content": "",
+                "author": {
+                    "user_openid": "u_open"
+                },
+                "message_scene": {
+                    "source": "default",
+                    "ext": ["msg_idx=REFIDX_real=="]
+                },
+                "attachments": [
+                    { "url": "https://gchat.qpic.cn/a.pdf", "filename": "协议.pdf" },
+                    { "url": "https://gchat.qpic.cn/b.pdf", "filename": "协议.pdf" }
+                ]
+            }),
+        )
+        .unwrap();
+        let unit = qq_message_unit(&message.msg_id, message.msg_idx.as_deref());
+        let downloaded = ["first", "second"]
+            .iter()
+            .enumerate()
+            .map(|(index, body)| DownloadedQqAttachment {
+                attachment: message.attachments[index].clone(),
+                index,
+                name: "协议.pdf".to_string(),
+                relative_path: qq_attachment_relative_path(&unit, "协议.pdf", index),
+                bytes: body.as_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+
+        write_context_sync(
+            dir.path(),
+            qq_context_request(&message, downloaded, Vec::new()),
+            &[],
+        )
+        .unwrap();
+        let recovered = read_context_artifacts_from_manifest(
+            dir.path(),
+            "qq",
+            &message.session_key,
+            Path::new("qq"),
+        )
+        .unwrap();
+
+        let files = recovered
+            .iter()
+            .filter(|record| record.kind == QQ_ATTACHMENT_KIND)
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 2, "{recovered:?}");
+        assert_ne!(files[0].paths, files[1].paths);
+        assert_eq!(
+            std::fs::read(dir.path().join(&files[0].paths[0])).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(&files[1].paths[0])).unwrap(),
+            b"second"
         );
     }
 
@@ -1959,6 +2054,76 @@ mod tests {
         let began = router.began.lock().await;
         assert_eq!(began.len(), 1);
         assert_eq!(began[0].intent, ChannelInputIntent::Route);
+    }
+
+    #[tokio::test]
+    async fn attachment_context_travels_through_the_ticket_finish_path() {
+        let channel = QqBotChannel::new(
+            QqConfig {
+                enabled: true,
+                app_id: String::new(),
+                client_secret: String::new(),
+                sandbox: false,
+                intents: 0,
+                channel_events: ChannelEventMode::Off,
+                allowed_users: BTreeSet::new(),
+                allowed_groups: BTreeSet::new(),
+            },
+            Arc::new(ApprovalBroker::default()),
+        );
+        let router = Arc::new(IntakeOnlyRouter {
+            allow_context: true,
+            ..IntakeOnlyRouter::default()
+        });
+        // A host outside the QQ media domains fails before any request is sent,
+        // so the turn still carries the failure as an unresolved issue.
+        let data = json!({
+            "id": "m2",
+            "content": "",
+            "author": {
+                "user_openid": "u_open"
+            },
+            "attachments": [{
+                "url": "https://example.com/协议.pdf",
+                "filename": "协议.pdf",
+                "size": 8,
+                "content_type": "file"
+            }]
+        });
+
+        channel
+            .handle_dispatch("C2C_MESSAGE_CREATE", &data, router.clone())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if *router.finished.lock().await > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("QQ attachment message did not finish through intake");
+
+        let contexts = router.contexts.lock().await;
+        let request = contexts[0]
+            .as_ref()
+            .expect("the turn must receive the attachment context");
+        assert_eq!(request.source, "qq");
+        assert_eq!(request.base_path, PathBuf::from("qq"));
+        assert!(request.artifacts.is_empty());
+        assert_eq!(request.unresolved.len(), 1);
+        assert_eq!(request.unresolved[0].kind, QQ_ATTACHMENT_KIND);
+        assert!(
+            request.unresolved[0].reason.contains("not allowed"),
+            "{}",
+            request.unresolved[0].reason
+        );
+        drop(contexts);
+        // The turn owns the context commit; the channel must not sync it early.
+        assert_eq!(*router.synced.lock().await, 0);
     }
 
     #[test]
