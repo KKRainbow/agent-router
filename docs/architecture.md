@@ -43,7 +43,10 @@ Slack, QQ, Telegram, Discord, webhook, and CLI.
 
 Adapters should translate platform-specific events into normalized router
 events. They should not know about LLM providers, tools, memory systems, or
-agent handoff logic.
+agent handoff logic. An adapter may also sync referenced channel context as
+files in the session workspace: Slack adds thread history and shared files, and
+QQ adds message attachments. A sync fetches only what the platform event
+reports, under the adapter's own host and size limits.
 
 ### Session
 

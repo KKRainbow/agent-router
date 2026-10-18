@@ -23,6 +23,8 @@ internal workflows, and early integrations.
 - Routes a session to at most one active agent at a time.
 - Lets users switch agents inside the same chat session.
 - Projects conversation context when a session switches agents.
+- Syncs channel context files (Slack threads and files, QQ message attachments)
+  into the session workspace.
 - Sends normalized replies back to the originating channel.
 - Lets agents send messages to their conversation or configured channel targets through HTTP.
 - Runs persistent scheduled tasks that agents can manage through a skill and REST API.
@@ -180,7 +182,7 @@ protocol changes are needed. `agent_api.enabled` controls the HTTP service;
 Channels:
 
 - Slack Socket Mode
-- Tencent QQ Official Bot Gateway
+- Tencent QQ Official Bot Gateway (text, images, and files)
 - Local browser web chat
 - Local terminal chat
 

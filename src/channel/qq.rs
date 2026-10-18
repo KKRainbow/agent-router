@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -8,7 +9,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -24,6 +25,10 @@ use crate::{
         ChannelContextPolicy, ChannelInput, ChannelInputIntent, ChannelIntakeOutcome,
         ChannelRouteTicket, RouterService,
     },
+    session::context::{
+        ContextArtifactInput, ContextFileContent, ContextFileInput, ContextSyncIssueInput,
+        ContextSyncRequest, sanitize_path_segment,
+    },
 };
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
@@ -33,6 +38,14 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 const QQ_REPLY_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(20);
 const QQ_REPLY_CHECKPOINT_MIN_GROWTH: usize = 500;
+// QQ serves message attachments from Tencent media hosts with a signed URL, so
+// the download carries no credential; only these hosts are contacted.
+const QQ_ATTACHMENT_HOSTS: [&str; 4] = ["qq.com", "qq.com.cn", "qpic.cn", "gtimg.cn"];
+const QQ_ATTACHMENT_KIND: &str = "qq_file";
+const QQ_ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
+const QQ_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const QQ_ATTACHMENT_PLACEHOLDER: &str = "[attachment]";
+const QQ_ATTACHMENT_NOTICE_LIMIT: usize = 3;
 const QQ_REPLY_CHECKPOINT_PREVIEW_CHARS: usize = 240;
 const QQ_MSG_TYPE_TEXT: u8 = 0;
 const QQ_MSG_TYPE_MARKDOWN: u8 = 2;
@@ -41,6 +54,7 @@ pub struct QqBotChannel {
     cfg: QqConfig,
     approvals: SharedApprovalBroker,
     http: Client,
+    attachment_http: Client,
     access_token: Arc<Mutex<Option<CachedAccessToken>>>,
     gateway_session: Arc<Mutex<QqGatewaySession>>,
     seen_events: Arc<Mutex<EventDeduper>>,
@@ -54,6 +68,7 @@ impl QqBotChannel {
             cfg,
             approvals,
             http: Client::new(),
+            attachment_http: qq_attachment_http_client(),
             access_token: Arc::new(Mutex::new(None)),
             gateway_session: Arc::new(Mutex::new(QqGatewaySession::default())),
             seen_events: Arc::new(Mutex::new(EventDeduper::new(1024))),
@@ -277,10 +292,17 @@ impl QqBotChannel {
                 user_id: Some(message.user_id.clone()),
                 source: "qq".to_string(),
                 intent: ChannelInputIntent::Route,
-                context_policy: ChannelContextPolicy::disabled("qq"),
+                context_policy: ChannelContextPolicy {
+                    source: "qq".to_string(),
+                    enabled: true,
+                },
             })
             .await?;
-        let ChannelIntakeOutcome::Route { ticket, .. } = outcome else {
+        let ChannelIntakeOutcome::Route {
+            ticket,
+            context_allowed,
+        } = outcome
+        else {
             return Ok(());
         };
         let reply_context_sequence = self
@@ -290,7 +312,13 @@ impl QqBotChannel {
         tokio::spawn(async move {
             let session_key = message.session_key.clone();
             if let Err(err) = channel
-                .route_message(message, ticket, reply_context_sequence, router)
+                .route_message(
+                    message,
+                    ticket,
+                    reply_context_sequence,
+                    context_allowed,
+                    router,
+                )
                 .await
             {
                 tracing::warn!(
@@ -308,6 +336,7 @@ impl QqBotChannel {
         message: QqInboundMessage,
         ticket: ChannelRouteTicket,
         reply_context_sequence: u64,
+        context_allowed: bool,
         router: Arc<dyn RouterService>,
     ) -> anyhow::Result<()> {
         self.remember_reply_context(&message, reply_context_sequence)
@@ -317,8 +346,14 @@ impl QqBotChannel {
             user_id = %message.user_id,
             group_id = ?message.group_id,
             text_len = message.text.len(),
+            attachment_count = message.attachments.len(),
             "routing QQ message"
         );
+        let sync = if context_allowed {
+            self.sync_attachments(&message).await
+        } else {
+            QqAttachmentSync::default()
+        };
         let mut output = ChannelOutputSink::new(
             QqReplyPort {
                 channel: self.clone(),
@@ -328,7 +363,123 @@ impl QqBotChannel {
             message.target,
             qq_output_policy(self.cfg.channel_events),
         );
-        router.finish_channel_input(ticket, None, &mut output).await
+        let result = router
+            .finish_channel_input(ticket, sync.request, &mut output)
+            .await;
+        if !sync.failures.is_empty() {
+            self.report_attachment_failures(&message.session_key, &sync.failures)
+                .await;
+        }
+        result
+    }
+
+    async fn sync_attachments(&self, message: &QqInboundMessage) -> QqAttachmentSync {
+        if message.attachments.is_empty() {
+            return QqAttachmentSync::default();
+        }
+        let mut downloaded = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut failures = Vec::new();
+        for (index, attachment) in message.attachments.iter().enumerate() {
+            match self.download_attachment(message, attachment, index).await {
+                Ok(file) => downloaded.push(file),
+                Err(err) => {
+                    let reason = format!("{err:#}");
+                    let name = qq_attachment_label(attachment, index);
+                    tracing::warn!(
+                        message_id = %message.msg_id,
+                        file = %name,
+                        error = %reason,
+                        "QQ attachment sync failed"
+                    );
+                    unresolved.push(ContextSyncIssueInput {
+                        kind: QQ_ATTACHMENT_KIND.to_string(),
+                        reference: qq_attachment_reference(&message.msg_id, index),
+                        reason: reason.clone(),
+                    });
+                    failures.push(format!("{name}: {reason}"));
+                }
+            }
+        }
+        QqAttachmentSync {
+            request: Some(qq_context_request(message, downloaded, unresolved)),
+            failures,
+        }
+    }
+
+    async fn download_attachment(
+        &self,
+        message: &QqInboundMessage,
+        attachment: &QqAttachment,
+        index: usize,
+    ) -> anyhow::Result<DownloadedQqAttachment> {
+        let url = parse_qq_attachment_url(&attachment.url)?;
+        anyhow::ensure!(
+            attachment.size <= QQ_ATTACHMENT_MAX_BYTES as u64,
+            "file exceeds {QQ_ATTACHMENT_MAX_BYTES} bytes"
+        );
+        tracing::info!(
+            message_id = %message.msg_id,
+            file = %qq_attachment_label(attachment, index),
+            size_bytes = attachment.size,
+            host = url.host_str().unwrap_or_default(),
+            "downloading QQ attachment"
+        );
+        // The URL is signed by the platform, so no credential is sent.
+        let mut response = self
+            .attachment_http
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("download request failed: {err}"))?;
+        if !response.status().is_success() {
+            anyhow::bail!("download rejected with {}", response.status());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > QQ_ATTACHMENT_MAX_BYTES as u64)
+        {
+            anyhow::bail!("file exceeds {QQ_ATTACHMENT_MAX_BYTES} bytes");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| anyhow::anyhow!("download read failed: {err}"))?
+        {
+            if bytes.len() + chunk.len() > QQ_ATTACHMENT_MAX_BYTES {
+                anyhow::bail!("file exceeds {QQ_ATTACHMENT_MAX_BYTES} bytes");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let name = qq_attachment_label(attachment, index);
+        let relative_path = PathBuf::from("qq")
+            .join("files")
+            .join(sanitize_path_segment(&message.msg_id))
+            .join(sanitize_path_segment(&name));
+        Ok(DownloadedQqAttachment {
+            attachment: attachment.clone(),
+            index,
+            name,
+            relative_path,
+            bytes,
+        })
+    }
+
+    async fn report_attachment_failures(&self, session_key: &str, failures: &[String]) {
+        let mut text = format!(
+            "Attachment sync failed, {} file(s) skipped:",
+            failures.len()
+        );
+        for failure in failures.iter().take(QQ_ATTACHMENT_NOTICE_LIMIT) {
+            text.push_str(&format!("\n- {failure}"));
+        }
+        if failures.len() > QQ_ATTACHMENT_NOTICE_LIMIT {
+            text.push_str("\n- ...");
+        }
+        if let Err(err) = self.send_session_message(session_key, &text).await {
+            tracing::warn!(error = %err, "failed to post QQ attachment failure notice");
+        }
     }
 
     fn spawn_approval_notifier(self: Arc<Self>) {
@@ -810,7 +961,32 @@ struct QqInboundMessage {
     user_id: String,
     group_id: Option<String>,
     text: String,
+    attachments: Vec<QqAttachment>,
     target: QqReplyTarget,
+}
+
+/// A platform attachment. `size` is 0 when the event does not report it.
+#[derive(Debug, Clone)]
+struct QqAttachment {
+    url: String,
+    filename: String,
+    size: u64,
+    content_type: String,
+}
+
+#[derive(Debug)]
+struct DownloadedQqAttachment {
+    attachment: QqAttachment,
+    index: usize,
+    name: String,
+    relative_path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct QqAttachmentSync {
+    request: Option<ContextSyncRequest>,
+    failures: Vec<String>,
 }
 
 fn parse_inbound_message(event_type: &str, data: &Value) -> Option<QqInboundMessage> {
@@ -818,6 +994,68 @@ fn parse_inbound_message(event_type: &str, data: &Value) -> Option<QqInboundMess
         "C2C_MESSAGE_CREATE" => parse_c2c_message(event_type, data),
         "GROUP_AT_MESSAGE_CREATE" => parse_group_at_message(event_type, data),
         _ => None,
+    }
+}
+
+fn parse_attachments(data: &Value) -> Vec<QqAttachment> {
+    data.get("attachments")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let url = item.get("url").and_then(Value::as_str)?.trim();
+                    if url.is_empty() {
+                        return None;
+                    }
+                    Some(QqAttachment {
+                        url: url.to_string(),
+                        filename: item
+                            .get("filename")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        size: item.get("size").and_then(Value::as_u64).unwrap_or_default(),
+                        content_type: item
+                            .get("content_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn qq_attachment_label(attachment: &QqAttachment, index: usize) -> String {
+    let raw = attachment.filename.trim();
+    if raw.is_empty() {
+        return format!("attachment-{index}");
+    }
+    raw.chars().filter(|ch| !ch.is_control()).take(80).collect()
+}
+
+fn qq_attachment_reference(msg_id: &str, index: usize) -> String {
+    format!("{msg_id}:{index}")
+}
+
+/// Attachment-only messages carry no text; keep a placeholder so the turn still
+/// routes and the agent knows what the synced files are.
+fn qq_message_text(text: String, attachments: &[QqAttachment]) -> String {
+    if !text.is_empty() {
+        return text;
+    }
+    let names = attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| qq_attachment_label(attachment, index))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.is_empty() {
+        QQ_ATTACHMENT_PLACEHOLDER.to_string()
+    } else {
+        format!("{QQ_ATTACHMENT_PLACEHOLDER} {names}")
     }
 }
 
@@ -835,7 +1073,8 @@ fn parse_c2c_message(event_type: &str, data: &Value) -> Option<QqInboundMessage>
         .unwrap_or("")
         .trim()
         .to_string();
-    if text.is_empty() {
+    let attachments = parse_attachments(data);
+    if text.is_empty() && attachments.is_empty() {
         return None;
     }
     Some(QqInboundMessage {
@@ -844,7 +1083,8 @@ fn parse_c2c_message(event_type: &str, data: &Value) -> Option<QqInboundMessage>
         session_key: format!("qq:c2c:{user_id}"),
         user_id: user_id.clone(),
         group_id: None,
-        text,
+        text: qq_message_text(text, &attachments),
+        attachments,
         target: QqReplyTarget::C2c { openid: user_id },
     })
 }
@@ -867,7 +1107,8 @@ fn parse_group_at_message(event_type: &str, data: &Value) -> Option<QqInboundMes
         .unwrap_or("")
         .trim()
         .to_string();
-    if text.is_empty() {
+    let attachments = parse_attachments(data);
+    if text.is_empty() && attachments.is_empty() {
         return None;
     }
     Some(QqInboundMessage {
@@ -876,11 +1117,86 @@ fn parse_group_at_message(event_type: &str, data: &Value) -> Option<QqInboundMes
         session_key: format!("qq:group:{group_id}"),
         user_id,
         group_id: Some(group_id.clone()),
-        text,
+        text: qq_message_text(text, &attachments),
+        attachments,
         target: QqReplyTarget::Group {
             group_openid: group_id,
         },
     })
+}
+
+fn qq_attachment_http_client() -> Client {
+    Client::builder()
+        .redirect(Policy::none())
+        .timeout(QQ_ATTACHMENT_TIMEOUT)
+        .build()
+        .expect("QQ attachment HTTP client configuration must be valid")
+}
+
+fn parse_qq_attachment_url(raw: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(raw).map_err(|_| anyhow::anyhow!("attachment URL is invalid"))?;
+    anyhow::ensure!(url.scheme() == "https", "attachment URL must use https");
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("attachment URL has no host"))?;
+    anyhow::ensure!(
+        is_allowed_qq_attachment_host(host),
+        "attachment host `{host}` is not allowed"
+    );
+    Ok(url)
+}
+
+fn is_allowed_qq_attachment_host(host: &str) -> bool {
+    QQ_ATTACHMENT_HOSTS.iter().any(|domain| {
+        host == *domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn qq_context_request(
+    message: &QqInboundMessage,
+    downloaded: Vec<DownloadedQqAttachment>,
+    unresolved: Vec<ContextSyncIssueInput>,
+) -> ContextSyncRequest {
+    let artifacts = downloaded
+        .into_iter()
+        .map(|file| {
+            let reference = qq_attachment_reference(&message.msg_id, file.index);
+            let mut metadata = BTreeMap::new();
+            metadata.insert("message_id".to_string(), json!(message.msg_id));
+            metadata.insert("filename".to_string(), json!(file.name));
+            metadata.insert("size_bytes".to_string(), json!(file.bytes.len()));
+            metadata.insert(
+                "content_type".to_string(),
+                json!(file.attachment.content_type),
+            );
+            metadata.insert(
+                "resolves_unresolved".to_string(),
+                json!([{"kind": QQ_ATTACHMENT_KIND, "reference": reference}]),
+            );
+            ContextArtifactInput {
+                id: format!("qq:file:{}:{}", message.msg_id, file.index),
+                kind: QQ_ATTACHMENT_KIND.to_string(),
+                title: format!("QQ attachment: {}", file.name),
+                source_locator: None,
+                files: vec![ContextFileInput {
+                    relative_path: file.relative_path,
+                    content: ContextFileContent::Bytes(file.bytes),
+                }],
+                metadata,
+            }
+        })
+        .collect();
+    ContextSyncRequest {
+        session_key: message.session_key.clone(),
+        source: "qq".to_string(),
+        base_path: PathBuf::from("qq"),
+        artifacts,
+        remove_artifacts: Vec::new(),
+        unresolved,
+    }
 }
 
 async fn send_heartbeat<S>(
@@ -1246,6 +1562,130 @@ mod tests {
         assert!(parse_inbound_message("READY", &json!({})).is_none());
     }
 
+    #[test]
+    fn parses_attachment_only_c2c_message() {
+        let data = json!({
+            "id": "m3",
+            "content": "",
+            "author": {
+                "user_openid": "u_open"
+            },
+            "attachments": [{
+                "url": "https://multimedia.nt.qq.com.cn/download?fileid=abc",
+                "filename": "协议草案 v2.pdf",
+                "size": 4096,
+                "content_type": "file"
+            }]
+        });
+
+        let message = parse_inbound_message("C2C_MESSAGE_CREATE", &data).unwrap();
+
+        assert_eq!(message.session_key, "qq:c2c:u_open");
+        assert_eq!(message.text, "[attachment] 协议草案 v2.pdf");
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].size, 4096);
+        assert_eq!(message.attachments[0].content_type, "file");
+    }
+
+    #[test]
+    fn attachment_message_keeps_its_text() {
+        let data = json!({
+            "id": "m4",
+            "content": " 看一下这个 ",
+            "author": {
+                "user_openid": "u_open"
+            },
+            "attachments": [{
+                "url": "https://gchat.qpic.cn/shot.png",
+                "filename": "shot.png"
+            }]
+        });
+
+        let message = parse_inbound_message("C2C_MESSAGE_CREATE", &data).unwrap();
+
+        assert_eq!(message.text, "看一下这个");
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].size, 0);
+        assert_eq!(message.attachments[0].content_type, "");
+    }
+
+    #[test]
+    fn qq_attachment_urls_are_restricted_to_tencent_hosts() {
+        assert!(
+            parse_qq_attachment_url("https://multimedia.nt.qq.com.cn/download?fileid=abc").is_ok()
+        );
+        assert!(parse_qq_attachment_url("https://gchat.qpic.cn/a/b.png").is_ok());
+        assert!(parse_qq_attachment_url("https://qq.com/x").is_ok());
+        assert!(parse_qq_attachment_url("http://multimedia.nt.qq.com.cn/x").is_err());
+        assert!(parse_qq_attachment_url("https://evilqq.com/x").is_err());
+        assert!(parse_qq_attachment_url("https://qq.com.evil.test/x").is_err());
+        assert!(parse_qq_attachment_url("https://127.0.0.1/x").is_err());
+        assert!(parse_qq_attachment_url("https://files.slack.com/x").is_err());
+    }
+
+    #[test]
+    fn qq_context_request_carries_downloaded_files_and_failures() {
+        let message = parse_inbound_message(
+            "C2C_MESSAGE_CREATE",
+            &json!({
+                "id": "ROBOT1.0_msg",
+                "content": "",
+                "author": {
+                    "user_openid": "u_open"
+                },
+                "attachments": [{
+                    "url": "https://multimedia.nt.qq.com.cn/download?fileid=abc",
+                    "filename": "../协议 v2.pdf",
+                    "size": 8,
+                    "content_type": "file"
+                }]
+            }),
+        )
+        .unwrap();
+
+        let request = qq_context_request(
+            &message,
+            vec![DownloadedQqAttachment {
+                attachment: message.attachments[0].clone(),
+                index: 0,
+                name: "协议 v2.pdf".to_string(),
+                relative_path: PathBuf::from("qq/files/ROBOT1.0_msg/v2.pdf"),
+                bytes: b"contents".to_vec(),
+            }],
+            vec![ContextSyncIssueInput {
+                kind: QQ_ATTACHMENT_KIND.to_string(),
+                reference: "ROBOT1.0_msg:1".to_string(),
+                reason: "download rejected with 403 Forbidden".to_string(),
+            }],
+        );
+
+        assert_eq!(request.session_key, "qq:c2c:u_open");
+        assert_eq!(request.source, "qq");
+        assert_eq!(request.base_path, PathBuf::from("qq"));
+        assert!(request.remove_artifacts.is_empty());
+        assert_eq!(request.unresolved.len(), 1);
+        assert_eq!(request.artifacts.len(), 1);
+        let artifact = &request.artifacts[0];
+        assert_eq!(artifact.id, "qq:file:ROBOT1.0_msg:0");
+        assert_eq!(artifact.kind, "qq_file");
+        assert_eq!(artifact.title, "QQ attachment: 协议 v2.pdf");
+        assert_eq!(artifact.files.len(), 1);
+        assert_eq!(
+            artifact.files[0].relative_path,
+            PathBuf::from("qq/files/ROBOT1.0_msg/v2.pdf")
+        );
+        match &artifact.files[0].content {
+            ContextFileContent::Bytes(bytes) => assert_eq!(bytes, b"contents"),
+            other => panic!("unexpected attachment content: {other:?}"),
+        }
+        assert_eq!(artifact.metadata["filename"], json!("协议 v2.pdf"));
+        assert_eq!(artifact.metadata["size_bytes"], json!(8));
+        assert_eq!(
+            artifact.metadata["resolves_unresolved"],
+            json!([{"kind": "qq_file", "reference": "ROBOT1.0_msg:0"}])
+        );
+    }
+
     #[tokio::test]
     async fn slash_command_does_not_preempt() {
         let channel = QqBotChannel::new(
@@ -1421,6 +1861,7 @@ mod tests {
             user_id: "u1".to_string(),
             group_id: Some("g1".to_string()),
             text: "old".to_string(),
+            attachments: Vec::new(),
             target: QqReplyTarget::Group {
                 group_openid: "old_group".to_string(),
             },
@@ -1432,6 +1873,7 @@ mod tests {
             user_id: "u1".to_string(),
             group_id: Some("g1".to_string()),
             text: "new".to_string(),
+            attachments: Vec::new(),
             target: QqReplyTarget::Group {
                 group_openid: "new_group".to_string(),
             },
