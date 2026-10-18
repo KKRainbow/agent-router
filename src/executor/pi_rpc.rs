@@ -1838,7 +1838,7 @@ impl PiThinkingProgress {
         events
             .send(
                 ExecutorUpdate::new("agent_thought_chunk", "Progress", text.clone(), "")
-                    .with_channel_event(ExecutorChannelEvent::agent_progress(text)),
+                    .with_channel_event(ExecutorChannelEvent::reasoning_summary(text)),
             )
             .await
     }
@@ -2747,7 +2747,7 @@ while True:
                 })
                 .collect::<Vec<_>>(),
             [Some((
-                ExecutorChannelEventKind::AgentProgress,
+                ExecutorChannelEventKind::ReasoningSummary,
                 "thinking standalone thinking"
             ))]
         );
@@ -2877,7 +2877,7 @@ while True:
                 .as_ref()
                 .map(|event| (event.kind, event.text.as_str())),
             Some((
-                ExecutorChannelEventKind::AgentProgress,
+                ExecutorChannelEventKind::ReasoningSummary,
                 "investigating answer"
             ))
         );

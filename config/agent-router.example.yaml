@@ -140,7 +140,10 @@ qq:
   # Optional. When omitted, QQ is enabled if app_id and client_secret are configured.
   # enabled: true
   # channel_events: off | compact | verbose
-  # compact groups useful turn activity and suppresses single successful tool calls.
+  # compact sends proactive progress notifications every 30s until completion.
+  # Snapshots show the latest tool event and agent explanation with their ages.
+  # Requires the recipient to allow proactive messages. Send errors stop progress
+  # notifications; the final answer still uses the normal passive reply path.
   channel_events: compact
   # Prefer environment variables for secrets:
   # QQ_APP_ID=...

@@ -19,7 +19,10 @@ use crate::{
     approval::SharedApprovalBroker,
     channel::{
         EventDeduper,
-        output::{ChannelOutputPolicy, ChannelOutputSink, ChannelReplyPort, PostedMessage},
+        output::{
+            ChannelOutputPolicy, ChannelOutputSink, ChannelReplyPort, CompactActivityStyle,
+            PostedMessage,
+        },
     },
     config::{ChannelEventMode, QqConfig},
     router::{
@@ -655,11 +658,15 @@ impl QqBotChannel {
         } else {
             anyhow::bail!("invalid QQ message target");
         };
+        self.post_notification(&target, text).await
+    }
+
+    async fn post_notification(&self, target: &QqReplyTarget, text: &str) -> anyhow::Result<()> {
         // Notifications have no fresh incoming message to reply to. Use the
         // proactive API and surface platform permission/quota errors as delivery
         // failures, without rerunning the task or reusing expired message IDs.
         self.post_message_body(
-            &target,
+            target,
             0,
             text.len(),
             json!({ "content": text, "msg_type": 0 }),
@@ -879,6 +886,15 @@ struct QqReplyPort {
 }
 
 fn qq_output_policy(activity_mode: ChannelEventMode) -> ChannelOutputPolicy {
+    if activity_mode == ChannelEventMode::Compact {
+        let mut policy = ChannelOutputPolicy::final_only(activity_mode);
+        // Progress uses proactive notifications so it does not consume the
+        // incoming message's passive reply quota or require a fresh msg_id.
+        policy.compact_activity_style = CompactActivityStyle::PeriodicMessages {
+            interval: Duration::from_secs(30),
+        };
+        return policy;
+    }
     let mut policy = ChannelOutputPolicy::checkpoint_messages(activity_mode);
     policy.checkpoint_min_interval = QQ_REPLY_CHECKPOINT_MIN_INTERVAL;
     policy.checkpoint_min_growth = QQ_REPLY_CHECKPOINT_MIN_GROWTH;
@@ -890,6 +906,15 @@ fn qq_output_policy(activity_mode: ChannelEventMode) -> ChannelOutputPolicy {
 #[async_trait::async_trait]
 impl ChannelReplyPort for QqReplyPort {
     type Target = QqReplyTarget;
+
+    async fn post_activity(
+        &self,
+        target: &Self::Target,
+        text: &str,
+    ) -> anyhow::Result<PostedMessage> {
+        self.channel.post_notification(target, text).await?;
+        Ok(PostedMessage::without_id())
+    }
 
     async fn post_text(&self, target: &Self::Target, text: &str) -> anyhow::Result<PostedMessage> {
         self.channel

@@ -16,11 +16,21 @@ use crate::{
     text::{append_reply_message_break, truncate_chars},
 };
 
+mod periodic;
+use periodic::PeriodicActivity;
+
 #[async_trait]
 pub(crate) trait ChannelReplyPort: Clone + Send + Sync + 'static {
     type Target: Clone + Send + Sync + 'static;
 
     async fn post_text(&self, target: &Self::Target, text: &str) -> anyhow::Result<PostedMessage>;
+    async fn post_activity(
+        &self,
+        target: &Self::Target,
+        text: &str,
+    ) -> anyhow::Result<PostedMessage> {
+        self.post_text(target, text).await
+    }
     async fn post_markdown(
         &self,
         target: &Self::Target,
@@ -67,6 +77,7 @@ pub(crate) enum ChannelReplyStyle {
 pub(crate) enum CompactActivityStyle {
     LiveUpdate,
     FinalSummary,
+    PeriodicMessages { interval: Duration },
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +150,7 @@ where
     policy: ChannelOutputPolicy,
     activity: ChannelActivity<P>,
     reply: ChannelReplyStream<P>,
+    periodic: Option<PeriodicActivity>,
 }
 
 impl<P> ChannelOutputSink<P>
@@ -146,16 +158,30 @@ where
     P: ChannelReplyPort,
 {
     pub(crate) fn new(port: P, target: P::Target, policy: ChannelOutputPolicy) -> Self {
+        let periodic = match (policy.activity_mode, policy.compact_activity_style) {
+            (ChannelEventMode::Compact, CompactActivityStyle::PeriodicMessages { interval }) => {
+                Some(PeriodicActivity::new(
+                    port.clone(),
+                    target.clone(),
+                    interval,
+                ))
+            }
+            _ => None,
+        };
         Self {
             port,
             target,
             policy,
             activity: ChannelActivity::default(),
             reply: ChannelReplyStream::default(),
+            periodic,
         }
     }
 
     async fn flush_activity(&mut self) -> Option<String> {
+        if let Some(periodic) = &mut self.periodic {
+            periodic.stop().await;
+        }
         match self.policy.activity_mode {
             ChannelEventMode::Off => None,
             ChannelEventMode::Compact => match self.policy.compact_activity_style {
@@ -166,6 +192,7 @@ where
                         .flush_final(self.port.clone(), self.target.clone())
                         .await
                 }
+                CompactActivityStyle::PeriodicMessages { .. } => None,
             },
             ChannelEventMode::Verbose => {
                 self.activity.verbose.flush().await;
@@ -181,6 +208,10 @@ where
     P: ChannelReplyPort,
 {
     fn send_channel_event(&mut self, event: RouterChannelEvent) {
+        if let Some(periodic) = &mut self.periodic {
+            periodic.update(event);
+            return;
+        }
         match self.policy.activity_mode {
             ChannelEventMode::Off => {}
             ChannelEventMode::Compact => match self.policy.compact_activity_style {
@@ -192,6 +223,7 @@ where
                 CompactActivityStyle::FinalSummary => {
                     self.activity.compact.push(event);
                 }
+                CompactActivityStyle::PeriodicMessages { .. } => {}
             },
             ChannelEventMode::Verbose => {
                 self.activity
@@ -238,6 +270,9 @@ where
     }
 
     async fn discard_reply_stream(&mut self) {
+        if let Some(periodic) = &mut self.periodic {
+            periodic.stop().await;
+        }
         if self.policy.activity_mode == ChannelEventMode::Compact
             && self.policy.compact_activity_style == CompactActivityStyle::LiveUpdate
             && let Some(id) = self.activity.compact.discard_live().await
@@ -970,6 +1005,8 @@ mod tests {
     struct RecordingPort {
         deliveries: Arc<Mutex<Vec<Delivery>>>,
         next_id: Arc<AtomicU64>,
+        activity_calls: Arc<AtomicU64>,
+        activity_error: Option<String>,
         post_text_delay: Duration,
         markdown_without_id: bool,
         update_markdown_error: Option<String>,
@@ -981,6 +1018,8 @@ mod tests {
             Self {
                 deliveries: Arc::default(),
                 next_id: Arc::default(),
+                activity_calls: Arc::default(),
+                activity_error: None,
                 post_text_delay: Duration::ZERO,
                 markdown_without_id: false,
                 update_markdown_error: None,
@@ -998,6 +1037,18 @@ mod tests {
     #[async_trait]
     impl ChannelReplyPort for RecordingPort {
         type Target = String;
+
+        async fn post_activity(
+            &self,
+            target: &Self::Target,
+            text: &str,
+        ) -> anyhow::Result<PostedMessage> {
+            self.activity_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = &self.activity_error {
+                anyhow::bail!("{error}");
+            }
+            self.post_text(target, text).await
+        }
 
         async fn post_text(
             &self,
@@ -1100,6 +1151,164 @@ mod tests {
             title: "Progress".to_string(),
             text: text.to_string(),
         }
+    }
+
+    fn periodic_sink(port: RecordingPort) -> ChannelOutputSink<RecordingPort> {
+        let mut policy = ChannelOutputPolicy::final_only(ChannelEventMode::Compact);
+        policy.compact_activity_style = CompactActivityStyle::PeriodicMessages {
+            interval: Duration::from_secs(30),
+        };
+        ChannelOutputSink::new(port, "target".to_string(), policy)
+    }
+
+    async fn advance_activity(seconds: u64) {
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_activity_reports_silence_until_final_reply() {
+        let port = RecordingPort::default();
+        let mut sink = periodic_sink(port.clone());
+        tokio::task::yield_now().await;
+        advance_activity(29).await;
+        assert!(port.deliveries().await.is_empty());
+        advance_activity(1).await;
+        assert!(
+            matches!(&port.deliveries().await[..], [Delivery::PostText { text, .. }]
+            if text.contains("已用时 30 秒") && text.contains("尚未收到"))
+        );
+        sink.send_reply_chunk("draft".repeat(1_000));
+        for _ in 0..6 {
+            advance_activity(30).await;
+        }
+        assert_eq!(port.deliveries().await.len(), 7);
+        assert_eq!(port.activity_calls.load(Ordering::Relaxed), 7);
+        sink.send_final_reply("done".to_string()).await.unwrap();
+        advance_activity(60).await;
+        let deliveries = port.deliveries().await;
+        assert_eq!(deliveries.len(), 8);
+        assert!(matches!(&deliveries[7], Delivery::PostMarkdown { text, .. }
+            if text == "done"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_activity_uses_latest_events_with_age_and_excludes_reasoning() {
+        let port = RecordingPort::default();
+        let mut sink = periodic_sink(port.clone());
+        sink.send_channel_event(progress_event("old explanation"));
+        sink.send_channel_event(event("old tool"));
+        tokio::task::yield_now().await;
+        advance_activity(20).await;
+        sink.send_channel_event(progress_event("running tests"));
+        sink.send_channel_event(RouterChannelEvent {
+            text: "status: completed".to_string(),
+            ..event("bash")
+        });
+        sink.send_channel_event(RouterChannelEvent {
+            kind: RouterChannelEventKind::ReasoningSummary,
+            ..progress_event("private reasoning")
+        });
+        advance_activity(10).await;
+        assert!(
+            matches!(&port.deliveries().await[..], [Delivery::PostText { text, .. }]
+            if text.contains("10 秒前") && text.contains("running tests")
+                && text.contains("bash") && text.contains("status: completed")
+                && !text.contains("old") && !text.contains("private reasoning"))
+        );
+        advance_activity(30).await;
+        assert!(
+            matches!(&port.deliveries().await[1], Delivery::PostText { text, .. }
+            if text.contains("40 秒前"))
+        );
+        sink.send_final_reply("done".to_string()).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_activity_fast_reply_never_posts_progress() {
+        let port = RecordingPort::default();
+        let mut sink = periodic_sink(port.clone());
+        sink.send_channel_event(event("bash"));
+        advance_activity(1).await;
+        sink.send_final_reply("done".to_string()).await.unwrap();
+        advance_activity(60).await;
+        assert!(
+            matches!(&port.deliveries().await[..], [Delivery::PostMarkdown { text, .. }]
+            if text == "done")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_activity_discard_and_drop_stop_future_sends() {
+        let port = RecordingPort::default();
+        let mut sink = periodic_sink(port.clone());
+        tokio::task::yield_now().await;
+        advance_activity(30).await;
+        assert_eq!(port.deliveries().await.len(), 1);
+        sink.discard_reply_stream().await;
+        sink.send_channel_event(event("stale"));
+        advance_activity(60).await;
+        assert_eq!(port.deliveries().await.len(), 1);
+
+        let sink = periodic_sink(port.clone());
+        tokio::task::yield_now().await;
+        drop(sink);
+        advance_activity(60).await;
+        assert_eq!(port.deliveries().await.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_activity_final_reply_cancels_in_flight_send() {
+        let port = RecordingPort {
+            post_text_delay: Duration::from_secs(60),
+            ..RecordingPort::default()
+        };
+        let mut sink = periodic_sink(port.clone());
+        tokio::task::yield_now().await;
+        advance_activity(30).await;
+        let final_at = Instant::now();
+        sink.send_final_reply("done".to_string()).await.unwrap();
+        assert_eq!(final_at.elapsed(), Duration::ZERO);
+        advance_activity(120).await;
+        assert!(
+            matches!(&port.deliveries().await[..], [Delivery::PostMarkdown { text, .. }]
+            if text == "done")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_activity_rejection_stops_notifications_but_not_final_reply() {
+        let port = RecordingPort {
+            activity_error: Some("proactive messages disabled".to_string()),
+            ..RecordingPort::default()
+        };
+        let mut sink = periodic_sink(port.clone());
+        tokio::task::yield_now().await;
+        advance_activity(30).await;
+        advance_activity(90).await;
+        assert_eq!(port.activity_calls.load(Ordering::Relaxed), 1);
+        sink.send_final_reply("done".to_string()).await.unwrap();
+        assert!(
+            matches!(&port.deliveries().await[..], [Delivery::PostMarkdown { text, .. }]
+            if text == "done")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_activity_timeout_does_not_retry_uncertain_delivery() {
+        let port = RecordingPort {
+            post_text_delay: Duration::from_secs(6),
+            ..RecordingPort::default()
+        };
+        let mut sink = periodic_sink(port.clone());
+        tokio::task::yield_now().await;
+        advance_activity(30).await;
+        advance_activity(5).await;
+        advance_activity(1).await;
+        advance_activity(30).await;
+        advance_activity(6).await;
+        assert!(port.deliveries().await.is_empty());
+        sink.send_final_reply("done".to_string()).await.unwrap();
     }
 
     #[tokio::test]
